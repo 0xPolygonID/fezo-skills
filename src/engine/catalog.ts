@@ -19,9 +19,17 @@ import { methodToToolName } from './tool-name.js';
 /**
  * A JSON Schema media type entry, as used inside an HTTP body binding's
  * `content` map (keyed by media type, e.g. "application/json").
+ *
+ * `schema` is `object | boolean` because JSON Schema 2020-12 allows a boolean
+ * in any schema position: `true` accepts every instance, `false` rejects
+ * every instance. Both are meaningful and must survive normalization —
+ * dropping `false` would silently turn "no body permitted" into "body
+ * declared with no schema". An entry present with no `schema` key at all
+ * (`{}`) is a body media type the catalog declared without describing; that is
+ * distinct from the media type being absent from `content` entirely.
  */
 export interface HttpBodyMediaType {
-  schema?: object;
+  schema?: object | boolean;
 }
 
 /** Mirrors the manifest's `Body` (zug/internal/gateway/manifest.go). */
@@ -67,23 +75,51 @@ export interface ToolCandidate {
   inputSchema: object;
   outputSchema?: object;
   userSettings: string[];
+  /**
+   * The backend's `info` title, summary, and description, concatenated —
+   * nothing else.
+   *
+   * The contents of this string are fixed by the search-semantics rule that
+   * searchable fields are "tool name, backend id, method name, title,
+   * description, and backend info title/summary/description". Search matches
+   * query terms as case-insensitive substrings against this text, so every
+   * extra token added here becomes a false-match source: a `docs_url` ending
+   * in `/scrape` would match the term "scrape" on a backend with no scrape
+   * method, and a literal label like "Categories" would match on every
+   * backend that has any. Do not add fields or labels beyond the
+   * three named above. Case folding and truncation are the search layer's job,
+   * not this module's.
+   */
   backendInfoText: string;
   billingModel: 'per_call' | 'dynamic' | 'package';
 }
 
 /**
- * Thrown when the catalog endpoint responds with a non-2xx status, or with a
- * 2xx status whose body cannot be parsed as JSON. Carries the raw status and
- * body so a later task (retry classification, error rendering) can decide
- * what it means; this module does not classify or interpret it.
+ * Thrown when the catalog endpoint responds with a non-2xx status
+ * (`reason: 'status'`), or with a 2xx status whose body cannot be parsed as
+ * JSON (`reason: 'parse'`). Carries the raw status and body so a later task
+ * (retry classification, error rendering) can decide what it means; this
+ * module does not classify or interpret it beyond that distinction.
+ *
+ * `reason` exists because the two modes are not interchangeable and the
+ * message is surfaced to users by the CLI: a status failure means the gateway
+ * refused, while a parse failure means the gateway answered successfully with
+ * something that is not a catalog. Rendering the latter as "failed with status
+ * 200" would be untrue.
  */
 export class CatalogFetchError extends Error {
+  readonly reason: 'status' | 'parse';
   readonly status: number;
   readonly body: string;
 
-  constructor(status: number, body: string) {
-    super(`catalog fetch failed with status ${status}`);
+  constructor(reason: 'status' | 'parse', status: number, body: string) {
+    super(
+      reason === 'status'
+        ? `catalog fetch failed with status ${status}`
+        : `catalog response with status ${status} could not be parsed as JSON`,
+    );
     this.name = 'CatalogFetchError';
+    this.reason = reason;
     this.status = status;
     this.body = body;
   }
@@ -129,49 +165,30 @@ function asStringArray(value: unknown): string[] | undefined {
   return out;
 }
 
-interface CatalogInfo {
-  title?: string;
-  summary?: string;
-  description?: string;
-  docsUrl?: string;
-  categories?: string[];
-}
-
-function parseInfo(value: unknown): CatalogInfo | undefined {
-  const rec = asRecord(value);
-  if (!rec) return undefined;
-
-  const info: CatalogInfo = {};
-  const title = asString(rec.title);
-  if (title !== undefined) info.title = title;
-  const summary = asString(rec.summary);
-  if (summary !== undefined) info.summary = summary;
-  const description = asString(rec.description);
-  if (description !== undefined) info.description = description;
-  const docsUrl = asString(rec.docs_url);
-  if (docsUrl !== undefined) info.docsUrl = docsUrl;
-  const categories = asStringArray(rec.categories);
-  if (categories !== undefined) info.categories = categories;
-  return info;
-}
-
 /**
- * Renders a backend's optional `info` block into a single human-readable
- * string for a tool candidate's `backendInfoText`. There is no wire format
- * for this — it exists to give the skill/CLI something to show alongside a
- * tool without re-fetching backend docs. A backend with no `info` block
- * (the common case for a minimal manifest) renders to an empty string.
+ * Renders a backend's optional `info` block into the searchable text carried
+ * on every one of its tool candidates as `backendInfoText`.
+ *
+ * The contents are fixed by the search-semantics rule quoted on
+ * `ToolCandidate.backendInfoText`: exactly `title`, `summary`, and
+ * `description`, in that order, and nothing else. `info.docs_url`,
+ * `info.categories`, and `info.version` are deliberately excluded, as are
+ * field labels — each would be substring-matchable by search without
+ * corresponding to any capability the backend actually has, so they are not
+ * parsed at all. A backend with no `info` block (the common case for a
+ * minimal manifest) renders to an empty string.
+ *
+ * No case folding and no truncation: search lowercases both sides itself.
  */
-function formatBackendInfoText(info: CatalogInfo | undefined): string {
-  if (!info) return '';
+function formatBackendInfoText(value: unknown): string {
+  const rec = asRecord(value);
+  if (!rec) return '';
+
   const parts: string[] = [];
-  if (info.title) parts.push(info.title);
-  if (info.summary) parts.push(info.summary);
-  if (info.description) parts.push(info.description);
-  if (info.categories && info.categories.length > 0) {
-    parts.push(`Categories: ${info.categories.join(', ')}`);
+  for (const key of ['title', 'summary', 'description'] as const) {
+    const text = asString(rec[key]);
+    if (text !== undefined && text.length > 0) parts.push(text);
   }
-  if (info.docsUrl) parts.push(`Docs: ${info.docsUrl}`);
   return parts.join(' — ');
 }
 
@@ -189,6 +206,17 @@ function parseBillingModel(value: unknown): 'per_call' | 'dynamic' | 'package' {
   return 'dynamic';
 }
 
+/**
+ * Parses one JSON Schema value out of the catalog. A schema is either a JSON
+ * object or — legally, under JSON Schema 2020-12 — the boolean `true` or
+ * `false`. Anything else (a string, a number, an array, null) is not a schema
+ * and is reported as absent.
+ */
+function parseSchema(value: unknown): object | boolean | undefined {
+  if (typeof value === 'boolean') return value;
+  return asRecord(value);
+}
+
 function parseHttpBody(value: unknown): HttpBody | undefined {
   const rec = asRecord(value);
   if (!rec) return undefined;
@@ -202,9 +230,16 @@ function parseHttpBody(value: unknown): HttpBody | undefined {
     const content: Record<string, HttpBodyMediaType> = {};
     for (const [mediaType, mediaValue] of Object.entries(contentRec)) {
       const mediaRec = asRecord(mediaValue);
+      // A media-type value that is not an object is garbled, not "declared
+      // with no schema". Recording `{}` for it would report a body media type
+      // the catalog never actually described, which the binding logic would
+      // read as a real (schema-less) body. Drop it so the media type reads as
+      // absent, which is what it effectively is.
+      if (!mediaRec) continue;
+
       const media: HttpBodyMediaType = {};
-      const schema = mediaRec ? asRecord(mediaRec.schema) : undefined;
-      if (schema) media.schema = schema;
+      const schema = parseSchema(mediaRec.schema);
+      if (schema !== undefined) media.schema = schema;
       content[mediaType] = media;
     }
     body.content = content;
@@ -234,12 +269,43 @@ function parseHttpBindings(value: unknown): HttpBindings {
 }
 
 /**
+ * Emits a diagnostic to stderr. Normalization never throws over a bad catalog
+ * entry — one malformed backend or method must not take down discovery for
+ * every other one (mirroring the gateway's own per-backend skip-and-log in
+ * catalog.go) — so every degradation is announced here instead. stdout is
+ * reserved for the CLI's machine-readable output.
+ */
+function warn(message: string): void {
+  process.stderr.write(`fezoctl: ${message}\n`);
+}
+
+/**
  * Resolves the HTTP verb to call with. `http.method` is optional on the
  * catalog's wire format; when absent (or set to anything other than "GET"),
  * the verb defaults to POST, per the governing spec.
+ *
+ * The `'GET' | 'POST'` domain and the POST default are specified, so a
+ * manifest declaring some other verb still gets POST — but silently calling
+ * POST where the manifest asked for PUT/PATCH/DELETE would be an invisible
+ * wrong-verb request, so the coercion is announced.
  */
-function resolveHttpMethod(bindings: HttpBindings): 'GET' | 'POST' {
-  return bindings.method?.toUpperCase() === 'GET' ? 'GET' : 'POST';
+function resolveHttpMethod(
+  bindings: HttpBindings,
+  backendId: string,
+  methodName: string,
+): 'GET' | 'POST' {
+  const declared = bindings.method;
+  // An absent or empty verb is the specified POST default, not a coercion.
+  if (declared === undefined || declared.length === 0) return 'POST';
+
+  const verb = declared.toUpperCase();
+  if (verb === 'GET') return 'GET';
+  if (verb !== 'POST') {
+    warn(
+      `${backendId}.${methodName}: unrecognized http.method "${declared}"; calling with POST (only "GET" and "POST" are supported)`,
+    );
+  }
+  return 'POST';
 }
 
 /**
@@ -264,7 +330,10 @@ function resolvePath(path: string | undefined, methodName: string): string {
  * `backend_id`, or a method with no `name`, has no identity to build a tool
  * name from and cannot be recovered, but one bad entry must not take down
  * discovery for every other backend/method (mirroring the gateway's own
- * per-backend skip-on-error behavior in catalog.go).
+ * per-backend skip-on-error behavior in catalog.go). Every skip is announced
+ * on stderr, so a provider that vanishes from discovery always leaves a
+ * trace — silently returning a short list is indistinguishable from the
+ * gateway not offering the backend at all.
  */
 export function normalizeCatalog(parsed: unknown): ToolCandidate[] {
   const root = asRecord(parsed);
@@ -273,35 +342,49 @@ export function normalizeCatalog(parsed: unknown): ToolCandidate[] {
 
   const candidates: ToolCandidate[] = [];
 
-  for (const backendRaw of backendsRaw) {
+  for (const [backendIndex, backendRaw] of backendsRaw.entries()) {
     const backendRec = asRecord(backendRaw);
-    if (!backendRec) continue;
+    if (!backendRec) {
+      warn(`skipping catalog backend at index ${backendIndex}: entry is not an object`);
+      continue;
+    }
 
     const backendId = asString(backendRec.backend_id);
-    if (!backendId) continue;
+    if (!backendId) {
+      warn(`skipping catalog backend at index ${backendIndex}: missing "backend_id"`);
+      continue;
+    }
 
-    const backendInfoText = formatBackendInfoText(parseInfo(backendRec.info));
+    const backendInfoText = formatBackendInfoText(backendRec.info);
     const billingModel = parseBillingModel(backendRec.billing);
     const userSettings = asStringArray(backendRec.user_settings) ?? [];
     const methodsRaw = asArray(backendRec.methods) ?? [];
 
-    for (const methodRaw of methodsRaw) {
+    for (const [methodIndex, methodRaw] of methodsRaw.entries()) {
       const methodRec = asRecord(methodRaw);
-      if (!methodRec) continue;
+      if (!methodRec) {
+        warn(`skipping ${backendId} method at index ${methodIndex}: entry is not an object`);
+        continue;
+      }
 
       const methodName = asString(methodRec.name);
-      if (!methodName) continue;
+      if (!methodName) {
+        warn(`skipping ${backendId} method at index ${methodIndex}: missing "name"`);
+        continue;
+      }
 
-      const protocol = asString(methodRec.protocol) ?? 'http';
+      // `||` not `??`: an empty-string protocol is an omitted protocol, not an
+      // unsupported one. (`resolvePath` treats an empty `path` the same way.)
+      const protocol = asString(methodRec.protocol) || 'http';
       if (protocol !== 'http') {
-        process.stderr.write(
-          `fezoctl: skipping ${backendId}.${methodName}: unsupported protocol "${protocol}" (only "http" is supported)\n`,
+        warn(
+          `skipping ${backendId}.${methodName}: unsupported protocol "${protocol}" (only "http" is supported)`,
         );
         continue;
       }
 
       const bindings = parseHttpBindings(methodRec.http);
-      const httpMethod = resolveHttpMethod(bindings);
+      const httpMethod = resolveHttpMethod(bindings, backendId, methodName);
       const path = resolvePath(asString(methodRec.path), methodName);
       const title = asString(methodRec.title);
       const description = asString(methodRec.description) ?? '';
@@ -334,9 +417,9 @@ export function normalizeCatalog(parsed: unknown): ToolCandidate[] {
 /**
  * Fetches and normalizes the catalog from a live gateway.
  *
- * Throws `CatalogFetchError` on a non-2xx response or an unparseable body;
- * classifying that failure (retryable vs. fatal, gateway-code vs. status) is
- * later tasks' job, not this one's.
+ * Throws `CatalogFetchError` on a non-2xx response (`reason: 'status'`) or an
+ * unparseable body (`reason: 'parse'`); classifying that failure (retryable
+ * vs. fatal, gateway-code vs. status) is later tasks' job, not this one's.
  */
 export async function fetchCatalog(options: FetchCatalogOptions): Promise<ToolCandidate[]> {
   const fetchFn = options.fetchFn ?? fetch;
@@ -348,14 +431,14 @@ export async function fetchCatalog(options: FetchCatalogOptions): Promise<ToolCa
   const bodyText = await response.text();
 
   if (!response.ok) {
-    throw new CatalogFetchError(response.status, bodyText);
+    throw new CatalogFetchError('status', response.status, bodyText);
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(bodyText);
   } catch {
-    throw new CatalogFetchError(response.status, bodyText);
+    throw new CatalogFetchError('parse', response.status, bodyText);
   }
 
   return normalizeCatalog(parsed);
