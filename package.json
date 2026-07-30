@@ -26,13 +26,12 @@
     "test": "vitest run",
     "bundle": "node build/bundle.mjs",
     "gen-skill": "node build/gen-skill.mjs",
-    "pack:check": "node build/pack-check.mjs"
-  },
-  "dependencies": {
-    "ajv": "8.20.0"
+    "pack:check": "node build/pack-check.mjs",
+    "prepack": "node build/bundle.mjs"
   },
   "devDependencies": {
     "@types/node": "22.20.1",
+    "ajv": "8.20.0",
     "esbuild": "0.28.1",
     "typescript": "7.0.2",
     "vitest": "4.1.10"

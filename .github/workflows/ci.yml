@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.8.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.12"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Test output is pristine (no stray "fezoctl" lines on the runner)
+        run: |
+          set -euo pipefail
+          count="$(pnpm exec vitest run 2>&1 | grep -c fezoctl || true)"
+          echo "fezoctl mention count: ${count}"
+          if [ "${count}" != "0" ]; then
+            echo "vitest output is not pristine — a test is writing to a real stream instead of capturing it" >&2
+            exit 1
+          fi
+
+      - name: Build the bundle
+        run: pnpm bundle
+
+      - name: Bundle freshness — fail if the committed dist/fezoctl.mjs differs from a fresh build
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- dist/fezoctl.mjs; then
+            echo "dist/fezoctl.mjs is stale: commit the output of 'pnpm bundle'." >&2
+            exit 1
+          fi
+
+      - name: Generate the skill
+        run: pnpm gen-skill
+
+      - name: Skill freshness — fail if the committed SKILL.md differs from a fresh generation
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- skills/fezo/SKILL.md; then
+            echo "skills/fezo/SKILL.md is stale: commit the output of 'pnpm gen-skill'." >&2
+            exit 1
+          fi
+
+      - name: Built artifact --version matches package.json's version
+        run: |
+          set -euo pipefail
+          built="$(node dist/fezoctl.mjs --version)"
+          expected="fezoctl $(node -p "require('./package.json').version")"
+          echo "built: ${built}"
+          echo "expected: ${expected}"
+          if [ "${built}" != "${expected}" ]; then
+            echo "dist/fezoctl.mjs --version does not match package.json's version" >&2
+            exit 1
+          fi
+
+      - name: Pack check
+        run: pnpm pack:check
