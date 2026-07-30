@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { BindingError, bindArgs } from '../src/engine/bindings.js';
 import type { ToolCandidate } from '../src/engine/catalog.js';
@@ -70,6 +70,7 @@ describe('bindArgs — path substitution', () => {
     expect(() => bindArgs(method, {})).toThrow(BindingError);
     try {
       bindArgs(method, { id: null });
+      expect.unreachable('bindArgs should have thrown');
     } catch (err) {
       expect(err).toBeInstanceOf(BindingError);
       expect((err as BindingError).reason).toBe('missing-path-param');
@@ -77,8 +78,28 @@ describe('bindArgs — path substitution', () => {
     }
     try {
       bindArgs(method, { id: '' });
+      expect.unreachable('bindArgs should have thrown');
     } catch (err) {
       expect((err as BindingError).reason).toBe('missing-path-param');
+    }
+  });
+
+  it('substitutes every occurrence of a placeholder named twice in one template', () => {
+    const bound = bindArgs(
+      candidate({ path: '/a/{id}/b/{id}', httpMethod: 'POST', bindings: { path_params: ['id'] } }),
+      { id: 'x1', keep: 'in-body' },
+    );
+    expect(bound.path).toBe('/a/x1/b/x1');
+    expect(bound.body).toEqual({ keep: 'in-body' });
+  });
+
+  it('reports a repeated placeholder whose value is absent once, not once per occurrence', () => {
+    try {
+      bindArgs(candidate({ path: '/a/{id}/b/{id}', httpMethod: 'POST', bindings: {} }), {});
+      expect.unreachable('bindArgs should have thrown');
+    } catch (err) {
+      expect((err as BindingError).reason).toBe('missing-path-param');
+      expect((err as BindingError).names).toEqual(['id']);
     }
   });
 });
@@ -116,11 +137,59 @@ describe('bindArgs — query binding', () => {
 
     try {
       bindArgs(method, { country: 'US' });
+      expect.unreachable('bindArgs should have thrown');
     } catch (err) {
       expect(err).toBeInstanceOf(BindingError);
       expect((err as BindingError).reason).toBe('missing-query-param');
       expect((err as BindingError).names).toEqual(['query']);
     }
+  });
+
+  it('sends an explicitly empty string as a query parameter and does not treat it as missing', () => {
+    const method = candidate({
+      path: '/google/search',
+      httpMethod: 'GET',
+      bindings: { method: 'GET', query: ['query', 'country'] },
+      inputSchema: { type: 'object', required: ['query'] },
+    });
+    const bound = bindArgs(method, { query: '', country: '' });
+    expect(bound.query).toEqual({ query: '', country: '' });
+  });
+
+  it('treats an explicitly null query value as missing (never sent), matching the reference client', () => {
+    const bound = bindArgs(
+      candidate({ path: '/google/search', httpMethod: 'GET', bindings: { query: ['query', 'country'] } }),
+      { query: 'cats', country: null },
+    );
+    expect(bound.query).toEqual({ query: 'cats' });
+  });
+
+  it('warns on stderr about args a GET request cannot send anywhere', () => {
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      const bound = bindArgs(
+        candidate({ path: '/google/search', httpMethod: 'GET', bindings: { method: 'GET', query: ['query'] } }),
+        { query: 'cats', contry: 'US' }, // note the typo: no binding claims "contry"
+      );
+      expect(bound.query).toEqual({ query: 'cats' });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(writes.join('')).toContain('contry');
+  });
+
+  it('says nothing when a GET leaves no args unbound', () => {
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      bindArgs(candidate({ path: '/s', httpMethod: 'GET', bindings: { query: ['query'] } }), { query: 'cats' });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(spy).not.toHaveBeenCalled();
   });
 });
 
@@ -175,11 +244,54 @@ describe('bindArgs — header binding', () => {
     });
     try {
       bindArgs(method, {});
+      expect.unreachable('bindArgs should have thrown');
     } catch (err) {
       expect(err).toBeInstanceOf(BindingError);
       expect((err as BindingError).reason).toBe('missing-header-param');
       expect((err as BindingError).names).toEqual(['x-api-version']);
     }
+  });
+
+  // The GET cases below are the ones the verb could silently override: a GET
+  // with no `query` binding sends every remaining arg as a query parameter, so
+  // a declared `header` binding has to be honored *before* that sweep or the
+  // verb, not the declaration, decides placement.
+  it('sends a declared header as a header on a GET, not as a query parameter', () => {
+    const bound = bindArgs(
+      candidate({ path: '/lookup', httpMethod: 'GET', bindings: { method: 'GET', header: ['x-api-version'] } }),
+      { 'x-api-version': '2024-01', q: 'cats' },
+    );
+    expect(bound.headers).toEqual({ 'x-api-version': '2024-01' });
+    expect(bound.query).toEqual({ q: 'cats' });
+    expect(Object.hasOwn(bound.query, 'x-api-version')).toBe(false);
+  });
+
+  it('throws missing-header-param (not missing-query-param) for a required header on a GET with no query binding', () => {
+    const method = candidate({
+      path: '/lookup',
+      httpMethod: 'GET',
+      bindings: { method: 'GET', header: ['x-api-version'] },
+      inputSchema: { type: 'object', required: ['x-api-version'] },
+    });
+    try {
+      bindArgs(method, { q: 'cats' });
+      expect.unreachable('bindArgs should have thrown');
+    } catch (err) {
+      expect((err as BindingError).reason).toBe('missing-header-param');
+      expect((err as BindingError).names).toEqual(['x-api-version']);
+    }
+  });
+
+  it('does not report a supplied required header on a GET as missing at all', () => {
+    const method = candidate({
+      path: '/lookup',
+      httpMethod: 'GET',
+      bindings: { method: 'GET', header: ['x-api-version'] },
+      inputSchema: { type: 'object', required: ['x-api-version'] },
+    });
+    const bound = bindArgs(method, { 'x-api-version': '2024-01' });
+    expect(bound.headers).toEqual({ 'x-api-version': '2024-01' });
+    expect(bound.query).toEqual({});
   });
 });
 
@@ -270,5 +382,39 @@ describe('bindArgs — body-source rule', () => {
     const bound = bindArgs(needsBodyField, { id: 'abc' }, [1, 2, 3]);
     expect(bound.query).toEqual({ id: 'abc' });
     expect(bound.body).toEqual([1, 2, 3]);
+  });
+
+  it('accepts an explicitly null required body field (a schema may permit ["string","null"])', () => {
+    const method = candidate({
+      path: '/thing',
+      httpMethod: 'POST',
+      bindings: {},
+      inputSchema: { type: 'object', properties: { note: { type: ['string', 'null'] } }, required: ['note'] },
+    });
+    const bound = bindArgs(method, { note: null });
+    expect(bound.body).toEqual({ note: null });
+  });
+
+  it('accepts an explicitly empty-string required body field', () => {
+    const method = candidate({
+      path: '/thing',
+      httpMethod: 'POST',
+      bindings: {},
+      inputSchema: { type: 'object', required: ['note'] },
+    });
+    expect(bindArgs(method, { note: '' }).body).toEqual({ note: '' });
+  });
+
+  it('refuses --body-json on a GET method (body-not-allowed) rather than dropping the body or letting fetch throw', () => {
+    const method = candidate({ path: '/snapshots/{id}/data', httpMethod: 'GET', bindings: { path_params: ['id'] } });
+    try {
+      bindArgs(method, { id: 'snap-1' }, { some: 'body' });
+      expect.unreachable('bindArgs should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(BindingError);
+      expect((err as BindingError).reason).toBe('body-not-allowed');
+      expect((err as BindingError).names).toEqual([]);
+      expect((err as BindingError).message).toContain('GET');
+    }
   });
 });

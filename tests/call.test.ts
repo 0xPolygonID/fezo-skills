@@ -156,6 +156,53 @@ describe('callTool', () => {
     });
   });
 
+  it('keeps its own Content-Type when a manifest header binding declares a colliding spelling', async () => {
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string>;
+      expect(headers).toEqual({ Authorization: 'Bearer k', 'Content-Type': 'application/json' });
+      return new Response('{}', { status: 200 });
+    });
+
+    try {
+      await callTool({
+        baseUrl: 'https://gw.example.com',
+        apiKey: 'k',
+        candidate: candidate({
+          backendId: 'b',
+          path: '/thing',
+          httpMethod: 'POST',
+          bindings: { header: ['content-type'] },
+        }),
+        args: { 'content-type': 'text/xml', field: 1 },
+        fetchFn: fetchFn as unknown as typeof fetch,
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses locally (BindingError) and never calls fetch, for --body-json on a GET method', async () => {
+    const fetchFn = vi.fn();
+    await expect(
+      callTool({
+        baseUrl: 'https://gw.example.com',
+        apiKey: 'k',
+        candidate: candidate({
+          backendId: 'brightdata',
+          path: '/snapshots/{id}/data',
+          httpMethod: 'GET',
+          bindings: { method: 'GET', path_params: ['id'] },
+        }),
+        args: { id: 'snap-1' },
+        bodyJson: { some: 'body' },
+        fetchFn: fetchFn as unknown as typeof fetch,
+      }),
+    ).rejects.toBeInstanceOf(BindingError);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
   it('refuses locally (BindingError) and never calls fetch, for a missing required path parameter', async () => {
     const fetchFn = vi.fn();
     await expect(

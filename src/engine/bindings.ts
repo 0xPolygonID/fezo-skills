@@ -48,13 +48,17 @@ export interface BoundRequest {
   headers: Record<string, string>;
   /**
    * JSON request body, present iff this call sends one. Never present for a
-   * GET request (the Fetch API rejects a body on GET/HEAD).
+   * GET request: the Fetch API rejects a body on GET/HEAD, so a GET that
+   * would carry one (an explicit `--body-json`) is refused up front with a
+   * `body-not-allowed` `BindingError` rather than having its body silently
+   * dropped -- see `bindArgs`.
    */
   body?: unknown;
 }
 
 export type BindingErrorReason =
   | 'disallowed-header'
+  | 'body-not-allowed'
   | 'missing-path-param'
   | 'missing-query-param'
   | 'missing-header-param'
@@ -62,14 +66,18 @@ export type BindingErrorReason =
 
 /**
  * Thrown by `bindArgs` for a problem `bindArgs` can detect without ever
- * sending a request: a manifest naming a reserved header, or a path/query/
- * header/body value `input_schema.required` (or the path template itself)
- * demands but `args`/`bodyJson` does not supply. These are local client
- * errors, not requests that get sent and fail upstream.
+ * sending a request: a manifest naming a reserved header, a body on a verb
+ * that cannot carry one, or a path/query/header/body value
+ * `input_schema.required` (or the path template itself) demands but
+ * `args`/`bodyJson` does not supply. These are local client errors, not
+ * requests that get sent and fail upstream.
  */
 export class BindingError extends Error {
   readonly reason: BindingErrorReason;
-  /** The offending property or header name(s), in the order encountered. */
+  /**
+   * The offending property or header name(s), in the order encountered.
+   * Empty for `body-not-allowed`, whose fault is the verb, not a property.
+   */
   readonly names: string[];
 
   constructor(reason: BindingErrorReason, names: string[]) {
@@ -85,6 +93,8 @@ function formatBindingError(reason: BindingErrorReason, names: string[]): string
   switch (reason) {
     case 'disallowed-header':
       return `refusing to bind reserved header name(s): ${list} (Authorization and X-Zug-* headers may never be set by a tool call)`;
+    case 'body-not-allowed':
+      return 'refusing to send a request body on a GET method (the Fetch API rejects a body on GET/HEAD); drop --body-json, or call a method whose binding declares a request body';
     case 'missing-path-param':
       return `missing required path parameter(s): ${list}`;
     case 'missing-query-param':
@@ -105,13 +115,46 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * A value counts as "missing" for required-argument purposes when it is
- * `undefined`, `null`, or the empty string -- matching the reference MCP
- * client's path-placeholder check (`zug/mcp-server/src/zug_gateway_client.ts`).
- * A legitimately falsy value (`0`, `false`) is present, not missing.
+ * Emits a diagnostic to stderr, in the same form (and for the same reason) as
+ * catalog.ts's `warn`: stdout is reserved for the CLI's machine-readable
+ * output, so every silent degradation is announced here instead.
  */
-function isMissing(value: unknown): boolean {
-  return value === undefined || value === null || value === '';
+function warn(message: string): void {
+  process.stderr.write(`fezoctl: ${message}\n`);
+}
+
+/**
+ * "Missing" for a *sendable* value (query parameter, header): `undefined` or
+ * `null` only. Matching the reference MCP client's GET query construction
+ * (`zug/mcp-server/src/zug_gateway_client.ts`, which filters exactly those two
+ * and does send `''`), an explicitly empty string is a *present* value: `?q=`
+ * is a legal, sometimes meaningful request, and refusing to send it would make
+ * an intentionally empty parameter unexpressible. A legitimately falsy value
+ * (`0`, `false`) is likewise present, not missing.
+ */
+function isMissingValue(value: unknown): boolean {
+  return value === undefined || value === null;
+}
+
+/**
+ * "Missing" for a path placeholder: additionally `''`, which is the one place
+ * an empty string is not merely unusual but malformed -- it collapses
+ * `/snapshots/{id}/data` to `/snapshots//data`, a different resource. Matches
+ * the reference MCP client's path-placeholder check.
+ */
+function isMissingPathValue(value: unknown): boolean {
+  return isMissingValue(value) || value === '';
+}
+
+/**
+ * "Missing" for a JSON body field: absent from the object entirely. A `null`
+ * body field is a present value -- a property whose schema is
+ * `{"type": ["string", "null"]}` may legitimately be sent as `null`, and JSON
+ * cannot express `undefined`, so an `undefined` here means the key was not
+ * supplied.
+ */
+function isMissingBodyValue(value: unknown): boolean {
+  return value === undefined;
 }
 
 /** Reads `input_schema.required` defensively; anything else yields no required names. */
@@ -158,14 +201,32 @@ function isDisallowedHeaderName(name: string): boolean {
  * each segment is `encodeURIComponent`-ed individually, so a multi-segment
  * id (`fal-ai/flux/dev`) reaches the gateway with its slashes intact while
  * reserved characters within a segment are still escaped; a single-segment
- * id (an Apify actor `janedoe~my-actor`) is unaffected.
+ * id (an Apify actor `janedoe~my-actor`) is unaffected. A template that names
+ * the same placeholder twice (`/a/{id}/b/{id}`) substitutes both occurrences:
+ * consumed names are removed from the remaining args only *after* the whole
+ * template is resolved, so the second occurrence still sees its value.
+ *
+ * Placement precedence, when a property name appears in more than one binding
+ * list: path wins over query, and query wins over header. Path and query
+ * consume the name (it cannot also reach the body), so a name declared in both
+ * `query` and `header` is sent as a query parameter and *not* as a header --
+ * and, if `input_schema.required` names it, the header pass then reports it as
+ * `missing-header-param`. A manifest declaring one property in two places is
+ * an authoring error; this is the order in which it is resolved, not an
+ * endorsement of it.
  *
  * Body-source rule (three cases, in order):
  *   1. `bodyJson !== undefined` -- it is the body, verbatim. This is the
  *      documented escape hatch for a body shape `input_schema` cannot even
- *      describe (Bright Data's `scrape_async` array-of-records body).
+ *      describe (Bright Data's `scrape_async` array-of-records body). A GET
+ *      method is refused (`body-not-allowed`) rather than sent bodyless: the
+ *      Fetch API throws on a body with GET, and silently discarding a body the
+ *      caller explicitly passed would send a different request than the one
+ *      asked for.
  *   2. Otherwise, a GET request never gets a body (the Fetch API rejects
- *      one); any args not claimed by path/query/header are simply unsent.
+ *      one); any args not claimed by path/query/header are unsent, and are
+ *      announced on stderr so a typo'd optional parameter on a method with a
+ *      closed `query` list is not an invisible no-op.
  *   3. Otherwise (a POST-like request), everything left in `args` after
  *      path/query/header extraction becomes the JSON body. This is
  *      deliberately the *same* mechanism for a "plain" POST (nothing
@@ -187,22 +248,33 @@ export function bindArgs(candidate: ToolCandidate, args: unknown, bodyJson?: unk
     throw new BindingError('disallowed-header', disallowedHeaders);
   }
 
+  // Verb safety, likewise independent of args: a GET cannot carry a body, so
+  // an explicit `--body-json` on one is refused here rather than bound and
+  // then thrown out by `fetch` (`TypeError: Request with GET/HEAD method
+  // cannot have body`) at send time.
+  if (bodyJson !== undefined && candidate.httpMethod === 'GET') {
+    throw new BindingError('body-not-allowed', []);
+  }
+
   // --- Path -------------------------------------------------------------
   const pathParamNames = new Set<string>();
   const missingPath: string[] = [];
   const resolvedPath = candidate.path.replace(/\{(\w+)\}/g, (_match, name: string) => {
     pathParamNames.add(name);
     const value = source[name];
-    if (isMissing(value)) {
-      missingPath.push(name);
+    if (isMissingPathValue(value)) {
+      // A repeated placeholder reports its name once, not once per occurrence.
+      if (!missingPath.includes(name)) missingPath.push(name);
       return `{${name}}`;
     }
-    delete source[name];
     return String(value).split('/').map(encodeURIComponent).join('/');
   });
   if (missingPath.length > 0) {
     throw new BindingError('missing-path-param', missingPath);
   }
+  // Consumed only now that every occurrence has been read: deleting inside the
+  // replacer would leave a second `{id}` in `/a/{id}/b/{id}` reading undefined.
+  for (const name of pathParamNames) delete source[name];
 
   // --- Query --------------------------------------------------------------
   const query: Record<string, string> = {};
@@ -210,7 +282,7 @@ export function bindArgs(candidate: ToolCandidate, args: unknown, bodyJson?: unk
   if (bindings.query !== undefined) {
     for (const name of bindings.query) {
       const value = source[name];
-      if (isMissing(value)) {
+      if (isMissingValue(value)) {
         if (requiredNames.includes(name)) missingQuery.push(name);
         continue;
       }
@@ -219,14 +291,21 @@ export function bindArgs(candidate: ToolCandidate, args: unknown, bodyJson?: unk
     }
   } else if (candidate.httpMethod === 'GET') {
     // Legacy fallback: no declared query binding at all, so every remaining
-    // arg becomes a query parameter.
+    // arg becomes a query parameter -- except one a `header` binding claims.
+    // Sweeping those into the query string too would let the verb decide
+    // placement over an explicit declaration (the exact failure this module
+    // exists to prevent): the header pass below would find nothing left, and a
+    // required header-bound property would be reported missing here even
+    // though the caller did supply it.
     for (const [name, value] of Object.entries(source)) {
-      if (isMissing(value)) continue;
+      if (headerNames.includes(name)) continue;
+      if (isMissingValue(value)) continue;
       query[name] = String(value);
       delete source[name];
     }
     for (const name of requiredNames) {
-      if (!pathParamNames.has(name) && !(name in query)) missingQuery.push(name);
+      if (pathParamNames.has(name) || headerNames.includes(name)) continue;
+      if (!(name in query)) missingQuery.push(name);
     }
   }
   if (missingQuery.length > 0) {
@@ -238,7 +317,7 @@ export function bindArgs(candidate: ToolCandidate, args: unknown, bodyJson?: unk
   const missingHeader: string[] = [];
   for (const name of headerNames) {
     const value = source[name];
-    if (isMissing(value)) {
+    if (isMissingValue(value)) {
       if (requiredNames.includes(name)) missingHeader.push(name);
       continue;
     }
@@ -258,13 +337,28 @@ export function bindArgs(candidate: ToolCandidate, args: unknown, bodyJson?: unk
   } else if (candidate.httpMethod !== 'GET') {
     const queryNames = bindings.query ?? [];
     const missingBody = requiredNames.filter(
-      (name) => !pathParamNames.has(name) && !queryNames.includes(name) && !headerNames.includes(name) && isMissing(source[name]),
+      (name) =>
+        !pathParamNames.has(name) &&
+        !queryNames.includes(name) &&
+        !headerNames.includes(name) &&
+        isMissingBodyValue(source[name]),
     );
     if (missingBody.length > 0) {
       throw new BindingError('missing-body-param', missingBody);
     }
     body = source;
     hasBody = true;
+  } else {
+    // A GET has nowhere left to put these. Dropping them silently turns a
+    // typo'd optional parameter on a method with a closed `query` list
+    // (scraperapi, brave, alpaca) into an invisible no-op, so say so.
+    const unbound = Object.keys(source);
+    if (unbound.length > 0) {
+      warn(
+        `${candidate.tool}: not sending argument(s) ${unbound.join(', ')} -- ` +
+          `nothing placed them in the path, query string, or a header, and a GET request has no body`,
+      );
+    }
   }
 
   return {

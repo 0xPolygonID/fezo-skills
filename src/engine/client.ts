@@ -55,6 +55,15 @@ export class GatewayCallError extends Error {
 }
 
 /**
+ * Emits a diagnostic to stderr, in the same form (and for the same reason) as
+ * catalog.ts's and bindings.ts's `warn`: stdout is reserved for the CLI's
+ * machine-readable output.
+ */
+function warn(message: string): void {
+  process.stderr.write(`fezoctl: ${message}\n`);
+}
+
+/**
  * Calls one catalog method end to end: binds `args`/`bodyJson` per
  * `candidate`'s HTTP binding (bindings.ts's `bindArgs`), sends the request,
  * and returns the raw 2xx response.
@@ -75,13 +84,28 @@ export async function callTool(options: CallToolOptions): Promise<CallToolResult
     `${options.baseUrl.replace(/\/$/, '')}/v1/${options.candidate.backendId}${bound.path}` +
     (queryString.length > 0 ? `?${queryString}` : '');
 
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${options.apiKey}`,
-    ...bound.headers,
-  };
+  // Headers this module owns are written last, and a bound header colliding
+  // with one (case-insensitively -- HTTP header names are case-insensitive, and
+  // a plain-object `HeadersInit` would otherwise reach `fetch` carrying both
+  // spellings) is dropped with a diagnostic. `bindArgs` already refuses to bind
+  // `Authorization` or `X-Zug-*` at all, so this is defense in depth rather
+  // than the only barrier: the credential this client sends must not be
+  // overridable by catalog data, and neither must the content type of a body
+  // this client is the one serializing.
+  const hasBody = Object.hasOwn(bound, 'body');
+  const clientOwnedHeaders = hasBody ? ['authorization', 'content-type'] : ['authorization'];
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(bound.headers)) {
+    if (clientOwnedHeaders.includes(name.toLowerCase())) {
+      warn(`${options.candidate.tool}: ignoring bound header "${name}" -- it is set by the client and may not be overridden`);
+      continue;
+    }
+    headers[name] = value;
+  }
+  headers.Authorization = `Bearer ${options.apiKey}`;
 
   const init: RequestInit = { method: options.candidate.httpMethod, headers };
-  if (Object.hasOwn(bound, 'body')) {
+  if (hasBody) {
     headers['Content-Type'] = 'application/json';
     init.body = JSON.stringify(bound.body);
   }
