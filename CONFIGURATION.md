@@ -27,7 +27,13 @@ boilerplate. Concretely:
   `fezoctl setup --key-stdin`, which reads the key from **stdin**.
 - There is no interactive "ask the agent to collect a key" flow; nothing in
   this CLI is designed to be driven by an `AskUserQuestion`-style prompt for a
-  secret.
+  secret. That rule has to be stated where a *model* will read it, not only
+  here: `skills/fezo/SKILL.md` (generated from `build/step0.md`) forbids
+  collecting the key through `AskUserQuestion` **and** forbids putting it in a
+  Bash command the model constructs, and tells the model to stop and have the
+  user run `setup --key-stdin` in their own terminal instead. The gateway URL
+  and the storage choice are the only things a modal may collect — neither is
+  a secret.
 - Writes to macOS Keychain pipe the secret through the write process's
   **stdin**, never through argv — the commonly-documented
   `security add-generic-password -w "$KEY"` form puts the secret in argv,
@@ -133,9 +139,15 @@ than falsely claiming "stored," pointing you at the shadowing source.
 `.env` lives at:
 
 ```
-$XDG_CONFIG_HOME/fezo/.env      (if $XDG_CONFIG_HOME is set and non-empty)
+$XDG_CONFIG_HOME/fezo/.env      (if $XDG_CONFIG_HOME is set to an ABSOLUTE path)
 ~/.config/fezo/.env             (otherwise)
 ```
+
+A relative `XDG_CONFIG_HOME` is **ignored** (with a note on stderr), per the XDG
+base-directory spec, and the `~/.config` fallback is used instead: joined
+verbatim, `XDG_CONFIG_HOME=.config` would resolve against the current working
+directory and write a live API key into whatever project you happened to be
+in — `0600`, but committable.
 
 **Not** `~/.config/fezoctl/` — the directory follows the product name
 (`fezo`), not the CLI binary's name, matching `FEZO_URL`/`FEZO_API_KEY` and
@@ -196,8 +208,27 @@ printf '%s' "$YOUR_KEY" | fezoctl setup --key-stdin --url https://your-gateway.e
 printf '%s' "$YOUR_KEY" | fezoctl setup --key-stdin --storage keychain --url https://your-gateway.example.com
 ```
 
-`setup` prints a confirmation with the masked key and the resolved source —
-never the raw key:
+`--url` is not optional in practice. `fezoctl` needs a gateway URL *and* an API
+key for every other command, so a `setup` that stores only the key reports the
+gap and exits **2**:
+
+```
+setup — storage: dotenv
+  api key: stored
+  configured url: (not configured — pass --url or set FEZO_URL)
+  configured api key: sk-l… (source: dotenv)
+  this configuration is NOT usable yet: fezoctl needs BOTH a gateway URL and an API key.
+```
+
+The key really was stored (that line is not a lie); the non-zero exit reports
+that the *configuration* is incomplete, which is what the pre-fix `setup` hid by
+exiting 0 while the next command failed with `credentials-not-configured`.
+Supplying the URL through an exported `FEZO_URL` instead of `--url` also
+satisfies it — resolution reads the environment first. Under `--json` the same
+state is the top-level `"usable": false`.
+
+With a URL, `setup` prints a confirmation with the masked key and the resolved
+source — never the raw key:
 
 ```
 setup — storage: dotenv

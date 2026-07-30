@@ -204,7 +204,7 @@ source — run it yourself if this ever looks stale.)
 | `call <tool> --args-json '<json>' [--body-json '<json>']` | Resolve exactly one named tool, validate, bind, and call it once. |
 | `run "<intent>" --args-json '<json>' [--body-json '<json>']` | Search, select the best candidate for the intent, call it, and retry a compatible alternative on a retryable mechanical failure. |
 | `catalog` | List every backend and method the gateway currently reports. |
-| `setup --key-stdin` | Store the gateway URL and API key without ever putting the key in argv or a transcript. |
+| `setup --key-stdin` | Store the gateway URL and API key without ever putting the key in argv or a transcript. Pass `--url` (or have `FEZO_URL` set): `fezoctl` needs both values, so a `setup` that leaves the URL unconfigured prints `configured url: (not configured — pass --url or set FEZO_URL)` and exits 2 rather than reporting a success that no other command can use. |
 | `doctor` | Diagnose configuration and connectivity — the first thing to run when something is wrong. See ["`doctor`"](#doctor). |
 
 ### Exit codes

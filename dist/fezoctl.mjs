@@ -6955,7 +6955,7 @@ function bindArgs(candidate, args, bodyJson) {
 import { spawnSync } from "node:child_process";
 import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 function warn3(message) {
   process.stderr.write(`fezoctl: ${message}
 `);
@@ -6968,6 +6968,9 @@ function nodeErrorCode(err) {
 function trimTrailingNewline(value) {
   return value.replace(/\r?\n+$/, "");
 }
+function normalizeCredentialValue(value) {
+  return value.trim();
+}
 var MASK_VISIBLE_CHARS = 4;
 function maskSecret(secret) {
   if (secret.length === 0) return "";
@@ -6978,7 +6981,7 @@ async function readSecretFromStream(stream) {
   for await (const chunk of stream) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
   }
-  return trimTrailingNewline(Buffer.concat(chunks).toString("utf8"));
+  return normalizeCredentialValue(Buffer.concat(chunks).toString("utf8"));
 }
 var SECURITY_BINARY = "/usr/bin/security";
 var systemKeychainRunner = {
@@ -7016,7 +7019,16 @@ function readKeychainSecret(runner, service, account) {
   return message.length > 0 ? { ok: false, message } : { ok: false, message: `security exited with status ${String(result.status)}` };
 }
 function defaultDotEnvPath(env = process.env) {
-  const configHome = env.XDG_CONFIG_HOME && env.XDG_CONFIG_HOME.length > 0 ? env.XDG_CONFIG_HOME : join(homedir(), ".config");
+  const override = env.XDG_CONFIG_HOME;
+  const fallback = join(homedir(), ".config");
+  let configHome = fallback;
+  if (override !== void 0 && override.length > 0) {
+    if (isAbsolute(override)) {
+      configHome = override;
+    } else {
+      warn3(`ignoring XDG_CONFIG_HOME="${override}": it is not an absolute path; using ${fallback} instead`);
+    }
+  }
   return join(configHome, "fezo", ".env");
 }
 function parseDotEnv(text) {
@@ -7149,7 +7161,9 @@ function resolveCredentials(options = {}) {
   };
 }
 function storeCredentials(options) {
-  if (options.apiKey.trim().length === 0) {
+  const apiKey = normalizeCredentialValue(options.apiKey);
+  const url = options.url !== void 0 ? normalizeCredentialValue(options.url) : void 0;
+  if (apiKey.length === 0) {
     const outcome = {
       ok: false,
       reason: "empty-api-key",
@@ -7158,19 +7172,19 @@ function storeCredentials(options) {
     return {
       storage: options.storage,
       apiKey: outcome,
-      ...options.url !== void 0 ? { url: outcome } : {}
+      ...url !== void 0 ? { url: outcome } : {}
     };
   }
   if (options.storage === "dotenv") {
     const dotEnvPath = options.dotEnvPath ?? defaultDotEnvPath();
-    const values = { FEZO_API_KEY: options.apiKey };
-    if (options.url !== void 0) values.FEZO_URL = options.url;
+    const values = { FEZO_API_KEY: apiKey };
+    if (url !== void 0) values.FEZO_URL = url;
     const written = writeDotEnvFile(dotEnvPath, values);
     const apiKeyOutcome2 = written.ok ? { ok: true } : { ok: false, ...written.reason !== void 0 ? { reason: written.reason } : {}, ...written.message !== void 0 ? { message: written.message } : {} };
     return {
       storage: "dotenv",
       apiKey: apiKeyOutcome2,
-      ...options.url !== void 0 ? { url: apiKeyOutcome2 } : {}
+      ...url !== void 0 ? { url: apiKeyOutcome2 } : {}
     };
   }
   if (!options.keychain) {
@@ -7178,15 +7192,15 @@ function storeCredentials(options) {
     return {
       storage: "keychain",
       apiKey: outcome,
-      ...options.url !== void 0 ? { url: outcome } : {}
+      ...url !== void 0 ? { url: outcome } : {}
     };
   }
-  const apiKeyWrite = writeKeychainSecret(options.keychain, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT, options.apiKey);
+  const apiKeyWrite = writeKeychainSecret(options.keychain, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT, apiKey);
   const apiKeyOutcome = apiKeyWrite.ok ? { ok: true } : { ok: false, ...apiKeyWrite.message !== void 0 ? { message: apiKeyWrite.message } : {} };
-  if (options.url === void 0) {
+  if (url === void 0) {
     return { storage: "keychain", apiKey: apiKeyOutcome };
   }
-  const urlWrite = writeKeychainSecret(options.keychain, KEYCHAIN_SERVICE_URL, KEYCHAIN_ACCOUNT, options.url);
+  const urlWrite = writeKeychainSecret(options.keychain, KEYCHAIN_SERVICE_URL, KEYCHAIN_ACCOUNT, url);
   const urlOutcome = urlWrite.ok ? { ok: true } : { ok: false, ...urlWrite.message !== void 0 ? { message: urlWrite.message } : {} };
   return { storage: "keychain", apiKey: apiKeyOutcome, url: urlOutcome };
 }
@@ -7760,17 +7774,28 @@ function describeStoreOutcome(outcome) {
   }
   return "stored";
 }
+function setupProducedUsableConfig(display) {
+  return display.url !== void 0 && display.apiKey !== void 0;
+}
+var NO_URL_CONFIGURED_TEXT = "(not configured \u2014 pass --url or set FEZO_URL)";
 function renderSetup(input, json) {
+  const usable = setupProducedUsableConfig(input.display);
   if (json) {
-    return toJson({ result: input.result, configured: input.display });
+    return toJson({ result: input.result, configured: input.display, usable });
   }
   const lines = [`setup \u2014 storage: ${input.result.storage}`];
   lines.push(`  api key: ${describeStoreOutcome(input.result.apiKey)}`);
   if (input.result.url !== void 0) {
     lines.push(`  url: ${describeStoreOutcome(input.result.url)}`);
   }
-  if (input.display.url !== void 0) lines.push(`  configured url: ${input.display.url.value} (source: ${input.display.url.source})`);
+  lines.push(
+    input.display.url !== void 0 ? `  configured url: ${input.display.url.value} (source: ${input.display.url.source})` : `  configured url: ${NO_URL_CONFIGURED_TEXT}`
+  );
   if (input.display.apiKey !== void 0) lines.push(`  configured api key: ${input.display.apiKey.masked} (source: ${input.display.apiKey.source})`);
+  else lines.push("  configured api key: (not configured)");
+  if (!usable) {
+    lines.push("  this configuration is NOT usable yet: fezoctl needs BOTH a gateway URL and an API key.");
+  }
   return lines.join("\n");
 }
 
@@ -7840,6 +7865,61 @@ async function callTool(options) {
   return { status: response.status, bodyText };
 }
 
+// src/engine/schema.ts
+var import_ajv = __toESM(require_ajv(), 1);
+var PERMISSIVE_SCHEMA = { type: "object" };
+var ajv = new import_ajv.Ajv({ allErrors: true, strict: false });
+function warn5(message) {
+  process.stderr.write(`fezoctl: ${message}
+`);
+}
+function errorDetail(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+function compileSchema(schema) {
+  try {
+    return ajv.compile(schema);
+  } catch (err) {
+    warn5(`failed to compile input_schema; using permissive validator (${errorDetail(err)})`);
+    return ajv.compile(PERMISSIVE_SCHEMA);
+  }
+}
+function ajvErrorsToText(errors) {
+  if (!errors || errors.length === 0) return "invalid input";
+  return errors.map((e) => `${e.instancePath || "(root)"} ${e.message}`).join("; ");
+}
+var SchemaValidatorCache = class {
+  byObject = /* @__PURE__ */ new WeakMap();
+  trueValidator;
+  falseValidator;
+  /** Returns the cached validator for `schema`, compiling it on first use. */
+  get(schema) {
+    if (schema === true) {
+      const existing = this.trueValidator;
+      if (existing) return existing;
+      const compiled2 = compileSchema(true);
+      this.trueValidator = compiled2;
+      return compiled2;
+    }
+    if (schema === false) {
+      const existing = this.falseValidator;
+      if (existing) return existing;
+      const compiled2 = compileSchema(false);
+      this.falseValidator = compiled2;
+      return compiled2;
+    }
+    const cached = this.byObject.get(schema);
+    if (cached) return cached;
+    const compiled = compileSchema(schema);
+    this.byObject.set(schema, compiled);
+    return compiled;
+  }
+};
+function validateArgs(validateFn, value) {
+  if (validateFn(value)) return { valid: true };
+  return { valid: false, errorText: ajvErrorsToText(validateFn.errors) };
+}
+
 // src/engine/retry.ts
 var ABORT_CODES = /* @__PURE__ */ new Set(["unauthorized", "limit_exceeded", "insufficient_balance"]);
 var RETRY_CODES = /* @__PURE__ */ new Set([
@@ -7894,7 +7974,7 @@ function buildLog(candidate, status, reason, billed, httpStatus, gatewayCode) {
     ...gatewayCode !== void 0 ? { gatewayCode } : {}
   };
 }
-function warn5(message) {
+function warn6(message) {
   process.stderr.write(`fezoctl: ${message}
 `);
 }
@@ -7912,7 +7992,19 @@ function classifyThrown(err) {
   const message = err instanceof Error ? err.message : String(err);
   return { kind: "transport", message };
 }
-async function attemptCandidate(candidate, options, retryEmpty2xx) {
+async function attemptCandidate(candidate, options, retryEmpty2xx, validators) {
+  const argsValidation = validateArgs(validators.get(candidate.inputSchema), options.args);
+  if (!argsValidation.valid) {
+    const failure = {
+      kind: "invalid-arguments",
+      message: `arguments do not match ${candidate.tool}'s input schema: ${argsValidation.errorText}`
+    };
+    const classified = classifyFailure(failure);
+    return {
+      log: buildLog(candidate, classified.decision, classified.reason, false),
+      preflightFailure: true
+    };
+  }
   try {
     const result = await callTool({
       baseUrl: options.baseUrl,
@@ -7924,7 +8016,7 @@ async function attemptCandidate(candidate, options, retryEmpty2xx) {
     });
     if (isEmptyBody(result.bodyText)) {
       if (retryEmpty2xx) {
-        warn5(
+        warn6(
           `${candidate.tool}: got an empty response body on a ${result.status} (already billed) and --retry-empty-2xx is set -- trying another candidate, which bills again`
         );
         return {
@@ -7969,12 +8061,13 @@ async function run(options) {
   let attemptBudgetExhausted = false;
   let callsMade = 0;
   let preflightSkips = 0;
+  const validators = new SchemaValidatorCache();
   for (const candidate of options.candidates) {
     if (callsMade >= maxAttempts) {
       attemptBudgetExhausted = true;
       break;
     }
-    const { log, result, preflightFailure } = await attemptCandidate(candidate, options, retryEmpty2xx);
+    const { log, result, preflightFailure } = await attemptCandidate(candidate, options, retryEmpty2xx, validators);
     attempts.push(log);
     if (preflightFailure) {
       preflightSkips += 1;
@@ -7997,61 +8090,6 @@ async function run(options) {
   const everyAttemptWasAPreflightSkip = attempts.length > 0 && preflightSkips === attempts.length;
   const reason = everyAttemptWasAPreflightSkip ? `no candidate accepted the supplied arguments: all ${attempts.length} candidate(s) rejected them before any request was sent (see the attempt log for each candidate's reason)` : attemptBudgetExhausted ? `max attempts (${maxAttempts}) reached with candidates remaining` : "no more candidates to try";
   return { outcome: { kind: "give_up", reason }, attempts };
-}
-
-// src/engine/schema.ts
-var import_ajv = __toESM(require_ajv(), 1);
-var PERMISSIVE_SCHEMA = { type: "object" };
-var ajv = new import_ajv.Ajv({ allErrors: true, strict: false });
-function warn6(message) {
-  process.stderr.write(`fezoctl: ${message}
-`);
-}
-function errorDetail(err) {
-  return err instanceof Error ? err.message : String(err);
-}
-function compileSchema(schema) {
-  try {
-    return ajv.compile(schema);
-  } catch (err) {
-    warn6(`failed to compile input_schema; using permissive validator (${errorDetail(err)})`);
-    return ajv.compile(PERMISSIVE_SCHEMA);
-  }
-}
-function ajvErrorsToText(errors) {
-  if (!errors || errors.length === 0) return "invalid input";
-  return errors.map((e) => `${e.instancePath || "(root)"} ${e.message}`).join("; ");
-}
-var SchemaValidatorCache = class {
-  byObject = /* @__PURE__ */ new WeakMap();
-  trueValidator;
-  falseValidator;
-  /** Returns the cached validator for `schema`, compiling it on first use. */
-  get(schema) {
-    if (schema === true) {
-      const existing = this.trueValidator;
-      if (existing) return existing;
-      const compiled2 = compileSchema(true);
-      this.trueValidator = compiled2;
-      return compiled2;
-    }
-    if (schema === false) {
-      const existing = this.falseValidator;
-      if (existing) return existing;
-      const compiled2 = compileSchema(false);
-      this.falseValidator = compiled2;
-      return compiled2;
-    }
-    const cached = this.byObject.get(schema);
-    if (cached) return cached;
-    const compiled = compileSchema(schema);
-    this.byObject.set(schema, compiled);
-    return compiled;
-  }
-};
-function validateArgs(validateFn, value) {
-  if (validateFn(value)) return { valid: true };
-  return { valid: false, errorText: ajvErrorsToText(validateFn.errors) };
 }
 
 // src/cli.ts
@@ -8429,7 +8467,7 @@ function verifyStoredField(outcome, expectedSource, resolved2, expectedValue) {
       message: `the write reported success but could not be verified: resolution now answers from "${resolved2.source}", which takes priority over "${expectedSource}", so the stored value could not be read back. Unset the higher-priority source and re-run \`fezoctl doctor\` to confirm what was stored.`
     };
   }
-  if (resolved2 !== void 0 && resolved2.value === expectedValue) return outcome;
+  if (resolved2 !== void 0 && normalizeCredentialValue(resolved2.value) === normalizeCredentialValue(expectedValue)) return outcome;
   return {
     ok: false,
     reason: "verification-failed",
@@ -8464,7 +8502,7 @@ async function cmdSetup(flags, deps, emit) {
     ...stored.url !== void 0 && flags.url !== void 0 ? { url: verifyStoredField(stored.url, expectedSource, resolution.url, flags.url) } : stored.url !== void 0 ? { url: stored.url } : {}
   };
   emit.out(renderSetup({ result, display }, flags.json));
-  const ok = result.apiKey.ok && (result.url === void 0 || result.url.ok);
+  const ok = result.apiKey.ok && (result.url === void 0 || result.url.ok) && setupProducedUsableConfig(display);
   return ok ? EXIT_OK : EXIT_OPERATIONAL;
 }
 async function cmdDoctor(flags, deps, emit) {

@@ -22,6 +22,7 @@ import { BindingError } from './bindings.js';
 import type { CallError } from './errors.js';
 import { GatewayCallError, callTool } from './client.js';
 import type { CallToolResult } from './client.js';
+import { SchemaValidatorCache, validateArgs } from './schema.js';
 
 // ---------------------------------------------------------------------------
 // Classification tables -- verbatim from the governing spec.
@@ -150,10 +151,13 @@ const RETRYABLE_CODELESS_STATUSES: ReadonlySet<number> = new Set([402, 429, 500,
  * opaque backend passthrough. The two additional variants cover the failure
  * modes that never produce an HTTP response at all:
  *
- * - `invalid-arguments`: a `BindingError` (bindings.ts) -- a manifest/args
- *   mismatch caught locally before any request is sent (missing required
- *   path/query/header/body value, a disallowed header, or `--body-json` on a
- *   GET). This SKIPS the candidate (a `retry` decision); it does NOT abort the
+ * - `invalid-arguments`: an args/manifest mismatch caught locally, before any
+ *   request is sent. Two sources, both candidate-scoped: a `BindingError`
+ *   (bindings.ts -- missing required path/query/header/body value, a disallowed
+ *   header, or `--body-json` on a GET), and a failed `input_schema` validation
+ *   of the args (schema.ts, checked by `attemptCandidate` before it calls
+ *   anything -- see there for why `run` must not bill for what `call` rejects
+ *   for free). This SKIPS the candidate (a `retry` decision); it does NOT abort the
  *   run, and because it issues no request it does not consume the attempt
  *   budget either (see `RunOptions.maxAttempts` and `run`). Every
  *   `BindingErrorReason` is derived from one candidate's own manifest,
@@ -352,10 +356,12 @@ export interface RunOptions {
    * `--max-attempts`).
    *
    * Because this budget governs SPEND, only candidates that actually issue a
-   * request consume it. A candidate skipped by a local pre-flight
-   * `BindingError` sends nothing and is charged nothing, so it is logged as an
-   * attempt but does not decrement the budget -- otherwise one unbindable
-   * manifest would silently halve the real retry budget. See `run`.
+   * request consume it. A candidate skipped by a local pre-flight check (a
+   * `BindingError`, or args that fail its own `input_schema`) sends nothing and
+   * is charged nothing, so it is logged as an attempt but does not decrement
+   * the budget -- otherwise one unbindable manifest, or one provider whose
+   * schema disagrees with the supplied arguments, would silently halve the real
+   * retry budget. See `run`.
    */
   maxAttempts?: number;
   /**
@@ -426,7 +432,39 @@ async function attemptCandidate(
   candidate: ToolCandidate,
   options: Pick<RunOptions, 'baseUrl' | 'apiKey' | 'args' | 'bodyJson' | 'fetchFn'>,
   retryEmpty2xx: boolean,
+  validators: SchemaValidatorCache,
 ): Promise<{ log: AttemptLog; result?: CallToolResult; preflightFailure: boolean }> {
+  // Schema validation is a PRE-FLIGHT check, on the same footing as
+  // `bindArgs`'s `BindingError`: it runs before any request, so a candidate
+  // that fails it costs nothing and is skipped rather than called.
+  //
+  // Without it, `run` billed for exactly the arguments `call` rejects for free.
+  // `bindArgs` catches a MISSING required path/query/header value, but nothing
+  // caught a type or shape mismatch (`{"url": 12345, "depth": "deep"}` against
+  // `{url: string, depth: integer}`), so `run` sent it, the backend answered
+  // 2xx or 4xx, and the user paid to discover a mistake `call` names locally.
+  // Validating per candidate (not once for the whole run) is deliberate: each
+  // provider publishes its own `input_schema`, so one candidate rejecting these
+  // arguments says nothing about the next — exactly the reasoning behind
+  // `invalid-arguments` being a candidate skip rather than an abort.
+  //
+  // `validateArgs` is used rather than calling the validator and reading
+  // `.errors`: validators are cached and shared, and AJV stores `errors` as
+  // mutable state on the function object, so a later validation would overwrite
+  // an earlier one's errors under any caller that held on to the reference.
+  const argsValidation = validateArgs(validators.get(candidate.inputSchema), options.args);
+  if (!argsValidation.valid) {
+    const failure: MechanicalFailure = {
+      kind: 'invalid-arguments',
+      message: `arguments do not match ${candidate.tool}'s input schema: ${argsValidation.errorText}`,
+    };
+    const classified = classifyFailure(failure);
+    return {
+      log: buildLog(candidate, classified.decision, classified.reason, false),
+      preflightFailure: true,
+    };
+  }
+
   try {
     const result = await callTool({
       baseUrl: options.baseUrl,
@@ -514,8 +552,9 @@ async function attemptCandidate(
  *   - `retry`   -> continue to the next candidate, budget and list permitting.
  *
  * The `maxAttempts` budget counts CALLS, not log entries: a candidate skipped
- * by a local pre-flight `BindingError` issued no request and was charged
- * nothing, so it appears in `attempts` but leaves the budget untouched.
+ * by a local pre-flight check (a `BindingError`, or args that fail that
+ * candidate's own `input_schema`) issued no request and was charged nothing, so
+ * it appears in `attempts` but leaves the budget untouched.
  * Charging it would let one provider's unbindable manifest silently halve the
  * user's real retry budget, which is the opposite of what a spend limit is for.
  *
@@ -530,7 +569,7 @@ async function attemptCandidate(
  * `attempts.length === 1`.
  *
  * One exhaustion reason is special-cased: when EVERY attempted candidate was
- * skipped by a local pre-flight `BindingError`, the summary says that no
+ * skipped by a local pre-flight check, the summary says that no
  * candidate accepted the supplied arguments rather than the generic "no more
  * candidates to try". Skipping (rather than aborting) such a candidate is
  * right, but it must not cost the crisp diagnostic an abort used to give: that
@@ -551,13 +590,16 @@ export async function run(options: RunOptions): Promise<RunReport> {
   // could have been billed. See `RunOptions.maxAttempts`.
   let callsMade = 0;
   let preflightSkips = 0;
+  // One cache for the whole run: two candidates may share an `inputSchema`
+  // object, and a retried candidate must not recompile its own.
+  const validators = new SchemaValidatorCache();
   for (const candidate of options.candidates) {
     if (callsMade >= maxAttempts) {
       attemptBudgetExhausted = true;
       break;
     }
 
-    const { log, result, preflightFailure } = await attemptCandidate(candidate, options, retryEmpty2xx);
+    const { log, result, preflightFailure } = await attemptCandidate(candidate, options, retryEmpty2xx, validators);
     attempts.push(log);
     if (preflightFailure) {
       preflightSkips += 1;

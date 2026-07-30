@@ -528,9 +528,36 @@ function describeStoreOutcome(outcome: { ok: boolean; reason?: string; message?:
   return 'stored';
 }
 
+/**
+ * Whether the credential state `setup` just produced is actually usable: BOTH
+ * a gateway URL and an API key resolve. `fezoctl`'s every other command needs
+ * both (`requireCredentials` in cli.ts refuses with
+ * `credentials-not-configured` when either is missing), so this is the
+ * condition that decides both what `renderSetup` prints and what `cmdSetup`
+ * exits with — one definition, two callers, so the message and the exit code
+ * cannot disagree.
+ *
+ * This exists because the pre-fix `setup` printed a `configured url:` line
+ * only when a URL had resolved, which made its ABSENCE invisible: `setup
+ * --key-stdin` with no `--url` printed "api key: stored", exited 0, and the
+ * very next `catalog` failed with "gateway URL and/or API key are not
+ * configured". The recipe in `build/step0.md` was exactly that command.
+ */
+export function setupProducedUsableConfig(display: CredentialDisplay): boolean {
+  return display.url !== undefined && display.apiKey !== undefined;
+}
+
+/** What the text output says in place of a `configured url:` value when none resolved. */
+export const NO_URL_CONFIGURED_TEXT = '(not configured — pass --url or set FEZO_URL)';
+
 export function renderSetup(input: SetupRenderInput, json: boolean): string {
+  const usable = setupProducedUsableConfig(input.display);
+
   if (json) {
-    return toJson({ result: input.result, configured: input.display });
+    // `usable` is emitted explicitly rather than left implicit in
+    // `configured.url`'s absence: a machine reader that only checks
+    // `result.apiKey.ok` would otherwise read a URL-less setup as a success.
+    return toJson({ result: input.result, configured: input.display, usable });
   }
 
   const lines = [`setup — storage: ${input.result.storage}`];
@@ -538,7 +565,15 @@ export function renderSetup(input: SetupRenderInput, json: boolean): string {
   if (input.result.url !== undefined) {
     lines.push(`  url: ${describeStoreOutcome(input.result.url)}`);
   }
-  if (input.display.url !== undefined) lines.push(`  configured url: ${input.display.url.value} (source: ${input.display.url.source})`);
+  lines.push(
+    input.display.url !== undefined
+      ? `  configured url: ${input.display.url.value} (source: ${input.display.url.source})`
+      : `  configured url: ${NO_URL_CONFIGURED_TEXT}`,
+  );
   if (input.display.apiKey !== undefined) lines.push(`  configured api key: ${input.display.apiKey.masked} (source: ${input.display.apiKey.source})`);
+  else lines.push('  configured api key: (not configured)');
+  if (!usable) {
+    lines.push('  this configuration is NOT usable yet: fezoctl needs BOTH a gateway URL and an API key.');
+  }
   return lines.join('\n');
 }

@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { isAbsolute, join, sep } from 'node:path';
 import { Readable } from 'node:stream';
 
 import {
   defaultDotEnvPath,
   maskSecret,
+  normalizeCredentialValue,
   parseDotEnv,
   readDotEnvFile,
   readKeychainSecret,
@@ -244,6 +245,71 @@ describe('defaultDotEnvPath', () => {
 
   it('treats an empty XDG_CONFIG_HOME as unset', () => {
     expect(defaultDotEnvPath({ XDG_CONFIG_HOME: '' })).toBe(join(homedir(), '.config', 'fezo', '.env'));
+  });
+
+  // ---------------------------------------------------------------------------
+  // C9: a RELATIVE `XDG_CONFIG_HOME` used to be joined verbatim, so
+  // `XDG_CONFIG_HOME=.config fezoctl setup --key-stdin --url ...` wrote a live
+  // API key to `<cwd>/.config/fezo/.env` -- 0600, but inside whatever project
+  // happened to be the working directory, which is precisely the outcome this
+  // function's doc comment says it prevents ("writing a live API key into an
+  // arbitrary project's `.env` would risk it ... being committed by accident").
+  // ---------------------------------------------------------------------------
+
+  it('ignores a RELATIVE XDG_CONFIG_HOME (which would put a live key in the project tree) and says so', () => {
+    const { stderr, result } = captureStderrWithResult(() => defaultDotEnvPath({ XDG_CONFIG_HOME: '.config' }));
+    expect(result).toBe(join(homedir(), '.config', 'fezo', '.env'));
+    // Not under the process's cwd, which is what the verbatim join produced.
+    expect(result).not.toContain(join(process.cwd(), '.config'));
+    expect(isAbsolute(result)).toBe(true);
+    // Announced, not silently discarded.
+    expect(stderr).toContain('ignoring XDG_CONFIG_HOME=".config"');
+    expect(stderr).toContain('not an absolute path');
+  });
+
+  it('ignores a relative override with path segments too, e.g. "../elsewhere/config"', () => {
+    const { stderr, result } = captureStderrWithResult(() => defaultDotEnvPath({ XDG_CONFIG_HOME: '../elsewhere/config' }));
+    expect(result).toBe(join(homedir(), '.config', 'fezo', '.env'));
+    expect(stderr).toContain('ignoring XDG_CONFIG_HOME="../elsewhere/config"');
+  });
+
+  it('an absolute XDG_CONFIG_HOME is still honoured silently', () => {
+    const { stderr, result } = captureStderrWithResult(() => defaultDotEnvPath({ XDG_CONFIG_HOME: '/xdg-config' }));
+    expect(result).toBe(join('/xdg-config', 'fezo', '.env'));
+    expect(stderr).toBe('');
+  });
+
+  // `storeCredentials` with no explicit path is what `setup` uses in production,
+  // so the guard is asserted through THAT path as well, not only through
+  // `defaultDotEnvPath` in isolation: nothing may be written under the cwd.
+  it('storeCredentials with a relative XDG_CONFIG_HOME writes nothing into the project tree', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-relative-xdg-'));
+    const previousCwd = process.cwd();
+    const previousXdg = process.env['XDG_CONFIG_HOME'];
+    const previousHome = process.env['HOME'];
+    try {
+      process.chdir(dir);
+      process.env['XDG_CONFIG_HOME'] = '.config';
+      // Redirect the fallback at a scratch HOME so the real `~/.config/fezo/.env`
+      // is never touched by the suite.
+      const scratchHome = join(dir, 'home');
+      process.env['HOME'] = scratchHome;
+
+      const { stderr, result } = captureStderrWithResult(() =>
+        storeCredentials({ storage: 'dotenv', apiKey: 'sk-relative-xdg-test', url: 'https://gw.example.com' }),
+      );
+      expect(stderr).toContain('ignoring XDG_CONFIG_HOME=".config"');
+      expect(result.apiKey.ok).toBe(true);
+      // The project-tree path the pre-fix code created.
+      expect(existsSync(join(dir, '.config', 'fezo', '.env'))).toBe(false);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousXdg === undefined) delete process.env['XDG_CONFIG_HOME'];
+      else process.env['XDG_CONFIG_HOME'] = previousXdg;
+      if (previousHome === undefined) delete process.env['HOME'];
+      else process.env['HOME'] = previousHome;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('names the config directory after the product, never after the binary', () => {
@@ -500,7 +566,7 @@ describe('readKeychainSecret', () => {
 // Trailing-newline trimming.
 // ---------------------------------------------------------------------------
 
-describe('trailing newline trimming', () => {
+describe('surrounding-whitespace and trailing-newline normalization', () => {
   it('readSecretFromStream trims a trailing newline from piped stdin-like input', async () => {
     const stream = Readable.from([Buffer.from('sk-pasted-key\n')]);
     const value = await readSecretFromStream(stream);
@@ -511,6 +577,54 @@ describe('trailing newline trimming', () => {
     const stream = Readable.from([Buffer.from('sk-pasted-key\r\n')]);
     const value = await readSecretFromStream(stream);
     expect(value).toBe('sk-pasted-key');
+  });
+
+  // ---------------------------------------------------------------------------
+  // C8: three modules used to disagree about whitespace. `readSecretFromStream`
+  // trimmed only trailing NEWLINES, `writeDotEnvFile` wrote verbatim, and
+  // `parseDotEnv` trimmed everything -- so a key pasted with a trailing space was
+  // stored correctly, read back DIFFERENT, and reported as
+  // "the value could not be read back and verified after storing it".
+  // `normalizeCredentialValue` is now the single normalization, applied on the way
+  // in and on the way back out.
+  // ---------------------------------------------------------------------------
+
+  it('readSecretFromStream trims surrounding spaces and tabs, not just newlines', async () => {
+    const stream = Readable.from([Buffer.from('  sk-pasted-key \t\n')]);
+    expect(await readSecretFromStream(stream)).toBe('sk-pasted-key');
+  });
+
+  it('normalizeCredentialValue leaves interior characters alone', () => {
+    expect(normalizeCredentialValue('  sk-a b-c  ')).toBe('sk-a b-c');
+    expect(normalizeCredentialValue('sk-plain')).toBe('sk-plain');
+    expect(normalizeCredentialValue('   ')).toBe('');
+  });
+
+  it('storeCredentials writes a whitespace-padded key and url trimmed, so the read-back matches', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-normalize-'));
+    try {
+      const dotEnvPath = join(dir, '.env');
+      const result = storeCredentials({
+        storage: 'dotenv',
+        apiKey: ' sk-padded-key ',
+        url: ' https://gw.example.com\n',
+        dotEnvPath,
+      });
+      expect(result.apiKey.ok).toBe(true);
+      expect(readFileSync(dotEnvPath, 'utf8')).toBe('FEZO_API_KEY=sk-padded-key\nFEZO_URL=https://gw.example.com\n');
+      // The property that matters: what is written is what a read-back produces.
+      expect(readDotEnvFile(dotEnvPath)['FEZO_API_KEY']).toBe('sk-padded-key');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('storeCredentials pipes a trimmed key to the Keychain too', () => {
+    const { runner, calls } = recordingKeychainRunner({ status: 0, stdout: '', stderr: '' });
+    const result = storeCredentials({ storage: 'keychain', apiKey: ' sk-padded-key \n', keychain: runner });
+    expect(result.apiKey.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.stdin).toBe('sk-padded-key\nsk-padded-key\n');
   });
 
   it('readSecretFromStream leaves a key with no trailing newline unchanged', async () => {

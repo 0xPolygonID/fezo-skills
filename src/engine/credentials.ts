@@ -43,7 +43,7 @@
 import { spawnSync } from 'node:child_process';
 import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import type { Readable } from 'node:stream';
 
 // ---------------------------------------------------------------------------
@@ -77,6 +77,30 @@ function trimTrailingNewline(value: string): string {
   return value.replace(/\r?\n+$/, '');
 }
 
+/**
+ * The ONE normalization applied to a credential value on its way in and on the
+ * way back out again: surrounding whitespace removed, interior untouched.
+ *
+ * This exists because three places in this module used to disagree about it,
+ * and the disagreement produced a false failure plus a wedged config file.
+ * `readSecretFromStream` trimmed only trailing NEWLINES, `writeDotEnvFile`
+ * wrote the value verbatim, and `parseDotEnv` trimmed everything — so a key
+ * pasted with a trailing space (` sk-live-abcdef `, trivially easy from a
+ * clipboard) was stored correctly but read back as a DIFFERENT string, which
+ * `cmdSetup`'s post-write verification reported as
+ * "the value could not be read back and verified after storing it" while
+ * `doctor` happily resolved the very same key. `.env`'s `wx` no-clobber flag
+ * then blocked the retry the message invited.
+ *
+ * Surrounding whitespace is never part of an API key or a URL, and `.env`
+ * cannot represent it anyway (`parseDotEnv` trims on read), so normalizing it
+ * away at every boundary is both safe and the only way the read-back
+ * comparison can be meaningful.
+ */
+export function normalizeCredentialValue(value: string): string {
+  return value.trim();
+}
+
 // ---------------------------------------------------------------------------
 // Masking.
 // ---------------------------------------------------------------------------
@@ -104,18 +128,20 @@ export function maskSecret(secret: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Reads a secret from `stream` to completion and trims its trailing
- * newline(s). Takes a `Readable` rather than referencing `process.stdin`
- * directly so the real code path (not a monkey-patched global) is exercised
- * by tests, and so a later task can pass `process.stdin` for `--key-stdin`
- * without this module knowing anything about argv or the CLI.
+ * Reads a secret from `stream` to completion and normalizes it with
+ * `normalizeCredentialValue` (surrounding whitespace removed — see that
+ * function for why trailing-newline-only trimming was not enough). Takes a
+ * `Readable` rather than referencing `process.stdin` directly so the real code
+ * path (not a monkey-patched global) is exercised by tests, and so a later task
+ * can pass `process.stdin` for `--key-stdin` without this module knowing
+ * anything about argv or the CLI.
  */
 export async function readSecretFromStream(stream: Readable): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of stream) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
   }
-  return trimTrailingNewline(Buffer.concat(chunks).toString('utf8'));
+  return normalizeCredentialValue(Buffer.concat(chunks).toString('utf8'));
 }
 
 // ---------------------------------------------------------------------------
@@ -281,9 +307,29 @@ export function readKeychainSecret(runner: KeychainRunner, service: string, acco
  * Every function that reads or writes `.env` in this module takes the path
  * as an explicit parameter and falls back to this function only when the
  * caller omits it — the path itself is never hardcoded inside a resolver.
+ *
+ * `XDG_CONFIG_HOME` is honoured only when it is ABSOLUTE. A relative value is
+ * resolved by the OS against the current working directory, which is exactly
+ * the outcome the paragraph above says this function prevents: with
+ * `XDG_CONFIG_HOME=.config`, `setup` wrote a live API key to
+ * `<cwd>/.config/fezo/.env` — inside whatever project happened to be the
+ * working directory, 0600 but committable. The XDG base-directory spec itself
+ * requires these variables to hold absolute paths and says a relative value
+ * "must be ignored", so falling back to the `homedir()` path is both the safe
+ * and the specified behavior. It is announced on stderr rather than applied
+ * silently, so a user whose override is being ignored can see why.
  */
 export function defaultDotEnvPath(env: NodeJS.ProcessEnv = process.env): string {
-  const configHome = env.XDG_CONFIG_HOME && env.XDG_CONFIG_HOME.length > 0 ? env.XDG_CONFIG_HOME : join(homedir(), '.config');
+  const override = env.XDG_CONFIG_HOME;
+  const fallback = join(homedir(), '.config');
+  let configHome = fallback;
+  if (override !== undefined && override.length > 0) {
+    if (isAbsolute(override)) {
+      configHome = override;
+    } else {
+      warn(`ignoring XDG_CONFIG_HOME="${override}": it is not an absolute path; using ${fallback} instead`);
+    }
+  }
   return join(configHome, 'fezo', '.env');
 }
 
@@ -667,7 +713,14 @@ export interface StoreCredentialsResult {
  * what counts as a credential.
  */
 export function storeCredentials(options: StoreCredentialsOptions): StoreCredentialsResult {
-  if (options.apiKey.trim().length === 0) {
+  // Normalized once, here, so every storage backend below persists the SAME
+  // bytes a later read-back produces — `.env` is written verbatim and parsed
+  // with trimming, so an untrimmed write cannot round-trip. See
+  // `normalizeCredentialValue`.
+  const apiKey = normalizeCredentialValue(options.apiKey);
+  const url = options.url !== undefined ? normalizeCredentialValue(options.url) : undefined;
+
+  if (apiKey.length === 0) {
     const outcome: FieldStoreOutcome = {
       ok: false,
       reason: 'empty-api-key',
@@ -676,14 +729,14 @@ export function storeCredentials(options: StoreCredentialsOptions): StoreCredent
     return {
       storage: options.storage,
       apiKey: outcome,
-      ...(options.url !== undefined ? { url: outcome } : {}),
+      ...(url !== undefined ? { url: outcome } : {}),
     };
   }
 
   if (options.storage === 'dotenv') {
     const dotEnvPath = options.dotEnvPath ?? defaultDotEnvPath();
-    const values: Record<string, string> = { FEZO_API_KEY: options.apiKey };
-    if (options.url !== undefined) values.FEZO_URL = options.url;
+    const values: Record<string, string> = { FEZO_API_KEY: apiKey };
+    if (url !== undefined) values.FEZO_URL = url;
 
     const written = writeDotEnvFile(dotEnvPath, values);
     const apiKeyOutcome: FieldStoreOutcome = written.ok
@@ -693,7 +746,7 @@ export function storeCredentials(options: StoreCredentialsOptions): StoreCredent
     return {
       storage: 'dotenv',
       apiKey: apiKeyOutcome,
-      ...(options.url !== undefined ? { url: apiKeyOutcome } : {}),
+      ...(url !== undefined ? { url: apiKeyOutcome } : {}),
     };
   }
 
@@ -703,20 +756,20 @@ export function storeCredentials(options: StoreCredentialsOptions): StoreCredent
     return {
       storage: 'keychain',
       apiKey: outcome,
-      ...(options.url !== undefined ? { url: outcome } : {}),
+      ...(url !== undefined ? { url: outcome } : {}),
     };
   }
 
-  const apiKeyWrite = writeKeychainSecret(options.keychain, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT, options.apiKey);
+  const apiKeyWrite = writeKeychainSecret(options.keychain, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT, apiKey);
   const apiKeyOutcome: FieldStoreOutcome = apiKeyWrite.ok
     ? { ok: true }
     : { ok: false, ...(apiKeyWrite.message !== undefined ? { message: apiKeyWrite.message } : {}) };
 
-  if (options.url === undefined) {
+  if (url === undefined) {
     return { storage: 'keychain', apiKey: apiKeyOutcome };
   }
 
-  const urlWrite = writeKeychainSecret(options.keychain, KEYCHAIN_SERVICE_URL, KEYCHAIN_ACCOUNT, options.url);
+  const urlWrite = writeKeychainSecret(options.keychain, KEYCHAIN_SERVICE_URL, KEYCHAIN_ACCOUNT, url);
   const urlOutcome: FieldStoreOutcome = urlWrite.ok
     ? { ok: true }
     : { ok: false, ...(urlWrite.message !== undefined ? { message: urlWrite.message } : {}) };

@@ -786,6 +786,155 @@ describe('run', () => {
 // here instead of silently desynchronizing `call`'s output from `run`'s.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// C5: `run` must not bill for arguments `call` rejects for free.
+//
+// Required-field OMISSIONS were already caught free, by `bindArgs`'s
+// BindingError. The exposure was type/shape mismatches -- the class a user pays
+// to discover -- because `cmdRun` performed no schema validation at all while
+// `cmdCall` did. A validation failure is now a candidate SKIP on the same
+// footing as a BindingError: no request, no spend, and no charge against the
+// `--max-attempts` budget (that budget governs billed calls).
+// ---------------------------------------------------------------------------
+
+describe('run validates each candidate\'s input schema before spending', () => {
+  // Two backends serving one capability. Both publish a typed schema, and the
+  // args below violate BOTH of them, so neither may be called.
+  const TYPED_SCRAPE_CATALOG: WireBackend[] = [
+    {
+      backend_id: 'firecrawl',
+      billing: { model: 'per_call' },
+      methods: [
+        {
+          name: 'scrape',
+          path: '/scrape',
+          description: 'Scrape a URL and return clean markdown content.',
+          input_schema: {
+            type: 'object',
+            properties: { profile: { type: 'string' }, url: { type: 'string' }, depth: { type: 'integer' } },
+            required: ['profile'],
+          },
+          http: { method: 'POST' },
+        },
+      ],
+    },
+    {
+      backend_id: 'scrapingbee',
+      billing: { model: 'per_call' },
+      methods: [
+        {
+          name: 'scrape',
+          path: '/scrape',
+          description: 'Scrape a URL via the ScrapingBee API.',
+          input_schema: {
+            type: 'object',
+            properties: { profile: { type: 'string' }, url: { type: 'string' }, depth: { type: 'integer' } },
+            required: ['profile'],
+          },
+          http: { method: 'GET', query: ['url'] },
+        },
+      ],
+    },
+  ];
+
+  const BAD_ARGS = '{"profile":"p","url":12345,"depth":"deep"}';
+
+  it('skips a candidate whose schema the args violate: nothing is billed, and no request is sent', async () => {
+    // No backend responses are queued: `multiRouteFetch` THROWS on any call to a
+    // backend, so a regression that spends money fails loudly here rather than
+    // quietly passing.
+    const fetchFn = multiRouteFetch(TYPED_SCRAPE_CATALOG);
+    const result = await runCli(['run', 'scrape this page', '--args-json', BAD_ARGS, '--json'], baseDeps({ fetchFn }));
+
+    expect(result.exitCode).toBe(2);
+    const parsed = JSON.parse(result.stdout) as {
+      attempts: { backendId: string; status: string; billed: boolean; reason: string }[];
+      result: { kind: string; reason: string };
+    };
+    // Both candidates were attempted (logged) and both were skipped locally.
+    expect(parsed.attempts).toHaveLength(2);
+    for (const attempt of parsed.attempts) {
+      expect(attempt.status).toBe('retry');
+      expect(attempt.billed).toBe(false);
+      expect(attempt.reason).toContain('candidate rejected the supplied arguments');
+      expect(attempt.reason).toContain('/url must be string');
+      expect(attempt.reason).toContain('/depth must be integer');
+    }
+    expect(parsed.result.kind).toBe('give_up');
+    expect(parsed.result.reason).toContain('no candidate accepted the supplied arguments');
+    // Exactly one fetch: the catalog. Nothing was called, so nothing was billed.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a validation skip does not consume the --max-attempts budget, so a later valid candidate is still called', async () => {
+    // The first candidate's schema rejects the args (a free skip); the second
+    // accepts them and must still be reached under the default budget of 2,
+    // which the skip must not have decremented. Pinned with `--max-attempts 1`
+    // so that a skip charged against the budget would leave NO calls at all.
+    const catalog: WireBackend[] = [
+      {
+        backend_id: 'firecrawl',
+        billing: { model: 'per_call' },
+        methods: [
+          {
+            name: 'scrape',
+            path: '/scrape',
+            description: 'Scrape a URL and return clean markdown content.',
+            input_schema: { type: 'object', properties: { url: { type: 'integer' } } },
+            http: { method: 'POST' },
+          },
+        ],
+      },
+      {
+        backend_id: 'scrapingbee',
+        billing: { model: 'per_call' },
+        methods: [
+          {
+            name: 'scrape',
+            path: '/scrape',
+            description: 'Scrape a URL via the ScrapingBee API.',
+            input_schema: { type: 'object', properties: { url: { type: 'string' } } },
+            http: { method: 'GET', query: ['url'] },
+          },
+        ],
+      },
+    ];
+    const fetchFn = multiRouteFetch(catalog, { scrapingbee: [okResponse('{"markdown":"hi"}')] });
+    const result = await runCli(
+      ['run', 'scrape this page', '--args-json', '{"url":"https://x.example"}', '--max-attempts', '1', '--json'],
+      baseDeps({ fetchFn }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as {
+      attempts: { backendId: string; status: string; billed: boolean }[];
+      result: { kind: string; backendId: string };
+    };
+    expect(parsed.attempts).toHaveLength(2);
+    expect(parsed.attempts[0]).toMatchObject({ backendId: 'firecrawl', status: 'retry', billed: false });
+    expect(parsed.attempts[1]).toMatchObject({ backendId: 'scrapingbee', status: 'success', billed: true });
+    expect(parsed.result.kind).toBe('success');
+    expect(parsed.result.backendId).toBe('scrapingbee');
+    expect(fetchFn).toHaveBeenCalledTimes(2); // catalog + the one valid candidate
+  });
+
+  it('run and call now agree on the same args and the same tool', async () => {
+    // The pre-fix asymmetry, pinned: `call` exited 2 naming the type errors while
+    // `run` billed a call for the identical payload.
+    const runFetch = multiRouteFetch(TYPED_SCRAPE_CATALOG);
+    const viaRun = await runCli(['run', 'scrape this page', '--args-json', BAD_ARGS], baseDeps({ fetchFn: runFetch }));
+    expect(viaRun.exitCode).toBe(2);
+    expect(runFetch).toHaveBeenCalledTimes(1);
+
+    const callFetch = multiRouteFetch(TYPED_SCRAPE_CATALOG);
+    const viaCall = await runCli(['call', 'firecrawl_scrape', '--args-json', BAD_ARGS], baseDeps({ fetchFn: callFetch }));
+    expect(viaCall.exitCode).toBe(2);
+    expect(viaCall.stderr).toContain('/url must be string');
+    expect(viaCall.stderr).toContain('/depth must be integer');
+    expect(callFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('give-up wording is shared with retry.ts, not re-invented', () => {
   it("a real run() exhaustion returns exactly cli.ts's NO_MORE_CANDIDATES_REASON", async () => {
     // One candidate, a retryable failure, no second candidate to advance into:
@@ -1006,10 +1155,15 @@ describe('setup', () => {
   // Fails against de6f98a: with `writeKeychainSecret` piping the secret only
   // once, the faithful fake above stores an empty value, post-write
   // verification catches it, and this exits 2 with `verification-failed`.
+  // `--url` is supplied because `setup` now exits non-zero unless the resulting
+  // configuration is USABLE (both a URL and a key resolve) — see cmdSetup's
+  // comment on that third condition. This test is about the Keychain write
+  // path, so it configures a complete credential set and keeps asserting exit 0
+  // for it; the URL-less case has its own test below.
   it('keychain storage never places the secret in argv, and round-trips through a faithful keychain', async () => {
     const { runner, calls } = fakeKeychain();
     const stdin = Readable.from([Buffer.from(`${SECRET}\n`)]);
-    const result = await runCli(['setup', '--key-stdin', '--storage', 'keychain', '--json'], {
+    const result = await runCli(['setup', '--key-stdin', '--storage', 'keychain', '--url', 'https://gw.example.com', '--json'], {
       stdin,
       keychain: runner,
       env: {},
@@ -1057,7 +1211,10 @@ describe('setup', () => {
       dotEnvPath: '/nonexistent/.env',
     };
 
-    const result = await runCli(['setup', '--key-stdin', '--storage', 'keychain', '--json'], deps);
+    // `--url` for the same reason as the test above: the assertion under test is
+    // "exit 0 with an UNVERIFIED api key", which requires the rest of the
+    // configuration to be complete.
+    const result = await runCli(['setup', '--key-stdin', '--storage', 'keychain', '--url', 'https://gw.example.com', '--json'], deps);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).not.toContain(SECRET);
     expect(result.stdout).not.toContain(shadowingKey);
@@ -1069,7 +1226,7 @@ describe('setup', () => {
     expect(parsed.result.apiKey.message).toContain('could not be verified');
 
     // ...and the text rendering must not claim a bare "stored".
-    const text = await runCli(['setup', '--key-stdin', '--storage', 'keychain'], {
+    const text = await runCli(['setup', '--key-stdin', '--storage', 'keychain', '--url', 'https://gw.example.com'], {
       ...deps,
       stdin: Readable.from([Buffer.from(`${SECRET}\n`)]),
     });
@@ -1110,6 +1267,140 @@ describe('setup', () => {
     const parsed = JSON.parse(result.stdout) as { result: { apiKey: { ok: boolean; reason?: string } } };
     expect(parsed.result.apiKey.ok).toBe(false);
     expect(parsed.result.apiKey.reason).toBe('verification-failed');
+  });
+
+  // ---------------------------------------------------------------------------
+  // C1: `setup --key-stdin` with NO `--url` stored the key, printed nothing about
+  // the missing URL (the `configured url:` line was emitted only when one had
+  // resolved, so its absence was invisible), and exited 0 -- while the very next
+  // command failed with `credentials-not-configured`. That exact command, with no
+  // `--url`, was the recipe `build/step0.md` gave the model.
+  //
+  // Both halves are asserted here: the state is now unmistakable in the output,
+  // and the exit code no longer claims more than is true.
+  // ---------------------------------------------------------------------------
+  it('without --url (and with no FEZO_URL), setup says the config is unusable and exits non-zero', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-setup-nourl-'));
+    try {
+      const dotEnvPath = join(dir, '.env');
+      const result = await runCli(['setup', '--key-stdin'], {
+        stdin: Readable.from([Buffer.from(`${SECRET}\n`)]),
+        dotEnvPath,
+        env: {},
+      });
+
+      // The key really was stored -- this is a partial success reported as
+      // incomplete, not a write failure.
+      expect(result.stdout).toContain('api key: stored');
+      expect(readFileSync(dotEnvPath, 'utf8')).toContain(`FEZO_API_KEY=${SECRET}`);
+
+      // ...and the missing URL is stated explicitly, not left to be inferred
+      // from an absent line.
+      expect(result.stdout).toContain('configured url: (not configured — pass --url or set FEZO_URL)');
+      expect(result.stdout).toContain('this configuration is NOT usable yet');
+      expect(result.exitCode).toBe(2);
+      expect(result.stdout).not.toContain(SECRET);
+      expect(result.stderr).not.toContain(SECRET);
+
+      // The end-to-end claim: exactly the state that makes the next command fail.
+      const next = await runCli(['catalog'], { dotEnvPath, env: {} });
+      expect(next.exitCode).toBe(2);
+      expect(next.stderr).toContain('gateway URL and/or API key are not configured');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('--json reports the same incompleteness as `usable: false`, with no second document on stdout', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-setup-nourl-json-'));
+    try {
+      const dotEnvPath = join(dir, '.env');
+      const result = await runCli(['setup', '--key-stdin', '--json'], {
+        stdin: Readable.from([Buffer.from(`${SECRET}\n`)]),
+        dotEnvPath,
+        env: {},
+      });
+      expect(result.exitCode).toBe(2);
+      // Still ONE JSON document (JSON.parse would throw on two concatenated).
+      const parsed = JSON.parse(result.stdout) as {
+        usable: boolean;
+        result: { apiKey: { ok: boolean } };
+        configured: { url?: unknown; apiKey?: { masked: string } };
+      };
+      expect(parsed.result.apiKey.ok).toBe(true); // the write itself succeeded
+      expect(parsed.usable).toBe(false);
+      expect(parsed.configured.url).toBeUndefined();
+      expect(parsed.configured.apiKey?.masked).toBe('sk-c…');
+      expect(result.stdout).not.toContain(SECRET);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a URL supplied through FEZO_URL instead of --url is enough: setup exits 0', async () => {
+    // The legitimate reason not to make this a hard failure of the WRITE: a user
+    // may configure the URL by environment variable. Resolution reads env first,
+    // so that user is already complete at this point and exits 0.
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-setup-envurl-'));
+    try {
+      const dotEnvPath = join(dir, '.env');
+      const result = await runCli(['setup', '--key-stdin'], {
+        stdin: Readable.from([Buffer.from(`${SECRET}\n`)]),
+        dotEnvPath,
+        env: { FEZO_URL: 'https://gw.example.com' },
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('configured url: https://gw.example.com (source: env)');
+      expect(result.stdout).not.toContain('NOT usable');
+      expect(result.stdout).not.toContain(SECRET);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // C8: a key pasted with surrounding whitespace. `readSecretFromStream` trimmed
+  // only trailing NEWLINES, `writeDotEnvFile` wrote the value verbatim, and
+  // `parseDotEnv` trimmed everything -- so post-write verification compared an
+  // untrimmed write against a trimmed read, reported
+  // "the value could not be read back and verified after storing it", and exited
+  // 2, while `doctor` resolved the very same key. `.env`'s `wx` no-clobber flag
+  // then blocked the retry that message invites. Note the internal contradiction
+  // the old behavior produced: ONE atomic write reported `api key: failed` and
+  // `url: stored` simultaneously.
+  // ---------------------------------------------------------------------------
+  it('a key pasted with surrounding whitespace is stored trimmed and verifies, instead of a false failure', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-setup-ws-'));
+    try {
+      const dotEnvPath = join(dir, '.env');
+      const result = await runCli(['setup', '--key-stdin', '--url', 'https://gw.example.com'], {
+        stdin: Readable.from([Buffer.from(`  ${SECRET} \n`)]),
+        dotEnvPath,
+        env: {},
+      });
+
+      expect(result.stdout).toContain('api key: stored');
+      expect(result.stdout).not.toContain('failed');
+      expect(result.stdout).not.toContain('could not be read back');
+      expect(result.exitCode).toBe(0);
+
+      // Stored trimmed, so the value that round-trips is the value that was meant.
+      const written = readFileSync(dotEnvPath, 'utf8');
+      expect(written).toContain(`FEZO_API_KEY=${SECRET}\n`);
+      expect(written).not.toContain(`FEZO_API_KEY= ${SECRET}`);
+      expect(written).not.toContain(`${SECRET} \n`);
+
+      // And the one atomic write cannot report two different outcomes for its
+      // two fields.
+      expect(result.stdout).toContain('url: stored');
+
+      const doctor = await runCli(['doctor'], { dotEnvPath, env: {}, fetchFn: multiRouteFetch(SCRAPE_CATALOG) });
+      expect(doctor.stdout).toContain('[ok] api-key: FEZO_API_KEY resolved from dotenv');
+      expect(doctor.exitCode).toBe(0);
+      expect(doctor.stdout).not.toContain(SECRET);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('requires --key-stdin and never accepts a key via a CLI flag', async () => {

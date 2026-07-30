@@ -90,6 +90,9 @@ arguments from the live catalog (\`search\`/\`schema\`) rather than assuming
 these exact names exist. Do not hardcode a backend roster: the catalog is
 the source of truth.
 
+Each line below is one command inside one Bash call, and every Bash call must
+re-establish \`FEZOCTL_ARGV\` first — see Step 0.
+
 \`\`\`bash
 "\${FEZOCTL_ARGV[@]}" search "web search" --schema
 "\${FEZOCTL_ARGV[@]}" call exa_search --args-json '{"query":"...","numResults":3}'

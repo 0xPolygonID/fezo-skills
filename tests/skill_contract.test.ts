@@ -39,6 +39,10 @@ const skillScriptPath = join(repoRoot, 'skills', 'fezo', 'scripts', 'fezoctl.mjs
 const packageJsonPath = join(repoRoot, 'package.json');
 
 const skillMd = readFileSync(skillMdPath, 'utf8');
+/** `skillMd` with every whitespace run collapsed to one space, for asserting on
+ * prose phrases that legitimately wrap across lines: the property under test is
+ * the wording, not where the paragraph happens to break. */
+const skillMdFlat = skillMd.replace(/\s+/g, ' ');
 
 function packageVersion(): string {
   const pkg: unknown = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
@@ -185,11 +189,95 @@ describe('skills/fezo/SKILL.md generated content', () => {
     expect(skillMd).toContain(`fezo-skills@\${SKILL_VERSION}`);
   });
 
-  it('the Examples block expands FEZOCTL_ARGV as a quoted array, "${FEZOCTL_ARGV[@]}"', () => {
+  it('every FEZOCTL_ARGV expansion in the file is the quoted array form "${FEZOCTL_ARGV[@]}"', () => {
     expect(skillMd).toContain('"${FEZOCTL_ARGV[@]}"');
-    // Guard against a regression to an unquoted or scalar-style expansion.
-    expect(skillMd).not.toMatch(/(?<!")\$FEZOCTL_ARGV(?!\[)/);
     expect(skillMd).not.toContain('$FEZOCTL_ARGV[@]"'); // missing open quote
+
+    // A POSITIVE count, not a negative regex. The previous guard here was
+    // `not.toMatch(/(?<!")\$FEZOCTL_ARGV(?!\[)/)`, whose lookbehind was inert
+    // (`"${FEZOCTL_ARGV[@]}"` contains `{`, so `\$FEZOCTL_ARGV` could never
+    // match it) and which therefore PASSED for the two spellings that matter
+    // most: `${FEZOCTL_ARGV[@]}` unquoted (word-splits on a spaced SKILL_DIR --
+    // the exact hazard the argv-array decision exists to survive) and
+    // `"$FEZOCTL_ARGV"` (a quoted scalar, which expands to element 0 alone, so
+    // `node /path/x.mjs` becomes bare `node`).
+    //
+    // Counting instead: every place the variable is READ (`$FEZOCTL_ARGV` or
+    // `${FEZOCTL_ARGV...`) must be one of the fully quoted array expansions.
+    // Assignments (`FEZOCTL_ARGV=(`) and prose mentions carry no `$` and so are
+    // not counted. Both regression spellings above make the two counts differ.
+    const reads = [...skillMd.matchAll(/\$\{?FEZOCTL_ARGV/g)];
+    const quotedArrayExpansions = [...skillMd.matchAll(/"\$\{FEZOCTL_ARGV\[@\]\}"/g)];
+    expect(quotedArrayExpansions.length).toBeGreaterThan(0);
+    expect(reads.length, `every FEZOCTL_ARGV expansion must be "\${FEZOCTL_ARGV[@]}"; found ${String(reads.length)} expansion(s) but only ${String(quotedArrayExpansions.length)} in the quoted array form`).toBe(
+      quotedArrayExpansions.length,
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // C3: the file must not tell the model to resolve once and reuse the result
+  // across Bash calls. Each Bash tool call is a fresh shell, so `FEZOCTL_ARGV`
+  // is unset on call two and every command after the first degrades to
+  // `<subcommand>: command not found`. See the two-shell execution test in
+  // tests/invocation_contract.test.ts for the behavioral half of this.
+  // ---------------------------------------------------------------------------
+
+  it('tells the model that each Bash call is a fresh shell and FEZOCTL_ARGV must be re-established', () => {
+    expect(skillMd).toContain('each Bash tool call runs in a NEW');
+    expect(skillMd).toContain('Nothing set in one call survives into the next');
+    expect(skillMd).toContain('re-establish the array before using it');
+    // The one-line re-establishment it offers must itself be an array literal.
+    expect(skillMd).toContain('FEZOCTL_ARGV=(node "/absolute/path/to/fezoctl.mjs")');
+    // ...and the pre-fix instruction must be gone.
+    expect(skillMd).not.toContain('for every subsequent command in this session');
+  });
+
+  // ---------------------------------------------------------------------------
+  // C2: the credential-leak prohibitions. `allowed-tools` grants
+  // `AskUserQuestion` (deliberately — the modal has a legitimate NON-secret use,
+  // and the governing spec fixes that exact string), the skill tells the model to
+  // run `setup`, and in an agent Bash tool stdin is closed. So the file itself
+  // has to rule out both leaking moves and name the correct third one; the rule
+  // living only in `src/engine/credentials.ts` (which has no UI) and in
+  // `CONFIGURATION.md` (which no model reads) is what made this reachable.
+  //
+  // Anchored on literal phrases, so dropping or softening the wording fails.
+  // ---------------------------------------------------------------------------
+
+  it('forbids collecting the API key through AskUserQuestion, and says why', () => {
+    expect(skillMd).toContain('**Never collect the API key through `AskUserQuestion`**');
+    expect(skillMdFlat).toContain('becomes part of the conversation transcript, which is persisted');
+    expect(skillMd).toContain('a live key in a transcript is a leaked key');
+  });
+
+  it('forbids putting the API key in a Bash command the model constructs, and says why', () => {
+    expect(skillMd).toContain('**Never put the API key in a Bash command you construct**');
+    expect(skillMd).toContain("printf '%s' 'sk-live-…' | ...");
+    expect(skillMdFlat).toContain('places the key in that process\'s argv, where any local process can read it with `ps`');
+    expect(skillMdFlat).toContain('writes it into the shell history file');
+  });
+
+  it('gives the correct third move: the user runs setup --key-stdin themselves', () => {
+    expect(skillMdFlat).toContain('stop and ask the user to run `setup --key-stdin` themselves, in their own terminal');
+    expect(skillMd).toContain('it never reaches the conversation or an argv');
+    // The Claude Code mechanism, with a fully expanded command line (the user's
+    // own shell has no FEZOCTL_ARGV to expand).
+    expect(skillMd).toContain('typing `!` followed by the command');
+    expect(skillMd).toContain('! node /absolute/path/to/fezoctl.mjs setup --key-stdin --url https://gateway.example.com');
+  });
+
+  it('names what the modal MAY collect: the gateway URL and the storage choice, both non-secret', () => {
+    expect(skillMdFlat).toContain('What you MAY collect through `AskUserQuestion`: the **gateway URL** and the **storage choice**');
+    expect(skillMd).toContain('**storage choice** (`dotenv` or `keychain`)');
+    expect(skillMdFlat).toContain('Neither is a secret; the API key is the only value that is');
+  });
+
+  // C1: the recipe the model follows must produce a USABLE configuration.
+  it('the setup recipe passes --url, and says what happens without it', () => {
+    expect(skillMd).toContain('"${FEZOCTL_ARGV[@]}" setup --key-stdin --url <gateway url>');
+    expect(skillMd).toContain('`--url` is not optional in practice');
+    expect(skillMd).toContain('(not configured — pass --url or set FEZO_URL)');
+    expect(skillMdFlat).toContain('and exits non-zero');
   });
 
   it('instructs setup through the resolved array, never a bare `fezoctl` command', () => {

@@ -44,6 +44,7 @@ import type { BoundRequest } from './engine/bindings.js';
 import type { CredentialSource, FieldStoreOutcome, KeychainRunner, ResolvedValue, StoreCredentialsResult } from './engine/credentials.js';
 import {
   credentialDisplay,
+  normalizeCredentialValue,
   readSecretFromStream,
   resolveCredentials,
   storeCredentials,
@@ -63,6 +64,7 @@ import {
   renderSearch,
   renderSetup,
   renderVersion,
+  setupProducedUsableConfig,
 } from './engine/render.js';
 import type { AttemptLog, MechanicalFailure, RunReport } from './engine/retry.js';
 import { classifyFailure, run } from './engine/retry.js';
@@ -714,7 +716,15 @@ function verifyStoredField(
         `Unset the higher-priority source and re-run \`fezoctl doctor\` to confirm what was stored.`,
     };
   }
-  if (resolved !== undefined && resolved.value === expectedValue) return outcome;
+  // Compared through the SAME normalization both sides of the write use
+  // (`normalizeCredentialValue`, applied by `readSecretFromStream` and
+  // `storeCredentials`), never raw against raw. `.env` is written verbatim but
+  // read back through `parseDotEnv`, which trims — so a key pasted with a
+  // trailing space used to be written untrimmed, read back trimmed, compared
+  // unequal, and reported as `verification-failed` even though the key WAS
+  // stored and `doctor` resolved it. One normalization, applied everywhere, is
+  // what keeps the three modules from disagreeing.
+  if (resolved !== undefined && normalizeCredentialValue(resolved.value) === normalizeCredentialValue(expectedValue)) return outcome;
   return {
     ok: false,
     reason: 'verification-failed',
@@ -776,7 +786,23 @@ async function cmdSetup(flags: Flags, deps: CliDeps, emit: Emit): Promise<number
 
   emit.out(renderSetup({ result, display }, flags.json));
 
-  const ok = result.apiKey.ok && (result.url === undefined || result.url.ok);
+  // Three conditions, not two: the API key stored, the URL (if one was being
+  // stored) stored, AND the resulting configuration is actually usable — i.e.
+  // BOTH a URL and a key now resolve.
+  //
+  // That third condition is why `setup --key-stdin` with no `--url` no longer
+  // exits 0. It used to: `ok` ignored the URL entirely, so a run that stored
+  // the key and left the gateway URL unset printed "api key: stored" and exited
+  // 0, and the next command failed with `credentials-not-configured`. A `setup`
+  // that cannot be followed by a working `catalog` must not report success —
+  // and the exit code is the only part of that report a script or an agent
+  // reliably reads. The output still says exactly what DID get stored (see
+  // `renderSetup`), so nothing is lost by the non-zero exit: this is a partial
+  // success reported as incomplete, not a write failure. A user who supplies
+  // `FEZO_URL` by environment variable instead of `--url` already has it
+  // resolving at this point (resolution reads the env first), so they exit 0.
+  const ok =
+    result.apiKey.ok && (result.url === undefined || result.url.ok) && setupProducedUsableConfig(display);
   return ok ? EXIT_OK : EXIT_OPERATIONAL;
 }
 

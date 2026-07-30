@@ -233,6 +233,12 @@ describe('callTool', () => {
       args: { id: 'p1', 'x-render-js': true, fields: ['price'] },
       fetchFn: fetchFn as unknown as typeof fetch,
     });
+    // REQUIRED, not decorative: the only `expect` above is INSIDE the fetch
+    // mock, so without this the test passes having asserted nothing whenever
+    // `callTool` returns without calling fetch — which is exactly what the three
+    // `BindingError` tests below prove it does for a range of inputs. Seven of
+    // this describe's eight siblings carry the same line for the same reason.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
   it('keeps its own Content-Type when a manifest header binding declares a colliding spelling', async () => {
