@@ -12,12 +12,17 @@
   "bin": {
     "fezoctl": "dist/fezoctl.mjs"
   },
+  "files": [
+    "dist/",
+    "skills/"
+  ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12"
   },
   "packageManager": "pnpm@11.8.0",
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc",
     "test": "vitest run",
     "bundle": "node build/bundle.mjs",
     "gen-skill": "node build/gen-skill.mjs",

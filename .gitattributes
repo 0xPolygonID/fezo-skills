@@ -1,1 +1,7 @@
 dist/fezoctl.mjs linguist-generated -diff
+
+# CI byte-compares a fresh esbuild build against the committed bundle. Any EOL
+# translation (core.autocrlf, a future `* text=auto`) would make working-tree
+# bytes differ from the blob and break that comparison for a non-obvious
+# reason. Pin the bundle to byte-for-byte, no normalization.
+dist/fezoctl.mjs -text

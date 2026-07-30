@@ -12,6 +12,12 @@ vitest.config.ts
 .gitignore
 .npmignore
 
+# Credentials — never publish. npm has no built-in default ignore for these,
+# and it stops consulting .gitignore once this file exists. package.json's
+# "files" allowlist already excludes them; this is deliberate defense in depth.
+.env
+.env.*
+
 # Local artifacts.
 node_modules/
 coverage/

@@ -6,6 +6,18 @@
     "moduleResolution": "NodeNext",
     "types": ["node"],
     "strict": true,
+    // Stricter than baseline `strict`, on purpose:
+    //   noUncheckedIndexedAccess    — the engine indexes into arrays and
+    //     records parsed from an untrusted catalog document; every such read
+    //     must be treated as possibly-undefined.
+    //   exactOptionalPropertyTypes  — the HTTP binding objects distinguish
+    //     "property absent" from "property present and undefined".
+    //   verbatimModuleSyntax        — the shipped artifact is a single-file
+    //     esbuild transform; type-only imports must be written as such so no
+    //     type-only specifier survives into the bundle.
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
     "noEmit": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
@@ -13,6 +25,6 @@
     "resolveJsonModule": true,
     "isolatedModules": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"],
+  "include": ["src/**/*.ts", "tests/**/*.ts", "vitest.config.ts"],
   "exclude": ["node_modules", "dist", "build"]
 }
