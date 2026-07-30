@@ -5,7 +5,7 @@ import { Readable } from 'node:stream';
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { candidatesToRun, resolvePackageVersion, runCli } from '../src/cli.js';
+import { NO_MORE_CANDIDATES_REASON, candidatesToRun, resolvePackageVersion, runCli } from '../src/cli.js';
 import type { CliDeps } from '../src/cli.js';
 import type { KeychainCommandResult, KeychainRunner } from '../src/engine/credentials.js';
 import type { RunSelection } from '../src/engine/rank.js';
@@ -151,6 +151,55 @@ describe('--version', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain(resolvePackageVersion());
   });
+
+  // ---------------------------------------------------------------------------
+  // I4. `resolvePackageVersion` reads a file and can throw (a bundling-layout
+  // change is enough). Unguarded, that throw propagates out of `runCli` into an
+  // unhandled rejection: a stack trace where a version string belongs. Because
+  // the skill's invocation ladder compares a global `fezoctl --version` against
+  // the skill's own version to decide whether to use it, that silently turns
+  // into mis-resolution rather than a visible failure.
+  //
+  // `node:fs` is mocked (rather than a version resolver being injected) so this
+  // exercises the real production path — the same `readFileSync` call
+  // `resolvePackageVersion` actually makes — instead of a test-only seam.
+  //
+  // Fails against de6f98a: there, `runCli` rejects and the `await` throws, so
+  // the assertions below are never reached.
+  // ---------------------------------------------------------------------------
+  it('exits 2 with a clear message, rather than throwing, when its own version cannot be read', async () => {
+    vi.resetModules();
+    vi.doMock('node:fs', async () => {
+      const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+      return {
+        ...actual,
+        default: actual,
+        readFileSync: (path: unknown, options?: unknown): unknown => {
+          if (String(path).endsWith('package.json')) throw new Error('EACCES: simulated unreadable package.json');
+          return (actual.readFileSync as (p: unknown, o?: unknown) => unknown)(path, options);
+        },
+      };
+    });
+
+    try {
+      const fresh = await import('../src/cli.js');
+
+      const text = await fresh.runCli(['--version'], {});
+      expect(text.exitCode).toBe(2);
+      expect(text.stdout).toBe('');
+      expect(text.stderr).toContain("could not determine fezoctl's own version");
+      expect(text.stderr).toContain('simulated unreadable package.json');
+
+      const json = await fresh.runCli(['--version', '--json'], {});
+      expect(json.exitCode).toBe(2);
+      const parsed = JSON.parse(json.stdout) as { error: { kind: string; message: string } };
+      expect(parsed.error.kind).toBe('version-unavailable');
+      expect(parsed.error.message).toContain('version');
+    } finally {
+      vi.doUnmock('node:fs');
+      vi.resetModules();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -196,11 +245,193 @@ describe('usage errors', () => {
     expect(result.stderr).toContain('--max-attempts');
   });
 
+  // M10: a budget of zero authorizes no calls at all, so `run` would call
+  // nothing and then report "max attempts (0) reached with candidates remaining"
+  // as an operational failure — a command-line mistake dressed up as a runtime
+  // one. Rejected as a usage error (exit 1) before any network work.
+  it('--max-attempts 0 is a usage error (exit 1), not a run that calls nothing and fails', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(
+      ['run', 'scrape this page', '--args-json', '{}', '--max-attempts', '0'],
+      baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }),
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('--max-attempts must be an integer >= 1');
+    expect(result.stderr).not.toContain('max attempts (0) reached');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('--max-attempts 1 is accepted', async () => {
+    const fetchFn = multiRouteFetch(SCRAPE_CATALOG, { firecrawl: [okResponse('{"markdown":"hi"}')] });
+    const result = await runCli(
+      ['run', 'scrape this page', '--args-json', '{"url":"https://x.example"}', '--max-attempts', '1', '--json'],
+      baseDeps({ fetchFn }),
+    );
+    expect(result.exitCode).toBe(0);
+  });
+
   it('no args at all prints help and exits 0', async () => {
     const result = await runCli([], {});
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Usage');
     expect(result.stdout).toContain('Exit codes');
+  });
+
+  // M15: `-h`/`--help` used to be recognized at argv[0] only, so `fezoctl
+  // search -h` searched the catalog for the term "-h" instead of printing help.
+  it('-h and --help are recognized anywhere in argv, not just at argv[0]', async () => {
+    const fetchFn = vi.fn();
+    for (const argv of [['search', '-h'], ['search', '--help'], ['call', 'some_tool', '-h'], ['run', 'x', '-h']]) {
+      const result = await runCli(argv, baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }));
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('Usage');
+      expect(result.stderr).toBe('');
+    }
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I2. The `--json` error contract: with `--json` set, stdout is ALWAYS a JSON
+// document. Before this, the most common failure of all — credentials not
+// configured — produced EMPTY stdout plus English on stderr, so an agent
+// scripting `fezoctl … --json` had to special-case "empty stdout means go read
+// stderr" for some failures and not others.
+//
+// `kind` is the stable part of the contract, so each value is pinned to the
+// exact path that emits it.
+// ---------------------------------------------------------------------------
+
+describe('--json failure envelope', () => {
+  const noCredentials: CliDeps = { env: {}, dotEnvPath: '/nonexistent/.env' };
+
+  function parseError(stdout: string): { kind: string; message: string } {
+    const parsed = JSON.parse(stdout) as { error?: { kind?: unknown; message?: unknown } };
+    const kind = parsed.error?.kind;
+    const message = parsed.error?.message;
+    if (typeof kind !== 'string' || typeof message !== 'string') {
+      throw new Error(`expected {"error":{"kind","message"}} on stdout, got: ${stdout}`);
+    }
+    return { kind, message };
+  }
+
+  it('credentials-not-configured: every catalog-backed command emits it (was empty stdout)', async () => {
+    const argvs: string[][] = [
+      ['search', 'scrape this page', '--json'],
+      ['schema', 'firecrawl_scrape', '--json'],
+      ['call', 'firecrawl_scrape', '--args-json', '{}', '--json'],
+      ['run', 'scrape this page', '--args-json', '{}', '--json'],
+      ['catalog', '--json'],
+    ];
+    for (const argv of argvs) {
+      const result = await runCli(argv, noCredentials);
+      expect(result.exitCode).toBe(2);
+      expect(parseError(result.stdout).kind).toBe('credentials-not-configured');
+      // The human-readable message still goes to stderr, unchanged.
+      expect(result.stderr).toContain('not configured');
+    }
+  });
+
+  it('catalog-unavailable: a gateway that cannot be reached, and one that answers non-JSON', async () => {
+    const unreachable = vi.fn(async () => {
+      throw new Error('connect ECONNREFUSED');
+    }) as unknown as typeof fetch;
+    const reachable = await runCli(['catalog', '--json'], baseDeps({ fetchFn: unreachable }));
+    expect(reachable.exitCode).toBe(2);
+    expect(parseError(reachable.stdout).kind).toBe('catalog-unavailable');
+    expect(reachable.stderr).toContain('ECONNREFUSED');
+
+    const notJson = vi.fn(async () => new Response('<html>nope</html>', { status: 200 })) as unknown as typeof fetch;
+    const parseFailure = await runCli(['search', 'scrape', '--json'], baseDeps({ fetchFn: notJson }));
+    expect(parseFailure.exitCode).toBe(2);
+    expect(parseError(parseFailure.stdout).kind).toBe('catalog-unavailable');
+
+    const status500 = vi.fn(async () => new Response('boom', { status: 500 })) as unknown as typeof fetch;
+    const statusFailure = await runCli(['schema', 'firecrawl_scrape', '--json'], baseDeps({ fetchFn: status500 }));
+    expect(statusFailure.exitCode).toBe(2);
+    expect(parseError(statusFailure.stdout).kind).toBe('catalog-unavailable');
+  });
+
+  it('tool-not-found: schema for a tool absent from the catalog', async () => {
+    const fetchFn = multiRouteFetch(SCRAPE_CATALOG);
+    const result = await runCli(['schema', 'totally_unknown_tool', '--json'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(2);
+    expect(parseError(result.stdout).kind).toBe('tool-not-found');
+    expect(result.stderr).toContain('not found');
+  });
+
+  it('invalid-args: --args-json failing the resolved tool\'s input schema', async () => {
+    const catalog: WireBackend[] = [
+      {
+        backend_id: 'firecrawl',
+        billing: { model: 'per_call' },
+        methods: [
+          {
+            name: 'scrape',
+            path: '/scrape',
+            description: 'Scrape a URL and return clean markdown content.',
+            input_schema: { type: 'object', required: ['url'], properties: { url: { type: 'string' } } },
+            http: { method: 'POST' },
+          },
+        ],
+      },
+    ];
+    const fetchFn = multiRouteFetch(catalog);
+    const result = await runCli(['call', 'firecrawl_scrape', '--args-json', '{}', '--json'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(2);
+    expect(parseError(result.stdout).kind).toBe('invalid-args');
+    expect(result.stderr).toContain('input schema');
+    // Rejected locally: only the catalog GET happened, nothing was billed.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('usage: a bad flag, an unknown command, and an unparseable payload all emit it', async () => {
+    const unknownFlag = await runCli(['catalog', '--not-a-flag', '--json'], baseDeps());
+    expect(unknownFlag.exitCode).toBe(1);
+    expect(parseError(unknownFlag.stdout).kind).toBe('usage');
+
+    const unknownCommand = await runCli(['not-a-real-command', '--json'], baseDeps());
+    expect(unknownCommand.exitCode).toBe(1);
+    expect(parseError(unknownCommand.stdout).kind).toBe('usage');
+
+    const badJson = await runCli(['call', 'some_tool', '--args-json', '{not valid json', '--json'], baseDeps());
+    expect(badJson.exitCode).toBe(1);
+    expect(parseError(badJson.stdout).kind).toBe('usage');
+
+    const missingArgs = await runCli(['call', 'some_tool', '--json'], baseDeps());
+    expect(missingArgs.exitCode).toBe(1);
+    expect(parseError(missingArgs.stdout).kind).toBe('usage');
+
+    const badMaxAttempts = await runCli(['run', 'x', '--args-json', '{}', '--max-attempts', '0', '--json'], baseDeps());
+    expect(badMaxAttempts.exitCode).toBe(1);
+    expect(parseError(badMaxAttempts.stdout).kind).toBe('usage');
+
+    // `--json` as the leading token is an unknown COMMAND, so the parsed flags
+    // never see it — but stdout must still not go silent on the one invocation
+    // that explicitly asked for JSON.
+    const jsonAsCommand = await runCli(['--json'], baseDeps());
+    expect(jsonAsCommand.exitCode).toBe(1);
+    expect(parseError(jsonAsCommand.stdout).kind).toBe('usage');
+    expect(parseError(jsonAsCommand.stdout).message).toContain('unknown command');
+  });
+
+  it('without --json, the same failures write only to stderr and leave stdout empty', async () => {
+    const result = await runCli(['catalog'], noCredentials);
+    expect(result.exitCode).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('not configured');
+  });
+
+  it('a call that reached the gateway keeps its report document instead of an error envelope', async () => {
+    // The deliberate exception to "failures emit an envelope": this document
+    // carries the attempt log and what was billed, which an envelope would lose.
+    const fetchFn = multiRouteFetch(SCRAPE_CATALOG);
+    const result = await runCli(['call', 'nonexistent_tool', '--args-json', '{}', '--json'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(2);
+    const parsed = JSON.parse(result.stdout) as { error?: unknown; attempts?: unknown[]; billedAnyAttempt?: boolean };
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.attempts).toHaveLength(1);
+    expect(parsed.billedAnyAttempt).toBe(false);
   });
 });
 
@@ -314,6 +545,119 @@ describe('call', () => {
     expect(parsed.request.body).toEqual([{ url: 'https://example.com' }]);
   });
 
+  // ---------------------------------------------------------------------------
+  // I3 / carry-forward 5. The body is validated against the binding's OWN
+  // declared media-type schema, never against `inputSchema` — whose permissive
+  // `{type:'object'}` fallback would reject a legitimate non-object body such as
+  // brightdata `scrape_async`'s array of records. Two branches matter, and the
+  // pre-existing `--body-json` test reached NEITHER: it declared
+  // `request_body: {description: 'records'}` with no `content`, so it exited at
+  // the `schema === undefined` branch before the compile probe ran.
+  //
+  // (a) A body schema that FAILS TO COMPILE. This is the branch carry-forward 5
+  // exists for: validation must be SKIPPED and the call must proceed with the
+  // non-object body intact, rather than falling back to a schema that would
+  // reject it.
+  //
+  // Fails against de6f98a? NO — this branch's behaviour is unchanged by this
+  // round of fixes; the test is new coverage of existing (correct) behaviour.
+  // It is written to fail if the permissive-fallback rule is ever "simplified"
+  // away.
+  // ---------------------------------------------------------------------------
+  it('--body-json: a body schema that fails to compile skips validation and the call proceeds with the body intact', async () => {
+    const catalog: WireBackend[] = [
+      {
+        backend_id: 'brightdata',
+        billing: { model: 'per_call' },
+        methods: [
+          {
+            name: 'scrape_async',
+            path: '/scrape_async',
+            description: 'Trigger an async scrape job.',
+            input_schema: {},
+            http: {
+              method: 'POST',
+              query: ['dataset_id'],
+              // `{type: 'bogus'}` is not a compilable JSON Schema: Ajv throws
+              // "schema is invalid" on it even under `strict: false`.
+              request_body: { content: { 'application/json': { schema: { type: 'bogus' } } } },
+            },
+          },
+        ],
+      },
+    ];
+    const fetchFn = multiRouteFetch(catalog, { brightdata: [okResponse('{"snapshot_id":"s_1"}')] });
+    const result = await runCli(
+      [
+        'call',
+        'brightdata_scrape_async',
+        '--args-json',
+        '{"dataset_id":"gd_1"}',
+        '--body-json',
+        '[{"url":"https://example.com"}]',
+        '--json',
+      ],
+      baseDeps({ fetchFn }),
+    );
+
+    // The call actually went through — not blocked by an uncompilable schema,
+    // and not silently rewritten.
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    const parsed = JSON.parse(result.stdout) as {
+      request: { query: Record<string, string>; body: unknown };
+      outcome: { kind: string; body: { snapshot_id: string } };
+    };
+    expect(parsed.outcome.kind).toBe('success');
+    expect(parsed.outcome.body.snapshot_id).toBe('s_1');
+    expect(parsed.request.query).toEqual({ dataset_id: 'gd_1' });
+    expect(parsed.request.body).toEqual([{ url: 'https://example.com' }]);
+    // Catalog GET + the real call: the array body reached the backend.
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  // (b) A body schema that COMPILES and REJECTS: exit 2 with the body-schema
+  // message, before any request is sent.
+  it('--body-json: a body that fails its own compiled media-type schema exits 2 without calling the backend', async () => {
+    const catalog: WireBackend[] = [
+      {
+        backend_id: 'brightdata',
+        billing: { model: 'per_call' },
+        methods: [
+          {
+            name: 'scrape_async',
+            path: '/scrape_async',
+            description: 'Trigger an async scrape job.',
+            input_schema: {},
+            http: {
+              method: 'POST',
+              query: ['dataset_id'],
+              request_body: {
+                content: {
+                  'application/json': {
+                    schema: { type: 'array', items: { type: 'object', required: ['url'] } },
+                  },
+                },
+              },
+            },
+          },
+        ],
+      },
+    ];
+    const fetchFn = multiRouteFetch(catalog);
+    const result = await runCli(
+      ['call', 'brightdata_scrape_async', '--args-json', '{"dataset_id":"gd_1"}', '--body-json', '[{}]', '--json'],
+      baseDeps({ fetchFn }),
+    );
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("does not match brightdata_scrape_async's request body schema");
+    const parsed = JSON.parse(result.stdout) as { error: { kind: string; message: string } };
+    expect(parsed.error.kind).toBe('invalid-body');
+    expect(parsed.error.message).toContain('request body schema');
+    // Only the catalog GET — the backend was never called, so nothing was billed.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
   it('an unresolved tool is classified as tool_not_in_catalog and exits 2 without calling fetch for a call', async () => {
     const fetchFn = multiRouteFetch(SCRAPE_CATALOG);
     const result = await runCli(['call', 'nonexistent_tool', '--args-json', '{}', '--json'], baseDeps({ fetchFn }));
@@ -337,8 +681,11 @@ describe('run', () => {
     const fetchFn = multiRouteFetch(SCRAPE_CATALOG, { firecrawl: [okResponse('{"markdown":"hi"}')] });
     const result = await runCli(['run', 'scrape this page', '--args-json', '{"url":"https://x.example"}', '--json'], baseDeps({ fetchFn }));
     expect(result.exitCode).toBe(0);
-    const parsed = JSON.parse(result.stdout) as { outcome: string; chosen: { backendId: string }; result: { kind: string } };
-    expect(parsed.outcome).toBe('selected');
+    // `selection`, not `outcome`: `run`'s --json document names the SELECTION
+    // outcome here and the call result under `result` (`call`'s `outcome` is a
+    // different shape entirely -- an object, not a string).
+    const parsed = JSON.parse(result.stdout) as { selection: string; chosen: { backendId: string }; result: { kind: string } };
+    expect(parsed.selection).toBe('selected');
     expect(parsed.chosen.backendId).toBe('firecrawl');
     expect(parsed.result.kind).toBe('success');
   });
@@ -376,8 +723,8 @@ describe('run', () => {
     const fetchFnNoOverride = multiRouteFetch(catalog);
     const refused = await runCli(['run', 'translate document', '--args-json', '{}', '--json'], baseDeps({ fetchFn: fetchFnNoOverride }));
     expect(refused.exitCode).toBe(2);
-    const refusedParsed = JSON.parse(refused.stdout) as { outcome: string; overridden: boolean };
-    expect(refusedParsed.outcome).toBe('refused-unhinted-multi-backend');
+    const refusedParsed = JSON.parse(refused.stdout) as { selection: string; overridden: boolean };
+    expect(refusedParsed.selection).toBe('refused-unhinted-multi-backend');
     expect(refusedParsed.overridden).toBe(false);
     expect(fetchFnNoOverride).toHaveBeenCalledTimes(1); // only the catalog fetch — no candidate was called
 
@@ -410,11 +757,48 @@ describe('run', () => {
     const fetchFn = multiRouteFetch(catalog);
     const result = await runCli(['run', 'check progress', '--args-json', '{}', '--json'], baseDeps({ fetchFn }));
     expect(result.exitCode).toBe(2);
-    const parsed = JSON.parse(result.stdout) as { outcome: string; asyncExcluded: { tool: string }[] };
-    expect(parsed.outcome).toBe('async-excluded');
+    const parsed = JSON.parse(result.stdout) as { selection: string; asyncExcluded: { tool: string }[] };
+    expect(parsed.selection).toBe('async-excluded');
     expect(parsed.asyncExcluded[0]?.tool).toBe('brightdata_check_progress');
     // Only the catalog GET happened -- the async lifecycle method was never called.
     expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M6. `unresolvedToolReport` synthesizes the give-up report that retry.ts's own
+// exhaustion path would have produced, which means cli.ts holds a second copy of
+// retry.ts's "no more candidates to try" wording. Nothing in the type system ties
+// the two together, so this test does: it drives a REAL `run()` to exhaustion
+// and asserts the reason it returns is character-for-character the constant
+// cli.ts uses for the synthesized case. A reworded string on either side fails
+// here instead of silently desynchronizing `call`'s output from `run`'s.
+// ---------------------------------------------------------------------------
+
+describe('give-up wording is shared with retry.ts, not re-invented', () => {
+  it("a real run() exhaustion returns exactly cli.ts's NO_MORE_CANDIDATES_REASON", async () => {
+    // One candidate, a retryable failure, no second candidate to advance into:
+    // retry.ts's "ran out of candidates" path, reached through the engine.
+    const catalog: WireBackend[] = [
+      {
+        backend_id: 'firecrawl',
+        billing: { model: 'per_call' },
+        methods: [{ name: 'scrape', path: '/scrape', description: 'Scrape a URL.', input_schema: {}, http: { method: 'POST' } }],
+      },
+    ];
+    const fetchFn = multiRouteFetch(catalog, { firecrawl: [gatewayErrorResponse(503, 'backend_unavailable')] });
+    const fromEngine = await runCli(['call', 'firecrawl_scrape', '--args-json', '{"url":"https://x.example"}', '--json'], baseDeps({ fetchFn }));
+    expect(fromEngine.exitCode).toBe(2);
+    const engineParsed = JSON.parse(fromEngine.stdout) as { outcome: { kind: string; reason: string } };
+    expect(engineParsed.outcome.kind).toBe('give_up');
+    expect(engineParsed.outcome.reason).toBe(NO_MORE_CANDIDATES_REASON);
+
+    // ...and the synthesized report for an unresolved tool says the same thing.
+    const synthesizedFetch = multiRouteFetch(catalog);
+    const synthesized = await runCli(['call', 'nonexistent_tool', '--args-json', '{}', '--json'], baseDeps({ fetchFn: synthesizedFetch }));
+    const synthesizedParsed = JSON.parse(synthesized.stdout) as { outcome: { reason: string } };
+    expect(synthesizedParsed.outcome.reason).toBe(NO_MORE_CANDIDATES_REASON);
+    expect(synthesizedParsed.outcome.reason).toBe(engineParsed.outcome.reason);
   });
 });
 
@@ -563,7 +947,20 @@ describe('setup', () => {
     }
   });
 
-  /** A faithful in-memory Keychain: `add-generic-password -w` stores the stdin payload, `find-generic-password -w` reads it back. */
+  /**
+   * A faithful in-memory Keychain: `add-generic-password -w` stores the stdin
+   * payload, `find-generic-password -w` reads it back.
+   *
+   * "Faithful" specifically includes the real binary's DOUBLE PROMPT: it reads
+   * the password and then a confirmation copy, as two separate newline-terminated
+   * lines. When the two do not match (which is what a single-line payload
+   * produces — the confirmation read hits EOF), the real `security` stores an
+   * EMPTY password and still exits 0. Modelling that is what makes the
+   * round-trip assertions below a real test of `writeKeychainSecret`'s payload
+   * rather than a test of a fake that quietly accepts one line; see
+   * credentials.ts's `writeKeychainSecret` doc comment for the transcript
+   * against the real binary.
+   */
   function fakeKeychain(): { runner: KeychainRunner; calls: { argv: readonly string[]; stdin: string | undefined }[] } {
     const store = new Map<string, string>();
     const calls: { argv: readonly string[]; stdin: string | undefined }[] = [];
@@ -572,7 +969,8 @@ describe('setup', () => {
         calls.push({ argv, stdin });
         if (argv[0] === 'add-generic-password') {
           const key = argv.join(' ');
-          store.set(key, (stdin ?? '').replace(/\r?\n+$/, ''));
+          const [password, confirmation] = (stdin ?? '').split('\n');
+          store.set(key, password !== undefined && password === confirmation ? password : '');
           const ok: KeychainCommandResult = { status: 0, stdout: '', stderr: '' };
           return ok;
         }
@@ -594,6 +992,9 @@ describe('setup', () => {
     return { runner, calls };
   }
 
+  // Fails against de6f98a: with `writeKeychainSecret` piping the secret only
+  // once, the faithful fake above stores an empty value, post-write
+  // verification catches it, and this exits 2 with `verification-failed`.
   it('keychain storage never places the secret in argv, and round-trips through a faithful keychain', async () => {
     const { runner, calls } = fakeKeychain();
     const stdin = Readable.from([Buffer.from(`${SECRET}\n`)]);
@@ -608,6 +1009,64 @@ describe('setup', () => {
     for (const call of calls) {
       expect(call.argv.join(' ')).not.toContain(SECRET);
     }
+
+    // Exit 0 alone would also be satisfied by "nothing was verified", so pin
+    // what actually round-tripped: the key resolves back out of the Keychain
+    // (not from env or .env, both of which are empty here) and masks to
+    // SECRET's prefix.
+    const parsed = JSON.parse(result.stdout) as {
+      result: { apiKey: { ok: boolean; reason?: string } };
+      configured: { apiKey?: { masked: string; source: string } };
+    };
+    expect(parsed.result.apiKey.ok).toBe(true);
+    expect(parsed.result.apiKey.reason).toBeUndefined(); // verified, not merely "reported ok"
+    expect(parsed.configured.apiKey?.source).toBe('keychain');
+    expect(parsed.configured.apiKey?.masked).toBe('sk-c…');
+  });
+
+  // ---------------------------------------------------------------------------
+  // C1(b): the shadowed-source hole. The common shape is a developer with
+  // FEZO_API_KEY exported in their shell running `setup --storage keychain`:
+  // resolution answers from env, so the Keychain write cannot be read back and
+  // NOTHING is verified. That is not a storage failure (the env var legitimately
+  // wins resolution), so it must still exit 0 — but the output must not print a
+  // bare "stored" as though a round-trip had been confirmed.
+  //
+  // Fails against de6f98a: there, `verifyStoredField` returned the unverified
+  // `{ok:true}` outcome untouched, `reason` was absent, and the text output said
+  // exactly "api key: stored".
+  // ---------------------------------------------------------------------------
+  it('a write shadowed by a higher-priority source exits 0 but is reported as unverified, not as "stored"', async () => {
+    const { runner } = fakeKeychain();
+    const shadowingKey = 'sk-env-var-that-shadows-the-keychain';
+    const deps: CliDeps = {
+      stdin: Readable.from([Buffer.from(`${SECRET}\n`)]),
+      keychain: runner,
+      env: { FEZO_API_KEY: shadowingKey },
+      dotEnvPath: '/nonexistent/.env',
+    };
+
+    const result = await runCli(['setup', '--key-stdin', '--storage', 'keychain', '--json'], deps);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain(SECRET);
+    expect(result.stdout).not.toContain(shadowingKey);
+    expect(result.stderr).not.toContain(SECRET);
+
+    const parsed = JSON.parse(result.stdout) as { result: { apiKey: { ok: boolean; reason?: string; message?: string } } };
+    expect(parsed.result.apiKey.ok).toBe(true);
+    expect(parsed.result.apiKey.reason).toBe('unverified-shadowed-by-env');
+    expect(parsed.result.apiKey.message).toContain('could not be verified');
+
+    // ...and the text rendering must not claim a bare "stored".
+    const text = await runCli(['setup', '--key-stdin', '--storage', 'keychain'], {
+      ...deps,
+      stdin: Readable.from([Buffer.from(`${SECRET}\n`)]),
+    });
+    expect(text.exitCode).toBe(0);
+    expect(text.stdout).toContain('NOT verified');
+    expect(text.stdout).not.toMatch(/api key: stored$/m);
+    expect(text.stdout).not.toContain(SECRET);
+    expect(text.stderr).not.toContain(SECRET);
   });
 
   // ---------------------------------------------------------------------------
@@ -654,30 +1113,83 @@ describe('setup', () => {
 // ---------------------------------------------------------------------------
 
 describe('no secret leakage across every command', () => {
-  it('search, schema, call, run, catalog, and doctor never print the raw API key', async () => {
+  // Each row carries its expected exit code, and every row's stdout is asserted
+  // NON-EMPTY. Without those two checks the sweep would pass vacuously for any
+  // command that started failing early — a command that exits 2 with empty
+  // stdout trivially "does not contain the secret". Text mode is covered
+  // alongside `--json` for every command, since the two render through
+  // different code paths.
+  it('search, schema, call, run, catalog, and doctor never print the raw API key, in text or JSON mode', async () => {
     const catalog = SCRAPE_CATALOG;
-    const commands: { argv: string[]; fetchFn: typeof fetch }[] = [
-      { argv: ['search', 'scrape this page', '--json'], fetchFn: multiRouteFetch(catalog) },
-      { argv: ['search', 'scrape this page'], fetchFn: multiRouteFetch(catalog) },
-      { argv: ['schema', 'firecrawl_scrape', '--json'], fetchFn: multiRouteFetch(catalog) },
-      { argv: ['schema', 'firecrawl_scrape'], fetchFn: multiRouteFetch(catalog) },
+    const commands: { argv: string[]; fetchFn: typeof fetch; exitCode: number }[] = [
+      { argv: ['search', 'scrape this page', '--json'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
+      { argv: ['search', 'scrape this page'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
+      { argv: ['schema', 'firecrawl_scrape', '--json'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
+      { argv: ['schema', 'firecrawl_scrape'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
       {
         argv: ['call', 'scrapingbee_scrape', '--args-json', '{"url":"https://x.example"}', '--json'],
         fetchFn: multiRouteFetch(catalog, { scrapingbee: [okResponse('{"ok":true}')] }),
+        exitCode: 0,
+      },
+      {
+        argv: ['call', 'scrapingbee_scrape', '--args-json', '{"url":"https://x.example"}'],
+        fetchFn: multiRouteFetch(catalog, { scrapingbee: [okResponse('{"ok":true}')] }),
+        exitCode: 0,
       },
       {
         argv: ['run', 'scrape this page', '--args-json', '{"url":"https://x.example"}', '--json'],
         fetchFn: multiRouteFetch(catalog, { firecrawl: [okResponse('{"ok":true}')] }),
+        exitCode: 0,
       },
-      { argv: ['catalog', '--json'], fetchFn: multiRouteFetch(catalog) },
-      { argv: ['doctor', '--json'], fetchFn: multiRouteFetch(catalog) },
-      { argv: ['doctor'], fetchFn: multiRouteFetch(catalog) },
+      {
+        argv: ['run', 'scrape this page', '--args-json', '{"url":"https://x.example"}'],
+        fetchFn: multiRouteFetch(catalog, { firecrawl: [okResponse('{"ok":true}')] }),
+        exitCode: 0,
+      },
+      // A failing call/run too: the failure paths (including the new --json
+      // error envelope) render different text than the success paths do.
+      {
+        argv: ['call', 'scrapingbee_scrape', '--args-json', '{"url":"https://x.example"}', '--json'],
+        fetchFn: multiRouteFetch(catalog, { scrapingbee: [gatewayErrorResponse(503, 'backend_unavailable')] }),
+        exitCode: 2,
+      },
+      {
+        argv: ['call', 'scrapingbee_scrape', '--args-json', '{"url":"https://x.example"}'],
+        fetchFn: multiRouteFetch(catalog, { scrapingbee: [gatewayErrorResponse(503, 'backend_unavailable')] }),
+        exitCode: 2,
+      },
+      { argv: ['catalog', '--json'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
+      { argv: ['catalog'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
+      { argv: ['doctor', '--json'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
+      { argv: ['doctor'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
     ];
 
-    for (const { argv, fetchFn } of commands) {
+    for (const { argv, fetchFn, exitCode } of commands) {
       const result = await runCli(argv, baseDeps({ fetchFn }));
-      expect(result.stdout).not.toContain(SECRET);
-      expect(result.stderr).not.toContain(SECRET);
+      const label = argv.join(' ');
+      expect(result.exitCode, label).toBe(exitCode);
+      expect(result.stdout.length, label).toBeGreaterThan(0);
+      expect(result.stdout, label).not.toContain(SECRET);
+      expect(result.stderr, label).not.toContain(SECRET);
+    }
+  });
+
+  // The failure envelope is new output, and a failure message is exactly where
+  // an "unable to authenticate with key X" style message would be tempting.
+  it('the --json failure envelope and its stderr twin never carry the API key', async () => {
+    const rejectingFetch = vi.fn(async () => new Response('unauthorized', { status: 401 })) as unknown as typeof fetch;
+    for (const argv of [
+      ['catalog', '--json'],
+      ['search', 'scrape', '--json'],
+      ['schema', 'firecrawl_scrape', '--json'],
+      ['call', 'firecrawl_scrape', '--args-json', '{}', '--json'],
+      ['run', 'scrape this page', '--args-json', '{}', '--json'],
+    ]) {
+      const result = await runCli(argv, baseDeps({ fetchFn: rejectingFetch }));
+      expect(result.exitCode, argv.join(' ')).toBe(2);
+      expect(result.stdout.length, argv.join(' ')).toBeGreaterThan(0);
+      expect(result.stdout, argv.join(' ')).not.toContain(SECRET);
+      expect(result.stderr, argv.join(' ')).not.toContain(SECRET);
     }
   });
 });

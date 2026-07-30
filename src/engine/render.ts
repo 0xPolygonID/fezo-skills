@@ -110,6 +110,47 @@ export function renderVersion(version: string, json: boolean): string {
 }
 
 // ---------------------------------------------------------------------------
+// Failures under `--json`.
+//
+// Every `--json` failure path writes THIS document to stdout, so a script never
+// has to special-case "empty stdout means go read the English on stderr" for
+// some failures and not others. The human-readable message still goes to
+// stderr, and exit codes are unchanged; this is purely an additional,
+// machine-readable statement of the same failure.
+//
+// `kind` is a closed, STABLE set — it is the contract agents script against, so
+// values may be added but must not be renamed or repurposed. The union type is
+// what keeps it closed: a call site cannot invent a seventh value without
+// changing this declaration.
+//
+// Not used for a `call`/`run` that reached the engine and came back with a
+// report: those already emit their full attempt-log document (which carries the
+// failure in `outcome`/`result`, plus what was billed), and replacing it with a
+// bare error envelope would LOSE information. This shape is for failures that
+// happen before, or instead of, a report existing.
+// ---------------------------------------------------------------------------
+
+export type CliErrorKind =
+  /** Bad command, bad/missing flag, or an unparseable `--args-json`/`--body-json`. Exit 1. */
+  | 'usage'
+  /** No gateway URL and/or API key could be resolved from any source. Exit 2. */
+  | 'credentials-not-configured'
+  /** The catalog could not be fetched, or could not be parsed once fetched. Exit 2. */
+  | 'catalog-unavailable'
+  /** `schema <tool>`: the named tool is not in the live catalog. Exit 2. */
+  | 'tool-not-found'
+  /** `--args-json` failed validation against the resolved tool's `inputSchema`. Exit 2. */
+  | 'invalid-args'
+  /** `--body-json` failed validation against the binding's own media-type schema. Exit 2. */
+  | 'invalid-body'
+  /** `--version` could not read the version out of `package.json`. Exit 2. */
+  | 'version-unavailable';
+
+export function renderError(kind: CliErrorKind, message: string): string {
+  return toJson({ error: { kind, message } });
+}
+
+// ---------------------------------------------------------------------------
 // search
 // ---------------------------------------------------------------------------
 
@@ -217,6 +258,16 @@ function renderOutcomeText(outcome: RunOutcome): string[] {
   }
 }
 
+/**
+ * The billing statement every attempt log carries. The governing spec requires
+ * the output to STATE that a 2xx attempt is billed — a bare `billed=true` flag
+ * only reports it, and leaves a reader to infer what it means and whether a
+ * retried run charged them once or twice. Exported so `--json` can carry the
+ * identical sentence rather than a second, drifting wording of the same rule.
+ */
+export const BILLING_STATEMENT =
+  'every attempt that reached a 2xx response is billed by the provider (billed=true); attempts that failed or were skipped before a request was sent are not billed';
+
 function renderAttemptsText(attempts: readonly AttemptLog[]): string[] {
   if (attempts.length === 0) return ['attempts: (none)'];
   const lines = ['attempts:'];
@@ -227,6 +278,7 @@ function renderAttemptsText(attempts: readonly AttemptLog[]): string[] {
       `  ${String(index + 1)}. ${attempt.tool} (${attempt.backendId}) [${attempt.status}] billed=${String(attempt.billed)}${httpStatus}${gatewayCode} — ${attempt.reason}`,
     );
   });
+  lines.push(`  billing: ${BILLING_STATEMENT}`);
   return lines;
 }
 
@@ -242,6 +294,7 @@ export function renderCall(input: CallRenderInput, json: boolean): string {
       attempts: input.report.attempts,
       outcome: outcomeToJson(input.report.outcome),
       billedAnyAttempt,
+      billing: BILLING_STATEMENT,
     });
   }
 
@@ -268,6 +321,16 @@ export interface RunRenderInput {
   intent: string;
   selection: RunSelection;
   allowUnhintedAutoPick: boolean;
+  /**
+   * The candidate list `run()` was actually given — cli.ts's `candidatesToRun`
+   * output, in order. This renderer must NOT re-derive it (in particular, must
+   * not reach for `selection.ranked[0]` to name the candidate promoted under
+   * `--allow-unhinted-auto-pick`): the promotion rule decides which backend
+   * gets billed, cli.ts owns it, and a second copy here could drift into naming
+   * a candidate other than the one that was called. Empty (or absent) means
+   * nothing was called.
+   */
+  runCandidates?: readonly ToolCandidate[];
   report?: RunReport;
 }
 
@@ -278,7 +341,11 @@ export function renderRun(input: RunRenderInput, json: boolean): string {
   if (json) {
     const base: Record<string, unknown> = {
       intent: input.intent,
-      outcome: selection.outcome,
+      // `selection`, not `outcome`: `call`'s `--json` document uses `outcome`
+      // for the CALL's outcome object, and `run` puts its call outcome under
+      // `result`. One field name meaning two different things across two
+      // commands is a trap for anything scripting against both.
+      selection: selection.outcome,
     };
     switch (selection.outcome) {
       case 'no-match':
@@ -313,6 +380,7 @@ export function renderRun(input: RunRenderInput, json: boolean): string {
       base.attempts = input.report.attempts;
       base.result = outcomeToJson(input.report.outcome);
       base.billedAnyAttempt = billedAnyAttempt;
+      base.billing = BILLING_STATEMENT;
     }
     return toJson(base);
   }
@@ -342,8 +410,10 @@ export function renderRun(input: RunRenderInput, json: boolean): string {
           'use --allow-unhinted-auto-pick to pick the top-ranked one, or call a specific tool',
       );
       if (input.allowUnhintedAutoPick) {
-        const top = selection.ranked[0];
-        if (top !== undefined) lines.push(`--allow-unhinted-auto-pick set: promoting ${summarizeCandidateLine(top.candidate)}`);
+        // Named from the list the caller actually passed to `run()`, never
+        // re-derived from `selection.ranked` — see `RunRenderInput.runCandidates`.
+        const promoted = input.runCandidates?.[0];
+        if (promoted !== undefined) lines.push(`--allow-unhinted-auto-pick set: promoting ${summarizeCandidateLine(promoted)}`);
       }
       break;
     default: {
@@ -440,15 +510,33 @@ export interface SetupRenderInput {
   display: CredentialDisplay;
 }
 
+/**
+ * One field's storage outcome as a phrase.
+ *
+ * Three states, not two: a successful write that could NOT be read back and
+ * confirmed must not print a bare "stored". `cmdSetup` marks that case
+ * `{ok: true, reason: 'unverified-shadowed-by-<source>'}` — the write itself
+ * reported success and a higher-priority source legitimately shadowing
+ * resolution is not a storage failure, but the output must not claim more than
+ * was actually checked.
+ */
+function describeStoreOutcome(outcome: { ok: boolean; reason?: string; message?: string }): string {
+  if (!outcome.ok) return `failed (${outcome.message ?? outcome.reason ?? 'unknown error'})`;
+  if (outcome.reason !== undefined) {
+    return `stored, but NOT verified — ${outcome.message ?? outcome.reason}`;
+  }
+  return 'stored';
+}
+
 export function renderSetup(input: SetupRenderInput, json: boolean): string {
   if (json) {
     return toJson({ result: input.result, configured: input.display });
   }
 
   const lines = [`setup — storage: ${input.result.storage}`];
-  lines.push(`  api key: ${input.result.apiKey.ok ? 'stored' : `failed (${input.result.apiKey.message ?? input.result.apiKey.reason ?? 'unknown error'})`}`);
+  lines.push(`  api key: ${describeStoreOutcome(input.result.apiKey)}`);
   if (input.result.url !== undefined) {
-    lines.push(`  url: ${input.result.url.ok ? 'stored' : `failed (${input.result.url.message ?? input.result.url.reason ?? 'unknown error'})`}`);
+    lines.push(`  url: ${describeStoreOutcome(input.result.url)}`);
   }
   if (input.display.url !== undefined) lines.push(`  configured url: ${input.display.url.value} (source: ${input.display.url.source})`);
   if (input.display.apiKey !== undefined) lines.push(`  configured api key: ${input.display.apiKey.masked} (source: ${input.display.apiKey.source})`);

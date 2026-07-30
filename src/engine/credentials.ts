@@ -205,10 +205,22 @@ export interface KeychainWriteResult {
  * the item already exists) so re-running `setup` does not require a manual
  * delete first.
  *
- * The stdin payload gets a trailing newline appended: `security`'s
- * non-interactive stdin read expects a newline-terminated line, matching how
- * a human would type a password into the interactive prompt this form falls
- * back to.
+ * The stdin payload carries the secret TWICE, each newline-terminated. This is
+ * not redundancy and must not be "simplified" to one copy: the prompting form
+ * of `security add-generic-password ... -w` prompts twice — "password data for
+ * new item:" and then "retype password for new item:" — so a single-line stdin
+ * satisfies only the first prompt. The confirmation read then hits EOF,
+ * `security` prints "passwords don't match", re-prompts, reads EOF again, and
+ * CREATES THE ITEM WITH AN EMPTY PASSWORD WHILE EXITING 0. Verified against
+ * the real `/usr/bin/security` on macOS 15:
+ *
+ *   printf 'S\n'    | security add-generic-password -a A -s S -U -w  -> exit 0, stored value EMPTY
+ *   printf 'S\nS\n' | security add-generic-password -a A -s S -U -w  -> exit 0, stored value correct
+ *
+ * Because the failure exits 0, no status check can catch it; the exit status is
+ * not evidence that anything was stored. `cmdSetup` additionally reads the
+ * value back and compares (defence in depth), and tests assert the exact stdin
+ * this function sends — see tests/credentials.test.ts.
  */
 export function writeKeychainSecret(
   runner: KeychainRunner,
@@ -217,7 +229,7 @@ export function writeKeychainSecret(
   secret: string,
 ): KeychainWriteResult {
   const argv = ['add-generic-password', '-a', account, '-s', service, '-U', '-w'];
-  const result = runner.run(argv, `${secret}\n`);
+  const result = runner.run(argv, `${secret}\n${secret}\n`);
   if (result.status === 0) return { ok: true };
   const message = result.stderr.trim();
   return message.length > 0 ? { ok: false, message } : { ok: false, message: `security exited with status ${String(result.status)}` };

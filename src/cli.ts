@@ -19,8 +19,17 @@
 //      candidate is selected or called.
 //   2  operational failure — credentials not configured, the gateway/catalog
 //      could not be reached or read, a resolved tool's arguments failed
-//      schema validation, or a `call`/`run` that did not end in success
-//      (including a `run` refusal or an empty match).
+//      schema validation, `--version` could not read its own version, or a
+//      `call`/`run` that did not end in success (including a `run` refusal or
+//      an empty match).
+//
+// `--json` output contract: stdout is ALWAYS a JSON document when `--json` is
+// set — never empty. A failure that never produced an attempt log emits
+// render.ts's `{"error":{"kind","message"}}` envelope (see `CliErrorKind` for
+// the closed set of kinds); a `call`/`run` that reached the engine emits its
+// full report document instead, because that carries strictly more (the attempt
+// log and what was billed). The English message goes to stderr either way, and
+// the exit code is the same with and without `--json`.
 
 import { Ajv } from 'ajv';
 import { readFileSync } from 'node:fs';
@@ -43,11 +52,12 @@ import {
 import { CAPABILITY_PREFERENCES, inferCapability } from './engine/preference.js';
 import type { RunSelection } from './engine/rank.js';
 import { rankCandidates, searchCandidates, selectForRun } from './engine/rank.js';
-import type { DoctorCheck } from './engine/render.js';
+import type { CliErrorKind, DoctorCheck } from './engine/render.js';
 import {
   renderCall,
   renderCatalog,
   renderDoctor,
+  renderError,
   renderRun,
   renderSchema,
   renderSearch,
@@ -188,6 +198,18 @@ export function candidatesToRun(selection: RunSelection, allowUnhintedAutoPick: 
 // classification decision itself — `classifyFailure` still decides it.
 // ---------------------------------------------------------------------------
 
+/**
+ * `retry.ts`'s wording for "the candidate list ran out", duplicated here
+ * because `unresolvedToolReport` synthesizes the report that path would have
+ * produced. The two copies MUST stay identical — otherwise `call`'s output for
+ * an unresolved tool silently stops matching `run`'s for the same exhaustion —
+ * so `tests/cli.test.ts` pins this constant against the string a real `run()`
+ * exhaustion actually returns, rather than trusting the comment.
+ * (Importing retry.ts's own copy would be better still, but it is a local
+ * expression there, not an exported constant, and retry.ts is out of scope.)
+ */
+export const NO_MORE_CANDIDATES_REASON = 'no more candidates to try';
+
 function unresolvedToolReport(tool: string): RunReport {
   const failure: MechanicalFailure = {
     kind: 'gateway',
@@ -205,7 +227,7 @@ function unresolvedToolReport(tool: string): RunReport {
     ...(classified.httpStatus !== undefined ? { httpStatus: classified.httpStatus } : {}),
     ...(classified.gatewayCode !== undefined ? { gatewayCode: classified.gatewayCode } : {}),
   };
-  return { attempts: [attempt], outcome: { kind: 'give_up', reason: 'no more candidates to try' } };
+  return { attempts: [attempt], outcome: { kind: 'give_up', reason: NO_MORE_CANDIDATES_REASON } };
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +302,14 @@ Credentials are never accepted as a command-line argument: setup --key-stdin
 reads the API key from stdin. Otherwise, set FEZO_URL and FEZO_API_KEY (the
 deprecated ZUG_URL/ZUG_API_KEY aliases are also accepted, with one warning).
 
+With --json, stdout is always a JSON document — never empty. A failure that
+never reached the gateway is {"error":{"kind":"...","message":"..."}}, where
+kind is one of: usage, credentials-not-configured, catalog-unavailable,
+tool-not-found, invalid-args, invalid-body, version-unavailable. A call/run
+that did reach the gateway emits its full attempt-log document instead (the
+failure is in its outcome/result, alongside what was billed). The
+human-readable message always goes to stderr, and exit codes do not change.
+
 Exit codes:
   0  success
   1  usage error: a bad command/flag, or an unparseable --args-json/--body-json
@@ -290,8 +320,32 @@ Exit codes:
      match, or doctor finding a hard failure).
 `;
 
-function usageErrorMessage(command: string, message: string): string {
-  return `fezoctl: ${command}: ${message}\n`;
+// ---------------------------------------------------------------------------
+// Output sinks + the one place a failure is reported.
+//
+// Every failure goes through `emitFailure`, which writes the English message to
+// stderr AND (under `--json`) the machine-readable envelope to stdout. Bundling
+// the two sinks with the `json` flag is what makes that pairing hard to
+// half-implement: there is no per-call-site decision left about whether a given
+// failure also owes stdout a document, which is exactly how the pre-fix code
+// ended up emitting a JSON document on exactly ONE failure path while eight
+// others left stdout empty and put the whole story on stderr.
+// ---------------------------------------------------------------------------
+
+interface Emit {
+  out: (s: string) => void;
+  err: (s: string) => void;
+  json: boolean;
+}
+
+function emitFailure(emit: Emit, kind: CliErrorKind, message: string): void {
+  emit.err(`fezoctl: ${message}\n`);
+  if (emit.json) emit.out(renderError(kind, message));
+}
+
+/** A usage error (exit 1), prefixed with the command it applies to. */
+function emitUsageError(emit: Emit, command: string, message: string): void {
+  emitFailure(emit, 'usage', `${command}: ${message}`);
 }
 
 function catalogErrorMessage(err: unknown): string {
@@ -315,21 +369,72 @@ function credentialResolutionFor(deps: CliDeps) {
   });
 }
 
-function requireCredentials(deps: CliDeps, writeErr: (line: string) => void): ResolvedGateway | undefined {
+function requireCredentials(deps: CliDeps, emit: Emit): ResolvedGateway | undefined {
   const resolution = credentialResolutionFor(deps);
   if (resolution.url === undefined || resolution.apiKey === undefined) {
-    writeErr('fezoctl: gateway URL and/or API key are not configured; run `fezoctl setup --key-stdin` or set FEZO_URL/FEZO_API_KEY\n');
+    emitFailure(
+      emit,
+      'credentials-not-configured',
+      'gateway URL and/or API key are not configured; run `fezoctl setup --key-stdin` or set FEZO_URL/FEZO_API_KEY',
+    );
     return undefined;
   }
   return { baseUrl: resolution.url.value, apiKey: resolution.apiKey.value };
 }
 
-function parseJsonFlag(raw: string, flagName: string, command: string): { ok: true; value: unknown } | { ok: false; error: string } {
+// ---------------------------------------------------------------------------
+// "Resolve credentials, then fetch the catalog" — the opening move of five of
+// the seven commands (search/schema/call/run/catalog), previously copy-pasted
+// verbatim at each one. One copy means one place the two failure kinds
+// (`credentials-not-configured`, `catalog-unavailable`) are reported and one
+// place the exit code is decided.
+//
+// `doctor` deliberately does NOT use this: it must report each step as its own
+// check (and distinguish an auth rejection from a connectivity failure) rather
+// than bailing out at the first failure.
+// ---------------------------------------------------------------------------
+
+interface GatewaySession {
+  creds: ResolvedGateway;
+  candidates: ToolCandidate[];
+}
+
+type GatewayResult = { ok: true; session: GatewaySession } | { ok: false; exitCode: number };
+
+async function openGateway(deps: CliDeps, emit: Emit): Promise<GatewayResult> {
+  const creds = requireCredentials(deps, emit);
+  if (!creds) return { ok: false, exitCode: EXIT_OPERATIONAL };
+
+  try {
+    const candidates = await fetchCatalog({
+      baseUrl: creds.baseUrl,
+      apiKey: creds.apiKey,
+      ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}),
+    });
+    return { ok: true, session: { creds, candidates } };
+  } catch (err) {
+    emitFailure(emit, 'catalog-unavailable', catalogErrorMessage(err));
+    return { ok: false, exitCode: EXIT_OPERATIONAL };
+  }
+}
+
+/**
+ * Parses one `--args-json`/`--body-json` payload, reporting an unparseable one
+ * as a usage error (exit 1) on both output channels before any candidate is
+ * selected or called.
+ */
+function parseJsonFlag(
+  raw: string,
+  flagName: string,
+  command: string,
+  emit: Emit,
+): { ok: true; value: unknown } | { ok: false } {
   try {
     return { ok: true, value: JSON.parse(raw) };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, error: usageErrorMessage(command, `${flagName} is not valid JSON: ${message}`) };
+    emitUsageError(emit, command, `${flagName} is not valid JSON: ${message}`);
+    return { ok: false };
   }
 }
 
@@ -337,116 +442,94 @@ function parseJsonFlag(raw: string, flagName: string, command: string): { ok: tr
 // Commands.
 // ---------------------------------------------------------------------------
 
-async function cmdSearch(flags: Flags, deps: CliDeps, write: (s: string) => void, writeErr: (s: string) => void): Promise<number> {
+async function cmdSearch(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
   const query = flags.positionals.join(' ');
   if (query.length === 0) {
-    writeErr(usageErrorMessage('search', 'requires a query, e.g. `fezoctl search "scrape this page"`'));
+    emitUsageError(emit, 'search', 'requires a query, e.g. `fezoctl search "scrape this page"`');
     return EXIT_USAGE;
   }
 
-  const creds = requireCredentials(deps, writeErr);
-  if (!creds) return EXIT_OPERATIONAL;
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
 
-  let candidates: ToolCandidate[];
-  try {
-    candidates = await fetchCatalog({ baseUrl: creds.baseUrl, apiKey: creds.apiKey, ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}) });
-  } catch (err) {
-    writeErr(`fezoctl: ${catalogErrorMessage(err)}\n`);
-    return EXIT_OPERATIONAL;
-  }
-
-  const matches = searchCandidates(candidates, query);
+  const matches = searchCandidates(gateway.session.candidates, query);
   const inference = inferCapability(query);
   const capability = inference.kind === 'matched' ? inference.capability : undefined;
   const ranked = rankCandidates(matches, query, capability);
 
-  write(renderSearch(ranked, query, { json: flags.json, includeSchema: flags.schema }));
+  emit.out(renderSearch(ranked, query, { json: flags.json, includeSchema: flags.schema }));
   return EXIT_OK;
 }
 
-async function cmdSchema(flags: Flags, deps: CliDeps, write: (s: string) => void, writeErr: (s: string) => void): Promise<number> {
+async function cmdSchema(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
   const tool = flags.positionals[0];
   if (tool === undefined || flags.positionals.length > 1) {
-    writeErr(usageErrorMessage('schema', 'requires exactly one tool name, e.g. `fezoctl schema firecrawl_scrape`'));
+    emitUsageError(emit, 'schema', 'requires exactly one tool name, e.g. `fezoctl schema firecrawl_scrape`');
     return EXIT_USAGE;
   }
 
-  const creds = requireCredentials(deps, writeErr);
-  if (!creds) return EXIT_OPERATIONAL;
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
 
-  let candidates: ToolCandidate[];
-  try {
-    candidates = await fetchCatalog({ baseUrl: creds.baseUrl, apiKey: creds.apiKey, ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}) });
-  } catch (err) {
-    writeErr(`fezoctl: ${catalogErrorMessage(err)}\n`);
-    return EXIT_OPERATIONAL;
-  }
-
-  const candidate = findCandidateByToolName(candidates, tool);
+  const candidate = findCandidateByToolName(gateway.session.candidates, tool);
   if (!candidate) {
-    writeErr(`fezoctl: tool "${tool}" was not found in the catalog\n`);
+    emitFailure(emit, 'tool-not-found', `tool "${tool}" was not found in the catalog`);
     return EXIT_OPERATIONAL;
   }
 
-  write(renderSchema(candidate, flags.json));
+  emit.out(renderSchema(candidate, flags.json));
   return EXIT_OK;
 }
 
-async function cmdCall(flags: Flags, deps: CliDeps, write: (s: string) => void, writeErr: (s: string) => void): Promise<number> {
+async function cmdCall(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
   const tool = flags.positionals[0];
   if (tool === undefined || flags.positionals.length > 1) {
-    writeErr(usageErrorMessage('call', 'requires exactly one tool name, e.g. `fezoctl call firecrawl_scrape --args-json \'{...}\'`'));
+    emitUsageError(emit, 'call', 'requires exactly one tool name, e.g. `fezoctl call firecrawl_scrape --args-json \'{...}\'`');
     return EXIT_USAGE;
   }
   if (flags.argsJson === undefined) {
-    writeErr(usageErrorMessage('call', "requires --args-json '<json>'"));
+    emitUsageError(emit, 'call', "requires --args-json '<json>'");
     return EXIT_USAGE;
   }
 
-  const argsParsed = parseJsonFlag(flags.argsJson, '--args-json', 'call');
-  if (!argsParsed.ok) {
-    writeErr(argsParsed.error);
-    return EXIT_USAGE;
-  }
+  const argsParsed = parseJsonFlag(flags.argsJson, '--args-json', 'call', emit);
+  if (!argsParsed.ok) return EXIT_USAGE;
   const args = argsParsed.value;
 
   let bodyJson: unknown;
   if (flags.bodyJson !== undefined) {
-    const bodyParsed = parseJsonFlag(flags.bodyJson, '--body-json', 'call');
-    if (!bodyParsed.ok) {
-      writeErr(bodyParsed.error);
-      return EXIT_USAGE;
-    }
+    const bodyParsed = parseJsonFlag(flags.bodyJson, '--body-json', 'call', emit);
+    if (!bodyParsed.ok) return EXIT_USAGE;
     bodyJson = bodyParsed.value;
   }
 
-  const creds = requireCredentials(deps, writeErr);
-  if (!creds) return EXIT_OPERATIONAL;
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
+  const { creds } = gateway.session;
 
-  let candidates: ToolCandidate[];
-  try {
-    candidates = await fetchCatalog({ baseUrl: creds.baseUrl, apiKey: creds.apiKey, ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}) });
-  } catch (err) {
-    writeErr(`fezoctl: ${catalogErrorMessage(err)}\n`);
-    return EXIT_OPERATIONAL;
-  }
-
-  const candidate = findCandidateByToolName(candidates, tool);
+  const candidate = findCandidateByToolName(gateway.session.candidates, tool);
   if (!candidate) {
-    write(renderCall({ tool, report: unresolvedToolReport(tool) }, flags.json));
+    // Not an `emitFailure` envelope: this path has a full attempt log (the
+    // synthesized `tool_not_in_catalog` classification `run` would have
+    // produced), and that document is strictly more informative.
+    emit.out(renderCall({ tool, report: unresolvedToolReport(tool) }, flags.json));
     return EXIT_OPERATIONAL;
   }
 
   const cache = new SchemaValidatorCache();
   const argsValidation = validateArgs(cache.get(candidate.inputSchema), args);
   if (!argsValidation.valid) {
-    writeErr(`fezoctl: --args-json does not match ${candidate.tool}'s input schema: ${argsValidation.errorText}\n`);
+    emitFailure(emit, 'invalid-args', `--args-json does not match ${candidate.tool}'s input schema: ${argsValidation.errorText}`);
     return EXIT_OPERATIONAL;
   }
   if (bodyJson !== undefined) {
     const bodyValidation = validateBodyAgainstBinding(cache, candidate, bodyJson);
     if (!bodyValidation.valid) {
-      writeErr(`fezoctl: --body-json does not match ${candidate.tool}'s request body schema: ${bodyValidation.errorText}\n`);
+      emitFailure(
+        emit,
+        'invalid-body',
+        `--body-json does not match ${candidate.tool}'s request body schema: ${bodyValidation.errorText}`,
+      );
       return EXIT_OPERATIONAL;
     }
   }
@@ -468,60 +551,53 @@ async function cmdCall(flags: Flags, deps: CliDeps, write: (s: string) => void, 
     ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}),
   });
 
-  write(renderCall({ tool, candidate, ...(boundRequest !== undefined ? { boundRequest } : {}), report }, flags.json));
+  emit.out(renderCall({ tool, candidate, ...(boundRequest !== undefined ? { boundRequest } : {}), report }, flags.json));
   return report.outcome.kind === 'success' ? EXIT_OK : EXIT_OPERATIONAL;
 }
 
-async function cmdRun(flags: Flags, deps: CliDeps, write: (s: string) => void, writeErr: (s: string) => void): Promise<number> {
+async function cmdRun(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
   const intent = flags.positionals.join(' ');
   if (intent.length === 0) {
-    writeErr(usageErrorMessage('run', 'requires an intent, e.g. `fezoctl run "scrape this page" --args-json \'{...}\'`'));
+    emitUsageError(emit, 'run', 'requires an intent, e.g. `fezoctl run "scrape this page" --args-json \'{...}\'`');
     return EXIT_USAGE;
   }
   if (flags.argsJson === undefined) {
-    writeErr(usageErrorMessage('run', "requires --args-json '<json>'"));
+    emitUsageError(emit, 'run', "requires --args-json '<json>'");
     return EXIT_USAGE;
   }
 
-  const argsParsed = parseJsonFlag(flags.argsJson, '--args-json', 'run');
-  if (!argsParsed.ok) {
-    writeErr(argsParsed.error);
-    return EXIT_USAGE;
-  }
+  const argsParsed = parseJsonFlag(flags.argsJson, '--args-json', 'run', emit);
+  if (!argsParsed.ok) return EXIT_USAGE;
   const args = argsParsed.value;
 
   let bodyJson: unknown;
   if (flags.bodyJson !== undefined) {
-    const bodyParsed = parseJsonFlag(flags.bodyJson, '--body-json', 'run');
-    if (!bodyParsed.ok) {
-      writeErr(bodyParsed.error);
-      return EXIT_USAGE;
-    }
+    const bodyParsed = parseJsonFlag(flags.bodyJson, '--body-json', 'run', emit);
+    if (!bodyParsed.ok) return EXIT_USAGE;
     bodyJson = bodyParsed.value;
   }
 
   let maxAttempts: number | undefined;
   if (flags.maxAttempts !== undefined) {
     const n = Number(flags.maxAttempts);
-    if (!Number.isInteger(n) || n < 0) {
-      writeErr(usageErrorMessage('run', '--max-attempts must be a non-negative integer'));
+    // `>= 1`, not `>= 0`: `--max-attempts 0` authorizes no calls at all, so the
+    // run would call nothing and then report "max attempts (0) reached with
+    // candidates remaining" as an operational failure — an unusable outcome
+    // dressed up as a runtime one. A budget of zero is a mistake in the
+    // command line, so it is rejected as one, before any credential or catalog
+    // work happens.
+    if (!Number.isInteger(n) || n < 1) {
+      emitUsageError(emit, 'run', '--max-attempts must be an integer >= 1');
       return EXIT_USAGE;
     }
     maxAttempts = n;
   }
 
-  const creds = requireCredentials(deps, writeErr);
-  if (!creds) return EXIT_OPERATIONAL;
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
+  const { creds } = gateway.session;
 
-  let candidates: ToolCandidate[];
-  try {
-    candidates = await fetchCatalog({ baseUrl: creds.baseUrl, apiKey: creds.apiKey, ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}) });
-  } catch (err) {
-    writeErr(`fezoctl: ${catalogErrorMessage(err)}\n`);
-    return EXIT_OPERATIONAL;
-  }
-
-  const selection = selectForRun(candidates, intent);
+  const selection = selectForRun(gateway.session.candidates, intent);
   const runCandidates = candidatesToRun(selection, flags.allowUnhintedAutoPick);
 
   let report: RunReport | undefined;
@@ -538,35 +614,55 @@ async function cmdRun(flags: Flags, deps: CliDeps, write: (s: string) => void, w
     });
   }
 
-  write(renderRun({ intent, selection, allowUnhintedAutoPick: flags.allowUnhintedAutoPick, ...(report !== undefined ? { report } : {}) }, flags.json));
+  // `runCandidates` is handed to the renderer rather than letting it re-derive
+  // which candidate was promoted: this list is what `run()` was actually given,
+  // so the output cannot name a different candidate than the one that was
+  // called (and billed). See `RunRenderInput.runCandidates`.
+  emit.out(
+    renderRun(
+      {
+        intent,
+        selection,
+        allowUnhintedAutoPick: flags.allowUnhintedAutoPick,
+        runCandidates,
+        ...(report !== undefined ? { report } : {}),
+      },
+      flags.json,
+    ),
+  );
 
   if (report === undefined) return EXIT_OPERATIONAL;
   return report.outcome.kind === 'success' ? EXIT_OK : EXIT_OPERATIONAL;
 }
 
-async function cmdCatalog(flags: Flags, deps: CliDeps, write: (s: string) => void, writeErr: (s: string) => void): Promise<number> {
-  const creds = requireCredentials(deps, writeErr);
-  if (!creds) return EXIT_OPERATIONAL;
+async function cmdCatalog(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
 
-  let candidates: ToolCandidate[];
-  try {
-    candidates = await fetchCatalog({ baseUrl: creds.baseUrl, apiKey: creds.apiKey, ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}) });
-  } catch (err) {
-    writeErr(`fezoctl: ${catalogErrorMessage(err)}\n`);
-    return EXIT_OPERATIONAL;
-  }
-
-  write(renderCatalog(candidates, flags.json));
+  emit.out(renderCatalog(gateway.session.candidates, flags.json));
   return EXIT_OK;
 }
 
 /**
- * Downgrades a storage backend's reported outcome to a failure when it cannot
- * be verified by reading the value straight back — see `cmdSetup`'s doc
- * comment on the call site for why this exists. Leaves `outcome` untouched
- * when it was already a failure, or when the freshly resolved value came from
- * a source other than the one just written (nothing to attribute a mismatch
- * to; a higher-priority source is a separate, pre-existing condition).
+ * Classifies a storage backend's reported outcome against what reading the
+ * value straight back actually produced — see `cmdSetup`'s doc comment on the
+ * call site for why post-write verification exists at all. Three outcomes, not
+ * two:
+ *
+ *   - already a failure -> unchanged.
+ *   - verified: the freshly resolved value came from the source just written
+ *     and equals what was written -> unchanged (`{ok: true}`, "stored").
+ *   - shadowed: resolution answered from a DIFFERENT (higher-priority) source,
+ *     e.g. an exported `FEZO_API_KEY` while writing to the Keychain. Nothing
+ *     was verified, because there is no way to read past the shadowing source
+ *     here. That is not a storage failure — the env var legitimately wins
+ *     resolution and the write may well have succeeded — so it stays `ok: true`
+ *     and exits 0, but it is reported as UNVERIFIED rather than as "stored":
+ *     claiming verification that never happened is exactly how the original
+ *     null-password bug (see credentials.ts's `writeKeychainSecret`) could
+ *     still slip through for any developer with the env var exported.
+ *   - anything else (nothing resolved, or a mismatching value from the source
+ *     just written) -> a hard verification failure.
  */
 function verifyStoredField(
   outcome: FieldStoreOutcome,
@@ -575,7 +671,16 @@ function verifyStoredField(
   expectedValue: string,
 ): FieldStoreOutcome {
   if (!outcome.ok) return outcome;
-  if (resolved !== undefined && resolved.source !== expectedSource) return outcome;
+  if (resolved !== undefined && resolved.source !== expectedSource) {
+    return {
+      ok: true,
+      reason: `unverified-shadowed-by-${resolved.source}`,
+      message:
+        `the write reported success but could not be verified: resolution now answers from "${resolved.source}", ` +
+        `which takes priority over "${expectedSource}", so the stored value could not be read back. ` +
+        `Unset the higher-priority source and re-run \`fezoctl doctor\` to confirm what was stored.`,
+    };
+  }
   if (resolved !== undefined && resolved.value === expectedValue) return outcome;
   return {
     ok: false,
@@ -585,16 +690,14 @@ function verifyStoredField(
   };
 }
 
-async function cmdSetup(flags: Flags, deps: CliDeps, write: (s: string) => void, writeErr: (s: string) => void): Promise<number> {
+async function cmdSetup(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
   if (!flags.keyStdin) {
-    writeErr(
-      usageErrorMessage('setup', 'requires --key-stdin (the API key is read from stdin; it must never be passed as a command-line argument)'),
-    );
+    emitUsageError(emit, 'setup', 'requires --key-stdin (the API key is read from stdin; it must never be passed as a command-line argument)');
     return EXIT_USAGE;
   }
   const storage = flags.storage ?? 'dotenv';
   if (storage !== 'dotenv' && storage !== 'keychain') {
-    writeErr(usageErrorMessage('setup', '--storage must be "dotenv" or "keychain"'));
+    emitUsageError(emit, 'setup', '--storage must be "dotenv" or "keychain"');
     return EXIT_USAGE;
   }
 
@@ -625,7 +728,8 @@ async function cmdSetup(flags: Flags, deps: CliDeps, write: (s: string) => void,
   // when the freshly resolved value's source is the one we just wrote to (or
   // nothing resolved at all) — a higher-priority source (a real env var)
   // overriding resolution is a separate, pre-existing condition, not a
-  // storage failure, and must not be reported as one.
+  // storage failure, and must not be reported as one. It is reported as
+  // UNVERIFIED instead of "stored", though: see `verifyStoredField`.
   const expectedSource = storage;
   const result: StoreCredentialsResult = {
     storage: stored.storage,
@@ -637,13 +741,13 @@ async function cmdSetup(flags: Flags, deps: CliDeps, write: (s: string) => void,
         : {}),
   };
 
-  write(renderSetup({ result, display }, flags.json));
+  emit.out(renderSetup({ result, display }, flags.json));
 
   const ok = result.apiKey.ok && (result.url === undefined || result.url.ok);
   return ok ? EXIT_OK : EXIT_OPERATIONAL;
 }
 
-async function cmdDoctor(flags: Flags, deps: CliDeps, write: (s: string) => void, _writeErr: (s: string) => void): Promise<number> {
+async function cmdDoctor(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
   const checks: DoctorCheck[] = [];
 
   const resolution = credentialResolutionFor(deps);
@@ -723,7 +827,7 @@ async function cmdDoctor(flags: Flags, deps: CliDeps, write: (s: string) => void
     checks.push({ name: 'preference-hints', status: 'skipped', message: 'skipped: catalog unavailable' });
   }
 
-  write(renderDoctor(checks, flags.json));
+  emit.out(renderDoctor(checks, flags.json));
   return checks.some((check) => check.status === 'fail') ? EXIT_OPERATIONAL : EXIT_OK;
 }
 
@@ -742,41 +846,69 @@ export async function runCli(argv: readonly string[], deps: CliDeps = {}): Promi
   };
   const finish = (exitCode: number): CliResult => ({ exitCode, stdout: outLines.join(''), stderr: errLines.join('') });
 
+  // Before argv is parsed there is no `Flags` to read `--json` off, so these
+  // pre-parse paths derive it straight from argv. That is the SAME condition
+  // `parseArgv` applies (`--json` is a boolean flag, matched by exact token),
+  // so the two agree for every argv that reaches a command.
+  const preParseEmit: Emit = { out: write, err: writeErr, json: argv.includes('--json') };
+
   const first = argv[0];
-  if (first === undefined || first === '--help' || first === '-h') {
+  // Recognized anywhere in argv, not just at argv[0]: `fezoctl search -h`
+  // otherwise silently searches the catalog for the term "-h".
+  const wantsHelp = argv.some((token) => token === '--help' || token === '-h');
+  if (first === undefined || wantsHelp) {
     write(HELP_TEXT);
     return finish(EXIT_OK);
   }
   if (first === '--version') {
-    write(renderVersion(resolvePackageVersion(), argv.includes('--json')));
+    // Guarded, because `resolvePackageVersion` reads a file and can throw: an
+    // unhandled rejection here would print a stack trace where a version string
+    // belongs, and the skill's invocation ladder compares a global `fezoctl
+    // --version` against the skill's own version to decide whether to use it —
+    // so a thrown error becomes silent mis-resolution rather than a visible
+    // failure.
+    let version: string;
+    try {
+      version = resolvePackageVersion();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      emitFailure(preParseEmit, 'version-unavailable', `could not determine fezoctl's own version: ${message}`);
+      return finish(EXIT_OPERATIONAL);
+    }
+    write(renderVersion(version, preParseEmit.json));
     return finish(EXIT_OK);
   }
 
   const parsed = parseArgv(argv.slice(1));
   if (!parsed.ok) {
-    writeErr(`fezoctl: ${parsed.error}\n`);
+    emitFailure(preParseEmit, 'usage', parsed.error);
     writeErr(HELP_TEXT);
     return finish(EXIT_USAGE);
   }
   const { flags } = parsed;
+  const emit: Emit = { out: write, err: writeErr, json: flags.json };
 
   switch (first) {
     case 'search':
-      return finish(await cmdSearch(flags, deps, write, writeErr));
+      return finish(await cmdSearch(flags, deps, emit));
     case 'schema':
-      return finish(await cmdSchema(flags, deps, write, writeErr));
+      return finish(await cmdSchema(flags, deps, emit));
     case 'call':
-      return finish(await cmdCall(flags, deps, write, writeErr));
+      return finish(await cmdCall(flags, deps, emit));
     case 'run':
-      return finish(await cmdRun(flags, deps, write, writeErr));
+      return finish(await cmdRun(flags, deps, emit));
     case 'catalog':
-      return finish(await cmdCatalog(flags, deps, write, writeErr));
+      return finish(await cmdCatalog(flags, deps, emit));
     case 'setup':
-      return finish(await cmdSetup(flags, deps, write, writeErr));
+      return finish(await cmdSetup(flags, deps, emit));
     case 'doctor':
-      return finish(await cmdDoctor(flags, deps, write, writeErr));
+      return finish(await cmdDoctor(flags, deps, emit));
     default:
-      writeErr(`fezoctl: unknown command "${first}"\n`);
+      // `preParseEmit`, not `emit`: the unrecognized command may itself be the
+      // `--json` token (`fezoctl --json`), in which case `parseArgv` never saw
+      // it as a flag and `flags.json` is false — and stdout would go silent on
+      // exactly the invocation that asked for JSON.
+      emitFailure(preParseEmit, 'usage', `unknown command "${first}"`);
       writeErr(HELP_TEXT);
       return finish(EXIT_USAGE);
   }

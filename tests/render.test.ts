@@ -6,9 +6,11 @@ import type { CredentialResolution, StoreCredentialsResult } from '../src/engine
 import type { RankedCandidate, RunSelection } from '../src/engine/rank.js';
 import type { AttemptLog, RunReport } from '../src/engine/retry.js';
 import {
+  BILLING_STATEMENT,
   renderCall,
   renderCatalog,
   renderDoctor,
+  renderError,
   renderRun,
   renderSchema,
   renderSearch,
@@ -258,10 +260,10 @@ describe('renderRun', () => {
     expect(text).not.toContain('attempts:');
 
     const parsed = JSON.parse(renderRun({ intent: 'snapshot status', selection, allowUnhintedAutoPick: false }, true)) as {
-      outcome: string;
+      selection: string;
       asyncExcluded: { tool: string }[];
     };
-    expect(parsed.outcome).toBe('async-excluded');
+    expect(parsed.selection).toBe('async-excluded');
     expect(parsed.asyncExcluded[0]?.tool).toBe('brightdata_snapshot_status');
   });
 
@@ -340,12 +342,116 @@ describe('renderRun', () => {
       attempts: [{ tool: 'firecrawl_scrape', backendId: 'firecrawl', status: 'success', httpStatus: 200, reason: '200 response', billed: true }],
       outcome: { kind: 'success', candidate: firecrawl, result: { status: 200, bodyText: '{}' } },
     };
-    const text = renderRun({ intent: 'translate document', selection, allowUnhintedAutoPick: true, report }, false);
+    const input = { intent: 'translate document', selection, allowUnhintedAutoPick: true, runCandidates: [firecrawl], report };
+    const text = renderRun(input, false);
     expect(text).toContain('promoting firecrawl_scrape');
     expect(text).toContain('billed: true');
 
-    const parsed = JSON.parse(renderRun({ intent: 'translate document', selection, allowUnhintedAutoPick: true, report }, true)) as { overridden: boolean };
+    const parsed = JSON.parse(renderRun(input, true)) as { overridden: boolean };
     expect(parsed.overridden).toBe(true);
+  });
+
+  // ---------------------------------------------------------------------------
+  // M5. The promotion rule under `--allow-unhinted-auto-pick` decides WHICH
+  // BACKEND GETS BILLED, and cli.ts's `candidatesToRun` owns it. This renderer
+  // used to re-derive the promoted candidate as `selection.ranked[0]`, i.e. hold
+  // a second copy of that rule; if the two ever disagreed, the output would name
+  // a candidate other than the one actually called and charged for.
+  //
+  // The assertion below is deliberately built on a DISAGREEMENT: `ranked[0]` is
+  // firecrawl, but the caller says it ran scrapingbee. A renderer that still
+  // re-derives from `ranked` names firecrawl and fails here. This is not a
+  // realistic argument combination — it is the only way to prove the renderer
+  // reports what it was told rather than recomputing it.
+  // ---------------------------------------------------------------------------
+  it('names the candidate the caller says it ran, never re-deriving ranked[0] itself', () => {
+    const ranked: RankedCandidate[] = [
+      { candidate: firecrawl, explanation: { tier: 'term-score', matchedTerms: [], termScore: 1, billingModel: 'per_call' } },
+      { candidate: scrapingbee, explanation: { tier: 'term-score', matchedTerms: [], termScore: 0, billingModel: 'per_call' } },
+    ];
+    const selection: RunSelection = {
+      outcome: 'refused-unhinted-multi-backend',
+      reason: { kind: 'unhinted-multi-backend', backends: ['firecrawl', 'scrapingbee'] },
+      ranked,
+    };
+    const text = renderRun(
+      { intent: 'translate document', selection, allowUnhintedAutoPick: true, runCandidates: [scrapingbee] },
+      false,
+    );
+    expect(text).toContain('promoting scrapingbee_scrape');
+    expect(text).not.toContain('promoting firecrawl_scrape');
+  });
+
+  it('promotes nothing when the caller passed no candidates, even with the override flag set', () => {
+    const selection: RunSelection = {
+      outcome: 'refused-unhinted-multi-backend',
+      reason: { kind: 'unhinted-multi-backend', backends: ['firecrawl', 'scrapingbee'] },
+      ranked: [{ candidate: firecrawl, explanation: { tier: 'term-score', matchedTerms: [], termScore: 1, billingModel: 'per_call' } }],
+    };
+    const text = renderRun({ intent: 'translate document', selection, allowUnhintedAutoPick: true, runCandidates: [] }, false);
+    expect(text).not.toContain('promoting');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M11. The governing spec asks the output to STATE that a 2xx attempt is
+// billed, not merely to expose a `billed` flag per attempt. Asserted on both
+// renderers and in both modes, because "the attempt log carries the statement"
+// is only true if every place that prints an attempt log carries it.
+// ---------------------------------------------------------------------------
+
+describe('billing statement', () => {
+  const report: RunReport = {
+    attempts: [
+      { tool: 'firecrawl_scrape', backendId: 'firecrawl', status: 'retry', httpStatus: 503, reason: 'backend unavailable', billed: false },
+      { tool: 'scrapingbee_scrape', backendId: 'scrapingbee', status: 'success', httpStatus: 200, reason: '200 response', billed: true },
+    ],
+    outcome: { kind: 'success', candidate: scrapingbee, result: { status: 200, bodyText: '{}' } },
+  };
+
+  it('says a 2xx attempt is billed, in renderCall text and JSON', () => {
+    const text = renderCall({ tool: 'scrapingbee_scrape', candidate: scrapingbee, report }, false);
+    expect(text).toContain('2xx');
+    expect(text).toContain(BILLING_STATEMENT);
+
+    const parsed = JSON.parse(renderCall({ tool: 'scrapingbee_scrape', candidate: scrapingbee, report }, true)) as { billing: string };
+    expect(parsed.billing).toBe(BILLING_STATEMENT);
+  });
+
+  it('says a 2xx attempt is billed, in renderRun text and JSON', () => {
+    const selection: RunSelection = {
+      outcome: 'selected',
+      chosen: { candidate: scrapingbee, explanation: { tier: 'term-score', matchedTerms: ['scrape'], termScore: 1, billingModel: 'per_call' } },
+      ranked: [{ candidate: scrapingbee, explanation: { tier: 'term-score', matchedTerms: ['scrape'], termScore: 1, billingModel: 'per_call' } }],
+    };
+    const input = { intent: 'scrape this page', selection, allowUnhintedAutoPick: false, runCandidates: [scrapingbee], report };
+    expect(renderRun(input, false)).toContain(BILLING_STATEMENT);
+    const parsed = JSON.parse(renderRun(input, true)) as { billing: string };
+    expect(parsed.billing).toBe(BILLING_STATEMENT);
+  });
+
+  it('the statement is one shared string, so text and JSON cannot drift apart', () => {
+    const text = renderCall({ tool: 'scrapingbee_scrape', candidate: scrapingbee, report }, false);
+    const parsed = JSON.parse(renderCall({ tool: 'scrapingbee_scrape', candidate: scrapingbee, report }, true)) as { billing: string };
+    expect(text).toContain(parsed.billing);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I2. The failure envelope every `--json` failure path writes to stdout.
+// ---------------------------------------------------------------------------
+
+describe('renderError', () => {
+  it('is a parseable {"error":{"kind","message"}} document and nothing else', () => {
+    const parsed = JSON.parse(renderError('credentials-not-configured', 'nothing is configured')) as Record<string, unknown>;
+    expect(Object.keys(parsed)).toEqual(['error']);
+    expect(parsed.error).toEqual({ kind: 'credentials-not-configured', message: 'nothing is configured' });
+  });
+
+  it('carries the message verbatim, without reformatting it', () => {
+    const message = 'could not fetch the catalog: gateway responded with status 500';
+    const parsed = JSON.parse(renderError('catalog-unavailable', message)) as { error: { message: string } };
+    expect(parsed.error.message).toBe(message);
   });
 });
 
@@ -418,6 +524,40 @@ describe('renderSetup', () => {
     expect(json).not.toContain('sk-should-never-appear-in-setup-output');
     const parsed = JSON.parse(json) as { configured: { apiKey?: { masked: string } } };
     expect(parsed.configured.apiKey?.masked).toBe('sk-s…');
+  });
+
+  // C1(b): a successful-but-unverified write is a third state. Printing a bare
+  // "stored" for it claims a round-trip that never happened.
+  it('a successful write that could not be verified is not rendered as a bare "stored"', () => {
+    const result: StoreCredentialsResult = {
+      storage: 'keychain',
+      apiKey: {
+        ok: true,
+        reason: 'unverified-shadowed-by-env',
+        message: 'the write reported success but could not be verified: resolution now answers from "env"',
+      },
+    };
+    const display = credentialDisplay({ apiKey: { value: 'sk-env-value', masked: 'sk-e…', source: 'env' } });
+
+    const text = renderSetup({ result, display }, false);
+    expect(text).toContain('NOT verified');
+    expect(text).toContain('could not be verified');
+    expect(text).not.toMatch(/api key: stored$/m);
+
+    // A genuinely verified write still says plain "stored" — the phrasing must
+    // distinguish the two states, not blur both into a caveat.
+    const verified = renderSetup({ result: { storage: 'keychain', apiKey: { ok: true } }, display }, false);
+    expect(verified).toMatch(/api key: stored$/m);
+    expect(verified).not.toContain('NOT verified');
+  });
+
+  it('a failed write is still rendered as a failure, with its message', () => {
+    const result: StoreCredentialsResult = {
+      storage: 'keychain',
+      apiKey: { ok: false, reason: 'verification-failed', message: 'the value could not be read back' },
+    };
+    const text = renderSetup({ result, display: credentialDisplay({}) }, false);
+    expect(text).toContain('failed (the value could not be read back)');
   });
 });
 

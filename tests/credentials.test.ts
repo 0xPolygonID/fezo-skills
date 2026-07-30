@@ -438,7 +438,39 @@ describe('writeKeychainSecret', () => {
     expect(call.argv.join(' ').includes(secret)).toBe(false);
 
     // The secret must instead have been sent on stdin.
-    expect(call.stdin).toBe(`${secret}\n`);
+    expect(call.stdin).toBe(`${secret}\n${secret}\n`);
+  });
+
+  // -------------------------------------------------------------------------
+  // The confirmation-prompt regression guard. `security add-generic-password
+  // ... -U -w` prompts for the password AND a retype; a single-copy stdin
+  // payload leaves the confirmation reading EOF, at which point `security`
+  // stores an EMPTY password and still exits 0 (verified against the real
+  // binary on macOS 15 — see `writeKeychainSecret`'s doc comment). No exit-code
+  // check can catch that, so the injectable runner's captured stdin is the only
+  // place it can be pinned. Deliberately asserted as a COUNT, not just a
+  // substring: `${secret}\n` also "contains" the secret.
+  // -------------------------------------------------------------------------
+  it('sends the secret twice on stdin, to satisfy security\'s confirmation prompt as well as the password prompt', () => {
+    const secret = 'sk-confirmation-prompt-guard-value';
+    const { runner, calls } = recordingKeychainRunner(OK);
+
+    writeKeychainSecret(runner, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT, secret);
+
+    const call = calls[0];
+    expect(call).toBeDefined();
+    if (call === undefined) throw new Error('unreachable');
+    const stdin = call.stdin;
+    expect(stdin).toBeDefined();
+    if (stdin === undefined) throw new Error('unreachable');
+
+    expect(stdin.split(secret).length - 1).toBe(2);
+    expect(stdin).toBe(`${secret}\n${secret}\n`);
+    // Each copy is its own newline-terminated line: `security` reads a line per
+    // prompt, so two copies on ONE line would satisfy neither.
+    expect(stdin.split('\n')).toEqual([secret, secret, '']);
+    // Still never in argv, whatever the stdin payload looks like.
+    expect(call.argv.join(' ').includes(secret)).toBe(false);
   });
 
   it('uses the recommended trailing "-w" form (no value follows it in argv)', () => {
