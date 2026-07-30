@@ -14,7 +14,8 @@
   },
   "files": [
     "dist/",
-    "skills/"
+    "skills/",
+    "CONFIGURATION.md"
   ],
   "engines": {
     "node": ">=22.12"

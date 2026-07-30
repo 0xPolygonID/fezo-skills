@@ -83,19 +83,41 @@ non-empty value:
 1. The canonical environment variable (`FEZO_URL` / `FEZO_API_KEY`).
 2. The deprecated alias (`ZUG_URL` / `ZUG_API_KEY`), with the one-time warning
    above.
-3. macOS Keychain (see below) — skipped entirely on a platform where no
-   Keychain runner is available.
+3. macOS Keychain (see below). This step is always **attempted**, never
+   conditionally skipped: `fezoctl`'s entry point always injects its
+   `/usr/bin/security`-backed Keychain runner (`src/cli.ts`'s `main()`), so
+   every resolution that gets past the two env sources shells out to
+   `security find-generic-password`. On a platform with no `/usr/bin/security`
+   that lookup just fails, and resolution falls through to the `.env` file —
+   the outcome is the same as skipping it, but the mechanism is a failed
+   lookup, not an absent runner.
 4. The `.env` config file (see below).
 
 `fezoctl doctor` reports which source won for each value (`env`,
 `deprecated-env`, `keychain`, or `dotenv`) — run it if you're not sure which
-credential is actually in effect. Verified:
+credential is actually in effect. Each `ok` credential check also prints a
+pretty-printed `details` block: the URL in full, the API key **masked**.
+Verified (against a local test gateway, hence the `localhost` URL; the
+`details` JSON's continuation lines are not re-indented, which is what the
+renderer actually emits):
 
 ```
 $ node dist/fezoctl.mjs doctor
 doctor:
   [ok] gateway-url: FEZO_URL resolved from dotenv
+      {
+  "url": {
+    "value": "http://localhost:8899",
+    "source": "dotenv"
+  }
+}
   [ok] api-key: FEZO_API_KEY resolved from dotenv
+      {
+  "apiKey": {
+    "masked": "test…",
+    "source": "dotenv"
+  }
+}
   ...
 ```
 
@@ -131,7 +153,9 @@ FEZO_URL=https://your-gateway.example.com
 `fezoctl setup --key-stdin --storage dotenv` (the default storage) writes
 this file for you, atomically, refusing to clobber an existing one — if
 `.env` already exists, `setup` reports that instead of overwriting it
-silently, so you don't lose a credential you didn't intend to replace.
+silently, so you don't lose a credential you didn't intend to replace. That
+refusal is also what makes a second `setup` fail rather than rotate the key;
+see ["Rotating a key"](#rotating-a-key) for what to do instead.
 
 Verified file mode after `setup --key-stdin`:
 
@@ -154,10 +178,11 @@ ever change:
 | Service (API key) | `fezo-api-key` |
 | Service (URL) | `fezo-url` |
 
-Keychain storage is only available where a `security`-binary-backed runner is
-wired in (macOS); on other platforms, `--storage keychain` fails as an
-ordinary reported error rather than a crash, and the default storage,
-`dotenv`, is what you want.
+`fezoctl` always wires up its Keychain runner (see
+["Resolution order"](#resolution-order)), but that runner shells out to
+`/usr/bin/security`, which exists only on macOS. Elsewhere, `--storage
+keychain` is *attempted* and reports an ordinary failure rather than crashing,
+and the default storage, `dotenv`, is what you want.
 
 ## `setup --key-stdin` usage
 
@@ -171,9 +196,8 @@ printf '%s' "$YOUR_KEY" | fezoctl setup --key-stdin --url https://your-gateway.e
 printf '%s' "$YOUR_KEY" | fezoctl setup --key-stdin --storage keychain --url https://your-gateway.example.com
 ```
 
-`--url` is optional on a re-run if you only need to rotate the key. `setup`
-prints a confirmation with the masked key and the resolved source — never the
-raw key:
+`setup` prints a confirmation with the masked key and the resolved source —
+never the raw key:
 
 ```
 setup — storage: dotenv
@@ -183,6 +207,104 @@ setup — storage: dotenv
   configured api key: sk-l… (source: dotenv)
 ```
 
-`setup` exits `0` only if both writes (or the one write you requested) are
-verified; otherwise it exits `2` (an operational failure) with a message
-explaining what went wrong or what could not be verified.
+## Rotating a key
+
+**With `--storage keychain`, just re-run `setup`.** Keychain writes pass `-U`
+to `security add-generic-password` ("Update item if it already exists (if
+omitted, the item cannot already exist)" — `man security`), so they are
+idempotent, and the URL and the key are two independent Keychain items. `--url`
+really is optional on a re-run:
+
+```bash
+printf '%s' "$NEW_KEY" | fezoctl setup --key-stdin --storage keychain
+```
+
+The previously stored URL survives, and the new key takes effect immediately.
+
+**With the default `dotenv` storage, a plain re-run does not rotate — it
+fails.** `setup` writes `.env` with `openSync(path, 'wx', 0o600)`, and `wx`
+means "create, or fail if it already exists", so a second `setup` is refused
+with exit code `2`:
+
+```
+$ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup --key-stdin
+setup — storage: dotenv
+  api key: failed (/Users/you/.config/fezo/.env already exists; refusing to overwrite it)
+  configured url: https://your-gateway.example.com (source: dotenv)
+  configured api key: test… (source: dotenv)
+$ echo $?
+2
+```
+
+(The path in the message is your real `.env` path, printed in full.) Note the
+last two lines: the *old* credential is still in effect and is what `setup`
+reports back. Nothing was changed.
+
+The `wx` flag is deliberate, not an oversight. It is the same rule that keeps
+`setup` from silently destroying a credential you didn't mean to replace, and
+it is what lets the file be created `0600` **at open time** rather than
+`chmod`'d afterward — a create-then-chmod would leave a window in which a live
+API key sits in a world-readable file. Both properties are worth more than a
+one-command rotation, so `setup` does not offer an `--overwrite` flag.
+
+Two ways to rotate a `dotenv`-stored credential:
+
+1. **Edit `~/.config/fezo/.env` in place.** It is plain `KEY=value` lines with
+   no quoting or escaping (see ["Config file location"](#config-file-location)),
+   so changing `FEZO_API_KEY=` to the new value with any editor is a complete
+   rotation. This preserves the file's existing `0600` mode and leaves
+   `FEZO_URL` alone — it is the smaller, safer of the two.
+
+2. **Remove the file and re-run `setup`** — but **pass `--url` again**:
+
+   ```bash
+   rm ~/.config/fezo/.env
+   printf '%s' "$NEW_KEY" | fezoctl setup --key-stdin --url https://your-gateway.example.com
+   ```
+
+   `setup` writes the whole file, not a patch, so a re-run without `--url`
+   leaves you with a `.env` containing only `FEZO_API_KEY` and no gateway URL.
+   Verified — same run, `--url` omitted:
+
+   ```
+   $ rm ~/.config/fezo/.env
+   $ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup --key-stdin
+   setup — storage: dotenv
+     api key: stored
+     configured api key: sk-l… (source: dotenv)
+   $ cat ~/.config/fezo/.env
+   FEZO_API_KEY=sk-live-rotated-key
+   ```
+
+   The URL is gone. Run `fezoctl doctor` after either route to confirm what is
+   actually in effect.
+
+## `setup`'s exit code
+
+`setup` exits `2` (an operational failure) when a write **failed** — the
+`.env`-already-exists refusal above, a Keychain write that reported an error —
+or when the value it just wrote could not be read back **and** nothing
+higher-priority explains why. Otherwise it exits `0`.
+
+A write that succeeded but could not be verified *because a higher-priority
+source shadows it* is **not** a failure: it is reported as "stored, but NOT
+verified" and exits `0`. This is the case described under
+["Resolution order"](#resolution-order) — the value really was stored, but
+resolution now answers from an exported env var, so `setup` cannot read its own
+write back to prove it. Verified (`FEZO_URL`/`FEZO_API_KEY` exported in the
+shell, `setup` writing to `dotenv`):
+
+```
+$ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup --key-stdin --url http://localhost:8899
+setup — storage: dotenv
+  api key: stored, but NOT verified — the write reported success but could not be verified: resolution now answers from "env", which takes priority over "dotenv", so the stored value could not be read back. Unset the higher-priority source and re-run `fezoctl doctor` to confirm what was stored.
+  url: stored, but NOT verified — the write reported success but could not be verified: resolution now answers from "env", which takes priority over "dotenv", so the stored value could not be read back. Unset the higher-priority source and re-run `fezoctl doctor` to confirm what was stored.
+  configured url: https://env-gateway.example.com (source: env)
+  configured api key: sk-e… (source: env)
+$ echo $?
+0
+```
+
+So a `0` exit from `setup` means "nothing failed", not "the stored value is now
+what `fezoctl` will use" — read the per-field lines, and use `doctor` to
+confirm which source actually wins.

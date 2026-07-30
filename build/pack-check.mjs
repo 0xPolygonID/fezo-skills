@@ -75,6 +75,32 @@ function run() {
       fail(`${skillScript} is missing from the npm pack file list: ${files.join(', ')}`);
     }
 
+    // --- both operator docs must ship. `README.md`'s "Credentials" section
+    // is only a LINK to `CONFIGURATION.md`, so shipping the first without the
+    // second leaves an installed package whose entire credential story is a
+    // dead relative link — and `CONFIGURATION.md` is the only place the
+    // threat model, the four-source resolution order, and the `.env` rotation
+    // path are written down. npm force-includes `README` regardless of
+    // `files`, but `CONFIGURATION.md` is there only because `package.json`'s
+    // `files` names it; asserting the pair together is what makes removing it
+    // from `files` fail here instead of silently shipping a broken link. ---
+    for (const doc of ['README.md', 'CONFIGURATION.md']) {
+      if (!files.includes(doc)) {
+        fail(`${doc} is missing from the npm pack file list: ${files.join(', ')}`);
+        continue;
+      }
+      // Listed is not the same as shipped: read it out of the EXTRACTED
+      // tarball, and require real content rather than an empty placeholder.
+      const absDoc = join(packageRoot, doc);
+      if (!existsSync(absDoc)) {
+        fail(`${doc} is listed in the npm pack file list but is absent from the extracted tarball`);
+        continue;
+      }
+      if (readFileSync(absDoc, 'utf8').trim().length === 0) {
+        fail(`${doc} is present in the tarball but empty`);
+      }
+    }
+
     // --- no credentials ever published. ---
     const envLike = files.filter((f) => f === '.env' || f.startsWith('.env.') || f.endsWith('/.env') || f.includes('/.env.'));
     if (envLike.length > 0) {
@@ -163,8 +189,9 @@ function run() {
 
     if (!failed) {
       process.stdout.write(
-        `pack:check: OK (${files.length} files; ${skillScript} present; no .env; no dev-only paths; ` +
-          `${scriptsInspected} shipped script(s) self-contained; shipped bundle reports its own version)\n`,
+        `pack:check: OK (${files.length} files; ${skillScript} present; README.md + CONFIGURATION.md present; ` +
+          `no .env; no dev-only paths; ${scriptsInspected} shipped script(s) self-contained; ` +
+          `shipped bundle reports its own version)\n`,
       );
     }
   } finally {

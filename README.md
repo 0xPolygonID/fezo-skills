@@ -150,8 +150,16 @@ user intent -> search live catalog -> inspect schema/bindings -> choose candidat
             -> call -> retry another compatible candidate on retryable failure
 ```
 
-- `fezoctl search "<query>"` fetches `/v1/catalog` and ranks matching tools by
-  name, method, description, and backend info text.
+- `fezoctl search "<query>"` fetches `/v1/catalog` and ranks matching tools.
+  The searchable text is six fields (`src/engine/rank.ts`'s
+  `searchableBlob`): tool name, **backend id**, method name, **title**,
+  description, and backend info text (the backend's `info` title, summary, and
+  description — and *only* those three). Nothing else in the catalog is
+  matchable: verified that a term appearing only in `info.docs_url`, only in
+  `info.categories`, or only as an input-schema property name returns no
+  matches. That exclusion is deliberate (`src/engine/catalog.ts`'s
+  `formatBackendInfoText`) — a `docs_url` ending in `/scrape` would otherwise
+  match "scrape" on a backend that cannot scrape.
 - `fezoctl schema <tool>` shows one tool's input schema, HTTP verb, binding
   map (query/path/header/body), backend id, method name, and call path — the
   information you need before calling it correctly.
@@ -333,8 +341,11 @@ fallback** when there is no code (`src/engine/retry.ts`):
   practice — a real upstream rate limit almost always arrives as a code-less
   backend 429, so the HTTP-status fallback is the path that actually matters
   for rate limiting.
-- **Give up:** a non-retryable 4xx with no retryable gateway code, or an
-  exhausted candidate list.
+- **Give up:** an **unrecognized** gateway code (one in neither the abort nor
+  the retry set above — `fezoctl` will not guess what an unknown code means);
+  a code-less response whose status is **anything** outside 402/429/500/502/503
+  (so a code-less 404 *and* a code-less 504 both give up — the rule is not
+  scoped to 4xx); or an exhausted candidate list.
 - A **local binding rejection** (a candidate-specific missing argument, a
   disallowed header) is *never* an abort — it just skips that one candidate,
   because it says nothing about whether the next candidate (which may name
@@ -356,6 +367,26 @@ billed: true
 result (status 200):
 { "markdown": "# Example\ncontent" }
 ```
+
+Verified give-up example — the same intent and the same candidate list, but
+the first attempt returns a gateway code that is in neither classification
+set. `run` stops there rather than spending money on `scrapingbee`, because an
+unknown code is not evidence that another provider would do better:
+
+```
+$ node dist/fezoctl.mjs run "scrape url" --args-json '{"url":"https://example.com"}'
+run "scrape url"
+selected: firecrawl_scrape (firecrawl.scrape, POST /scrape, per_call)
+  why: exact-method; matched: scrape, url; termScore=4; preferred for "scrape" (position 0)
+attempts:
+  1. firecrawl_scrape (firecrawl) [give_up] billed=false httpStatus=400 gatewayCode=malformed_request — unrecognized gateway code "malformed_request"
+  billing: every attempt that reached a 2xx response is billed by the provider (billed=true); attempts that failed or were skipped before a request was sent are not billed
+billed: false
+give up: unrecognized gateway code "malformed_request"
+```
+
+A code-less response gives up the same way, with `non-retryable HTTP <status>
+with no gateway code` — verified for both a code-less 404 and a code-less 504.
 
 ### Known limitation: a dropped connection during a billed response
 
@@ -391,10 +422,19 @@ back to alphabetical catalog order as a substitute policy.
   chain of un-hinted backends.
 - If two or more capabilities match ambiguously, `run` also refuses — with
   **no override** for that case.
-- **Async lifecycle methods are excluded from auto-selection entirely.** A
+- **Async lifecycle methods are excluded from auto-selection by default.** A
   method that looks like starting, polling, or fetching the result of an
-  asynchronous job is never something `run` will call on your behalf from a
-  free-text intent; you must name it explicitly.
+  asynchronous job is not something `run` will call on your behalf from an
+  ordinary free-text intent. The exclusion is a **default, not a wall** — two
+  things re-enable it (`src/engine/rank.ts`'s `selectForRun`), and when every
+  match was excluded, `run` prints the first one as a hint rather than
+  reporting a bare no-match:
+  1. The intent contains `async`, `job`, `snapshot`, `status`, or `crawl` as a
+     whole word. Async candidates are then eligible for auto-selection like
+     any other — asking for async behavior counts as consent to it.
+  2. The intent exactly matches one tool's name (that candidate alone is
+     re-enabled). `fezoctl call <tool>` always works too, and never applies
+     this filter at all.
 
 Verified refusal and override:
 
@@ -412,15 +452,38 @@ attempts:
 ...
 ```
 
+Verified async exclusion, the hint `run` prints, and the intent-word override:
+
+```
+$ node dist/fezoctl.mjs run "dataset" --args-json '{"dataset_id":"gd_l1"}'
+run "dataset"
+every matching candidate is an async lifecycle method (start/poll/status/fetch-result), so none was auto-picked:
+  - brightdata_scrape_async (brightdata.scrape_async, POST /scrape_async, dynamic)
+name the tool exactly (`fezoctl call <tool>`), or add "async"/"job"/"snapshot"/"status"/"crawl" to the intent to allow one
+
+$ node dist/fezoctl.mjs run "dataset job" --args-json '{"dataset_id":"gd_l1"}'
+run "dataset job"
+selected: brightdata_scrape_async (brightdata.scrape_async, POST /scrape_async, dynamic)
+  why: term-score; matched: dataset, job; termScore=2
+attempts:
+  1. brightdata_scrape_async (brightdata) [success] billed=true httpStatus=200 — 200 response
+...
+```
+
+The first form exits `2`, the second `0`. Because the override makes an async
+method billable from a free-text intent, prefer `call` when you already know
+which method you want.
+
 ## The `--json` error contract
 
-With `--json`, stdout is **always** a JSON document — never empty — which is
-what makes it safe for an agent or script to parse unconditionally. There are
-two possible shapes, and a consumer must handle both:
+With `--json`, stdout is a JSON document for every command — never empty —
+which is what makes it safe for an agent or script to parse unconditionally.
+There is exactly one exception, noted below.[^help-json] There are two
+possible shapes, and a consumer must handle both:
 
 1. **A failure that never reached the engine** (bad usage, no credentials,
-   catalog unreachable, tool not found, schema validation failed, or
-   `--version` couldn't read its own version):
+   catalog unreachable, `schema` naming a tool that isn't in the catalog,
+   schema validation failed, or `--version` couldn't read its own version):
 
    ```json
    {"error": {"kind": "...", "message": "..."}}
@@ -437,11 +500,16 @@ two possible shapes, and a consumer must handle both:
    report** instead of an error envelope, because that document carries
    strictly more information (the attempt log and what was billed). Look for
    an `attempts` array and an `outcome`/`result` field, not an `error` key.
+   **This includes `call <tool>` where `<tool>` is not in the catalog**: `call`
+   synthesizes the one-entry attempt log `run` would have produced rather than
+   emitting a `tool-not-found` envelope, so the marker to test is
+   `resolved: false`, not `error`. Only `schema <tool>` produces the
+   `tool-not-found` envelope (`src/cli.ts`'s `cmdSchema` vs. `cmdCall`).
 
 The human-readable message always goes to **stderr**, in both cases, and the
 exit code does not change based on `--json`.
 
-Verified:
+Verified — shape 1, an argument that fails the resolved tool's schema:
 
 ```
 $ node dist/fezoctl.mjs call exa_search --args-json '{}' --json
@@ -453,12 +521,60 @@ $ node dist/fezoctl.mjs call exa_search --args-json '{}' --json
 }
 ```
 
+Verified — the same unknown tool name through both commands, showing that
+"tool not found" is shape 2 under `call` and shape 1 under `schema`. Both exit
+`2`:
+
+```
+$ node dist/fezoctl.mjs call nope_tool --args-json '{}' --json
+{
+  "tool": "nope_tool",
+  "resolved": false,
+  "attempts": [
+    {
+      "tool": "nope_tool",
+      "backendId": "(unresolved)",
+      "status": "retry",
+      "reason": "gateway code \"tool_not_in_catalog\"",
+      "billed": false,
+      "httpStatus": 404,
+      "gatewayCode": "tool_not_in_catalog"
+    }
+  ],
+  "outcome": {
+    "kind": "give_up",
+    "reason": "no more candidates to try"
+  },
+  "billedAnyAttempt": false,
+  "billing": "every attempt that reached a 2xx response is billed by the provider (billed=true); attempts that failed or were skipped before a request was sent are not billed"
+}
+
+$ node dist/fezoctl.mjs schema nope_tool --json
+{
+  "error": {
+    "kind": "tool-not-found",
+    "message": "tool \"nope_tool\" was not found in the catalog"
+  }
+}
+```
+
+[^help-json]: `fezoctl --help --json` (or `-h` anywhere in argv alongside
+    `--json`) prints the **help text** on stdout and exits `0` — help is
+    resolved before argv is parsed into a command, and it has no JSON form.
+    That output is not parseable JSON, so a script that unconditionally
+    `JSON.parse`es stdout must not pass `--help`/`-h`. Every other command,
+    including a bare `fezoctl --json` (which is a `usage` error, because
+    `--json` is not a command), does emit a JSON document.
+
 ## Credentials
 
 See **[CONFIGURATION.md](CONFIGURATION.md)** for the full credential model:
 the four-source resolution order, the security reasoning behind
 `setup --key-stdin`, macOS Keychain details, `.env` file location and
-permissions, and the deprecated `ZUG_*` aliases.
+permissions, the deprecated `ZUG_*` aliases, and **how to rotate a key** —
+which differs between the two storage backends, because a second
+`setup --key-stdin` on the default `dotenv` storage is refused rather than
+overwriting the file.
 
 ## `doctor`
 
@@ -487,13 +603,34 @@ there, and the check names above tell you which is which — but do not expect
 independent of your key being valid. (The gateway does expose an open,
 unauthenticated `/healthz`; `fezoctl` does not call it today.)
 
-Verified — a stored key that the gateway's `/v1/catalog` rejects with 401:
+A check that has structured data to report also prints it as a
+pretty-printed `details` block on the line below — the resolved URL in full,
+the API key **masked** (never the raw key), and `preference-hints`' list of
+absent backends. Only the first line of that block carries the indent the
+renderer adds, so it looks ragged; that is the literal output, not a
+transcription slip.
+
+Verified — a stored key that the gateway's `/v1/catalog` rejects with 401
+(run against a local test gateway with an isolated `HOME`, hence the
+`localhost` URL). Exits `2`, because one check is a `fail`:
 
 ```
 $ node dist/fezoctl.mjs doctor
 doctor:
   [ok] gateway-url: FEZO_URL resolved from dotenv
+      {
+  "url": {
+    "value": "http://localhost:8899",
+    "source": "dotenv"
+  }
+}
   [ok] api-key: FEZO_API_KEY resolved from dotenv
+      {
+  "apiKey": {
+    "masked": "sk-l…",
+    "source": "dotenv"
+  }
+}
   [ok] gateway-connectivity: reached the gateway
   [fail] auth: the gateway rejected the API key (status 401)
   [skipped] catalog-readable: skipped: auth failed
