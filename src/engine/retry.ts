@@ -31,9 +31,21 @@ import type { CallToolResult } from './client.js';
  * Gateway codes that abort the *whole run* -- trying another candidate cannot
  * help, because these describe the caller's account, not one provider:
  *
- * - `unauthorized`: the API key itself is bad (zug/internal/gateway/proxy.go
- *   and errors.go). Every candidate uses the same key, so every candidate
- *   would fail identically.
+ * - `unauthorized` (HTTP 401): the gateway writes it when the caller's API key
+ *   itself is bad (zug/internal/gateway/proxy.go and errors.go), and every
+ *   candidate presents that same key, so for the GATEWAY-emitted 401 every
+ *   candidate really would fail identically. That reasoning does NOT cover the
+ *   whole code: all ten backend `unauthorized` sites mean "invalid call token"
+ *   on the gateway->backend hop (e.g.
+ *   zug/internal/brightdatabackend/handlers.go:68,
+ *   zug/internal/exabackend/handlers.go:57), which is a per-backend deployment
+ *   fault -- a different backend could well be provisioned correctly. Abort is
+ *   kept anyway, for a reason that holds for both shapes: a 401 is never
+ *   transient and never capability-shaped, it always means a credential is
+ *   wrong somewhere, and no amount of trying other providers repairs that.
+ *   Because the wire cannot tell the two apart, aborting surfaces the
+ *   credential defect loudly instead of hiding one backend's misconfiguration
+ *   behind a silent (and billed) fallback.
  * - `limit_exceeded`, `insufficient_balance`: both HTTP 402
  *   (zug/internal/gateway/spendlimit.go's `TrippedLimit`/`InsufficientBalance`,
  *   written by proxy.go's `Handle`). KNOWN LIMITATION, per the governing spec:
@@ -46,10 +58,11 @@ import type { CallToolResult } from './client.js';
  *   candidate could have safely advanced. Revisit if the gateway ever returns
  *   the scope as a structured field.
  *
- * Invalid local arguments (a `BindingError` -- see bindings.ts -- or a
- * malformed/incompatible request shape detected before any network call) are
- * ALSO an abort, but are not a gateway code at all, so they are handled as
- * their own `MechanicalFailure` variant below rather than added to this set.
+ * A per-candidate `BindingError` (bindings.ts) is deliberately NOT an abort and
+ * NOT in this set: unlike the three codes above, which are account-scoped
+ * without exception, it is computed from ONE candidate's own manifest. It is
+ * handled as its own `MechanicalFailure` variant below -- see the
+ * `invalid-arguments` note there for why it skips the candidate instead.
  */
 const ABORT_CODES: ReadonlySet<string> = new Set(['unauthorized', 'limit_exceeded', 'insufficient_balance']);
 
@@ -136,8 +149,21 @@ const RETRYABLE_CODELESS_STATUSES: ReadonlySet<number> = new Set([402, 429, 500,
  * - `invalid-arguments`: a `BindingError` (bindings.ts) -- a manifest/args
  *   mismatch caught locally before any request is sent (missing required
  *   path/query/header/body value, a disallowed header, or `--body-json` on a
- *   GET). This is "invalid local arguments" from the governing spec's abort
- *   list.
+ *   GET). This SKIPS the candidate (a `retry` decision); it does NOT abort the
+ *   run, and because it issues no request it does not consume the attempt
+ *   budget either (see `RunOptions.maxAttempts` and `run`). Every
+ *   `BindingErrorReason` is derived from one candidate's own manifest,
+ *   `bindings`, and `input_schema.required`, so it says nothing about whether
+ *   the NEXT candidate will accept the same arguments: two providers serving
+ *   one capability may name a parameter differently (`url` vs. `link`), and
+ *   `body-not-allowed` fires only because THIS candidate's verb is GET while
+ *   the next may be a POST. `disallowed-header` is not caused by the caller at
+ *   all -- it fires when a backend publishes a manifest naming a reserved
+ *   header, so aborting would let one provider's manifest defect kill a run
+ *   the user has no way to repair. Caller-level invalid arguments (an
+ *   unparseable `--args-json`/`--body-json` payload, which no candidate could
+ *   accept) ARE a genuine abort, but the CLI rejects those while parsing argv,
+ *   before `run` selects a candidate, so they never reach this module.
  * - `transport`: `fetch` itself rejected (DNS failure, connection refused,
  *   timeout, ...) -- no response was received to classify by code or status.
  */
@@ -167,16 +193,38 @@ export interface FailureClassification {
  * `RETRY_CODES`) is classified `give_up` rather than guessed either way: it is
  * a structured signal this engine does not understand, and continuing to
  * spend money against more candidates on an unknown failure shape is exactly
- * what this module exists to prevent. In practice every code the live gateway
- * writes on `/v1/*` is in one of the two sets above (`bad_request`/
- * `not_found` exist in errors.go but are written only by non-`/v1/*`
- * endpoints -- account/billing/limits/vouchers/registry -- that fezoctl never
- * calls), so this branch is a defensive default, not a documented behavior.
+ * what this module exists to prevent.
+ *
+ * That branch IS REACHABLE in production -- do not delete it and do not flip
+ * its default. The BACKENDS, not just the gateway, write gateway-shaped
+ * envelopes: each one has its own copy of the same
+ * `{"error":{"code","message"}}` writer (e.g.
+ * zug/internal/brightdatabackend/handlers.go:383), the gateway forwards those
+ * bodies through `/v1/*` verbatim, and errors.ts therefore parses them as
+ * `{kind:'gateway'}` envelopes carrying codes that appear in NO gateway-side
+ * table: `bad_request` (400; 19 backend sites, e.g.
+ * zug/internal/brightdatabackend/handlers.go:86,
+ * zug/internal/exabackend/handlers.go:71), `not_found` (404, e.g.
+ * zug/internal/apifybackend/handlers.go:148), `method_not_allowed` (405,
+ * zug/internal/xrobackend/handlers.go:75), `request_too_large` (413,
+ * zug/internal/newsapibackend/handlers.go:80), and `owner_data_forbidden`
+ * (403, zug/internal/xrobackend/handlers.go:80). Giving up is the correct
+ * outcome for every one of them -- each describes a request this caller built
+ * wrong, an absent resource, or a forbidden one, none of which another
+ * provider's identical call would fix -- so the behavior is right; it is
+ * simply real, exercised behavior rather than a defensive default. (An earlier
+ * revision of this comment called the branch unreachable on the strength of a
+ * grep that covered only zug/internal/gateway/*.go and so missed every
+ * backend.)
  */
 export function classifyFailure(failure: MechanicalFailure): FailureClassification {
   switch (failure.kind) {
     case 'invalid-arguments':
-      return { decision: 'abort', reason: `invalid local arguments: ${failure.message}` };
+      // Candidate-scoped, not caller-scoped: skip THIS candidate and let the
+      // next one try the same arguments. The reason string names the scope
+      // explicitly so an attempt log cannot be misread as "your arguments are
+      // wrong" when it means "this provider's manifest could not take them".
+      return { decision: 'retry', reason: `candidate rejected the supplied arguments: ${failure.message}` };
 
     case 'transport':
       return { decision: 'retry', reason: `transport failure: ${failure.message}` };
@@ -274,6 +322,18 @@ export interface RunOptions {
    * order, once a caller (Task 8) has decided which selection to run with.
    * This module does not call `selectForRun` itself and does not re-rank;
    * ordering is entirely the caller's responsibility.
+   *
+   * FORBIDDEN SOURCES: never populate this list from a `RunSelection`'s
+   * `asyncExcluded` (outcome `async-excluded`) or its `alternatives` (outcome
+   * `refused-ambiguous-capability`). rank.ts states that an async lifecycle
+   * method must never be auto-called and that `alternatives` is display-only on
+   * the one refusal with no override -- but both fields hold
+   * candidate-shaped values, so `run({candidates: selection.asyncExcluded,
+   * ...})` compiles cleanly and would bill exactly the call rank.ts refused to
+   * make. The only legitimate sources are `chosen`/`ranked` from `selected`,
+   * and `ranked[0]` from `refused-unhinted-multi-backend` under
+   * `--allow-unhinted-auto-pick`. (A compiler-enforced adapter that makes the
+   * misuse unrepresentable is Task 8's job, not this module's.)
    */
   candidates: readonly ToolCandidate[];
   /** Parsed `--args-json` value, tried against every candidate in turn. */
@@ -286,6 +346,12 @@ export interface RunOptions {
    * spends more money per `run` invocation on retries alone. Defaults to
    * `DEFAULT_MAX_ATTEMPTS` (2). Users can raise it explicitly (Task 8's
    * `--max-attempts`).
+   *
+   * Because this budget governs SPEND, only candidates that actually issue a
+   * request consume it. A candidate skipped by a local pre-flight
+   * `BindingError` sends nothing and is charged nothing, so it is logged as an
+   * attempt but does not decrement the budget -- otherwise one unbindable
+   * manifest would silently halve the real retry budget. See `run`.
    */
   maxAttempts?: number;
   /**
@@ -318,9 +384,9 @@ function isEmptyBody(bodyText: string): boolean {
 
 /**
  * Classifies whatever `callTool` threw into a `MechanicalFailure`: a
- * `BindingError` is invalid local arguments, a `GatewayCallError` carries its
- * own already-discriminated `CallError` (gateway envelope or backend
- * passthrough), and anything else reaching this function is a transport
+ * `BindingError` is a candidate-scoped `invalid-arguments`, a `GatewayCallError`
+ * carries its own already-discriminated `CallError` (gateway envelope or
+ * backend passthrough), and anything else reaching this function is a transport
  * failure -- `callTool` propagates a `fetch` rejection unwrapped rather than
  * throwing a typed error for it (see client.ts), so this is the only place
  * that can distinguish "transport" from the two typed cases.
@@ -345,12 +411,18 @@ function classifyThrown(err: unknown): MechanicalFailure {
  * happened. Whether to treat it as `success` (the default) or `retry` (opt-in
  * via `retryEmpty2xx`) is a policy choice about a SUCCESSFUL call, layered on
  * top of the mechanical-failure taxonomy rather than folded into it.
+ *
+ * `preflightFailure` tells `run` whether this attempt was rejected locally by
+ * `bindArgs` before any request was issued. It is derived from the classified
+ * failure's `kind`, not re-sniffed from the log, and `run` uses it for the two
+ * things a no-request attempt must not do: consume the spend budget, and be
+ * summarized as an ordinary out-of-candidates ending.
  */
 async function attemptCandidate(
   candidate: ToolCandidate,
   options: Pick<RunOptions, 'baseUrl' | 'apiKey' | 'args' | 'bodyJson' | 'fetchFn'>,
   retryEmpty2xx: boolean,
-): Promise<{ log: AttemptLog; result?: CallToolResult }> {
+): Promise<{ log: AttemptLog; result?: CallToolResult; preflightFailure: boolean }> {
   try {
     const result = await callTool({
       baseUrl: options.baseUrl,
@@ -369,23 +441,42 @@ async function attemptCandidate(
         );
         return {
           log: buildLog(candidate, 'retry', 'empty 2xx response body (--retry-empty-2xx)', true, result.status),
+          preflightFailure: false,
         };
       }
       return {
         log: buildLog(candidate, 'success', 'empty 2xx response body (not retried; --retry-empty-2xx not set)', true, result.status),
         result,
+        preflightFailure: false,
       };
     }
 
-    return { log: buildLog(candidate, 'success', `${result.status} response`, true, result.status), result };
+    return {
+      log: buildLog(candidate, 'success', `${result.status} response`, true, result.status),
+      result,
+      preflightFailure: false,
+    };
   } catch (err) {
     const failure = classifyThrown(err);
     const classified = classifyFailure(failure);
-    // Every branch reaching here came from a thrown error, not a returned
-    // 2xx `CallToolResult` -- `callTool` only ever throws for a non-2xx
-    // response or a local/transport problem, never after billing succeeded.
-    // So `billed` is unconditionally false here, by construction, not by
-    // inspecting `failure`.
+    // `billed` is unconditionally false here by construction (every branch
+    // reaching this catch threw instead of returning a 2xx `CallToolResult`),
+    // not by inspecting `failure`.
+    //
+    // KNOWN LIMITATION -- this can UNDER-REPORT spend, and it is recorded here
+    // rather than papered over because making spend visible is this module's
+    // stated job. `callTool` awaits `fetchFn(...)` and THEN `await
+    // response.text()` before it ever looks at the status (client.ts:113-114),
+    // while the gateway records the billing event BEFORE it copies the response
+    // body (zug/internal/gateway/proxy.go: `RecordUsage` at :288, then
+    // `io.Copy(w, resp.Body)` at :304). So a connection dropped *while reading
+    // the body of an already-billed 2xx* rejects out of client.ts:114, arrives
+    // here as an untyped rejection, is classified `transport`, and is logged
+    // `billed: false` even though the user was charged. This module cannot
+    // distinguish that from a pre-response transport failure without changing
+    // client.ts to report whether a response status was received at all, which
+    // is out of scope here. Read an attempt log accordingly: a `transport`
+    // failure with `billed: false` MAY still correspond to a charge.
     return {
       log: buildLog(
         candidate,
@@ -395,6 +486,7 @@ async function attemptCandidate(
         classified.httpStatus,
         classified.gatewayCode,
       ),
+      preflightFailure: failure.kind === 'invalid-arguments',
     };
   }
 }
@@ -417,6 +509,12 @@ async function attemptCandidate(
  *     per the governing spec's give-up list.
  *   - `retry`   -> continue to the next candidate, budget and list permitting.
  *
+ * The `maxAttempts` budget counts CALLS, not log entries: a candidate skipped
+ * by a local pre-flight `BindingError` issued no request and was charged
+ * nothing, so it appears in `attempts` but leaves the budget untouched.
+ * Charging it would let one provider's unbindable manifest silently halve the
+ * user's real retry budget, which is the opposite of what a spend limit is for.
+ *
  * When the loop ends because of exhaustion (no candidates left, or
  * `maxAttempts` reached) rather than because the last attempt was itself
  * `abort`/`give_up`, `outcome.kind` is still `give_up` -- the run simply ran
@@ -426,6 +524,14 @@ async function attemptCandidate(
  * `tool_not_in_catalog`) into a hard error: there is no second element to
  * advance into, so the very same "ran out of candidates" path applies with
  * `attempts.length === 1`.
+ *
+ * One exhaustion reason is special-cased: when EVERY attempted candidate was
+ * skipped by a local pre-flight `BindingError`, the summary says that no
+ * candidate accepted the supplied arguments rather than the generic "no more
+ * candidates to try". Skipping (rather than aborting) such a candidate is
+ * right, but it must not cost the crisp diagnostic an abort used to give: that
+ * run made no call at all, and the user's next move is to fix the arguments,
+ * not to retry. The per-candidate messages stay in the attempt log either way.
  */
 export async function run(options: RunOptions): Promise<RunReport> {
   const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
@@ -437,14 +543,23 @@ export async function run(options: RunOptions): Promise<RunReport> {
   }
 
   let attemptBudgetExhausted = false;
+  // Counts only attempts that actually issued a request -- i.e. the ones that
+  // could have been billed. See `RunOptions.maxAttempts`.
+  let callsMade = 0;
+  let preflightSkips = 0;
   for (const candidate of options.candidates) {
-    if (attempts.length >= maxAttempts) {
+    if (callsMade >= maxAttempts) {
       attemptBudgetExhausted = true;
       break;
     }
 
-    const { log, result } = await attemptCandidate(candidate, options, retryEmpty2xx);
+    const { log, result, preflightFailure } = await attemptCandidate(candidate, options, retryEmpty2xx);
     attempts.push(log);
+    if (preflightFailure) {
+      preflightSkips += 1;
+    } else {
+      callsMade += 1;
+    }
 
     if (log.status === 'success') {
       // attemptCandidate always sets `result` alongside a 'success' log; this
@@ -463,8 +578,15 @@ export async function run(options: RunOptions): Promise<RunReport> {
     // status === 'retry': fall through to the next candidate.
   }
 
-  const reason = attemptBudgetExhausted
-    ? `max attempts (${maxAttempts}) reached with candidates remaining`
-    : 'no more candidates to try';
+  // Every attempted candidate refused the arguments locally, so no request was
+  // ever sent: say so, instead of implying the run ran out of providers to try.
+  // (Unreachable via the budget branch by construction -- a pre-flight skip
+  // never decrements the budget -- but tested independently of that reasoning.)
+  const everyAttemptWasAPreflightSkip = attempts.length > 0 && preflightSkips === attempts.length;
+  const reason = everyAttemptWasAPreflightSkip
+    ? `no candidate accepted the supplied arguments: all ${attempts.length} candidate(s) rejected them before any request was sent (see the attempt log for each candidate's reason)`
+    : attemptBudgetExhausted
+      ? `max attempts (${maxAttempts}) reached with candidates remaining`
+      : 'no more candidates to try';
   return { outcome: { kind: 'give_up', reason }, attempts };
 }

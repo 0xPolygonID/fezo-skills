@@ -140,27 +140,119 @@ describe('run — abort', () => {
     expect(report.attempts[0]).toMatchObject({ backendId: 'alpha', status: 'abort', billed: false });
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
+});
 
-  it('aborts on a BindingError (invalid local arguments) and never calls fetch at all', async () => {
-    const missingPathParam = candidate({
-      tool: 'alpha_get',
-      backendId: 'alpha',
-      path: '/items/{id}',
-      httpMethod: 'GET',
-      bindings: { path_params: ['id'] },
-    });
+// ---------------------------------------------------------------------------
+// A per-candidate BindingError is a SKIP, not an abort: it is computed from one
+// candidate's own manifest/bindings/required-set, so the next candidate can
+// genuinely accept the same arguments. It also issues no request, so it must
+// not spend the --max-attempts budget (which governs money), and when it is the
+// only thing that happened the run must say so rather than blaming exhaustion.
+// ---------------------------------------------------------------------------
+describe('run — a per-candidate BindingError skips the candidate', () => {
+  /** Requires a path param the test args never supply -> BindingError before any fetch. */
+  const unbindable = candidate({
+    tool: 'alpha_get',
+    backendId: 'alpha',
+    path: '/items/{id}',
+    httpMethod: 'GET',
+    bindings: { path_params: ['id'] },
+  });
+  const unbindableToo = candidate({
+    tool: 'beta_get',
+    backendId: 'beta',
+    path: '/items/{id}',
+    httpMethod: 'GET',
+    bindings: { path_params: ['id'] },
+  });
+
+  it('candidate 1 raises a BindingError, is skipped without a request, and candidate 2 succeeds', async () => {
     const fetchFn = routedFetch({ beta: [okResponse('{"ok":true}')] });
 
-    const report = await run({ ...baseOptions, args: {}, candidates: [missingPathParam, beta], fetchFn });
+    const report = await run({ ...baseOptions, args: {}, candidates: [unbindable, beta], fetchFn });
 
-    expect(report.outcome.kind).toBe('aborted');
-    expect(report.attempts).toHaveLength(1);
-    const [first] = report.attempts;
-    expect(first).toBeDefined();
-    expect(first?.status).toBe('abort');
-    expect(first?.billed).toBe(false);
-    expect(first?.reason).toContain('missing required path parameter(s): id');
+    expect(report.outcome).toEqual({ kind: 'success', candidate: beta, result: { status: 200, bodyText: '{"ok":true}' } });
+    expect(report.attempts).toEqual<AttemptLog[]>([
+      {
+        tool: 'alpha_get',
+        backendId: 'alpha',
+        status: 'retry',
+        reason: 'candidate rejected the supplied arguments: missing required path parameter(s): id',
+        billed: false,
+      },
+      {
+        tool: 'beta_scrape',
+        backendId: 'beta',
+        status: 'success',
+        httpStatus: 200,
+        reason: '200 response',
+        billed: true,
+      },
+    ]);
+    // The skipped candidate issued no request: only the second one was called.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a local skip does not consume the spend budget: two billed calls still happen with maxAttempts 2', async () => {
+    // Three candidates, the first unbindable. With maxAttempts 2, a budget that
+    // charged the local skip would leave room for only ONE billed call and stop
+    // before gamma; the budget counts requests, so both beta and gamma are
+    // tried.
+    const fetchFn = routedFetch({
+      beta: [gatewayErrorResponse(503, 'backend_unavailable')],
+      gamma: [okResponse('{"ok":true}')],
+    });
+
+    const report = await run({ ...baseOptions, args: {}, candidates: [unbindable, beta, gamma], maxAttempts: 2, fetchFn });
+
+    expect(report.outcome).toEqual({ kind: 'success', candidate: gamma, result: { status: 200, bodyText: '{"ok":true}' } });
+    expect(report.attempts.map((attempt) => attempt.backendId)).toEqual(['alpha', 'beta', 'gamma']);
+    expect(report.attempts.map((attempt) => attempt.status)).toEqual(['retry', 'retry', 'success']);
+    // Two requests were issued (beta, gamma) — the full budget — even though
+    // three attempts are logged.
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(report.attempts.filter((attempt) => attempt.billed)).toHaveLength(1);
+  });
+
+  it('when every attempted candidate rejects the arguments locally, the summary says so instead of "no more candidates"', async () => {
+    const fetchFn = vi.fn();
+
+    const report = await run({
+      ...baseOptions,
+      args: {},
+      candidates: [unbindable, unbindableToo],
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+
+    expect(report.outcome.kind).toBe('give_up');
+    const { outcome } = report;
+    if (outcome.kind !== 'give_up') {
+      throw new Error(`expected a give_up outcome, got ${outcome.kind}`);
+    }
+    expect(outcome.reason).toContain('no candidate accepted the supplied arguments');
+    expect(outcome.reason).not.toContain('no more candidates to try');
+    expect(outcome.reason).not.toContain('max attempts');
+    // Both candidates were attempted despite maxAttempts defaulting to 2 and
+    // neither consuming it; the per-candidate messages stay in the log.
+    expect(report.attempts).toHaveLength(2);
+    expect(report.attempts.map((attempt) => attempt.status)).toEqual(['retry', 'retry']);
+    expect(report.attempts.map((attempt) => attempt.tool)).toEqual(['alpha_get', 'beta_get']);
+    for (const attempt of report.attempts) {
+      expect(attempt.reason).toContain('candidate rejected the supplied arguments: missing required path parameter(s): id');
+    }
+    expect(report.attempts.some((attempt) => attempt.billed)).toBe(false);
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('a mix of a local skip and a real failure keeps the generic exhaustion summary', async () => {
+    // The special-cased summary must fire ONLY when every attempt was a local
+    // skip — otherwise it would hide the fact that money was spent.
+    const fetchFn = routedFetch({ beta: [gatewayErrorResponse(503, 'backend_unavailable')] });
+
+    const report = await run({ ...baseOptions, args: {}, candidates: [unbindable, beta], fetchFn });
+
+    expect(report.outcome).toEqual({ kind: 'give_up', reason: 'no more candidates to try' });
+    expect(report.attempts).toHaveLength(2);
   });
 });
 

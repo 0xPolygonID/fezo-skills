@@ -35,11 +35,23 @@ describe('classifyFailure — abort the whole run', () => {
   it('insufficient_balance (402) aborts', () => {
     expect(classifyFailure(gatewayFailure('insufficient_balance', 402)).decision).toBe('abort');
   });
+});
 
-  it('invalid local arguments (a BindingError) aborts', () => {
+describe('classifyFailure — a per-candidate BindingError skips the candidate, it does NOT abort', () => {
+  it('invalid-arguments is a retry decision whose reason names the candidate, not the caller, as the scope', () => {
     const result = classifyFailure({ kind: 'invalid-arguments', message: 'missing required path parameter(s): id' });
-    expect(result.decision).toBe('abort');
+    // Every BindingErrorReason is computed from ONE candidate's own manifest,
+    // bindings, and input_schema.required, so another candidate can genuinely
+    // accept the same arguments (`url` vs. `link`, GET vs. POST). Aborting
+    // would also let a backend-published `disallowed-header` manifest defect
+    // kill a run the user cannot repair.
+    expect(result.decision).toBe('retry');
+    expect(result.decision).not.toBe('abort');
+    expect(result.reason).toContain('candidate rejected the supplied arguments');
     expect(result.reason).toContain('missing required path parameter(s): id');
+    // No response existed, so neither wire field may be invented.
+    expect(result.httpStatus).toBeUndefined();
+    expect(result.gatewayCode).toBeUndefined();
   });
 });
 
@@ -120,13 +132,35 @@ describe('classifyFailure — give up', () => {
   });
 
   it('an unrecognized gateway code gives up rather than guessing either way', () => {
-    // bad_request/not_found are real errors.go codes, but written only by
-    // non-/v1/* endpoints (account/billing/limits/vouchers/registry) that
-    // fezoctl never calls; this exercises the defensive default a genuinely
-    // unknown code would hit.
+    // NOT a hypothetical: the backends write gateway-shaped envelopes with the
+    // same {error:{code,message}} writer (brightdatabackend/handlers.go:383)
+    // and the gateway forwards them through /v1/* verbatim, so `bad_request`
+    // reaches this branch from ~19 real backend sites (e.g.
+    // brightdatabackend/handlers.go:86, exabackend/handlers.go:71). Give up is
+    // the right outcome for it; the branch is live, not defensive.
     const result = classifyFailure(gatewayFailure('bad_request', 400));
     expect(result.decision).toBe('give_up');
     expect(result.gatewayCode).toBe('bad_request');
+  });
+
+  it('the other backend-emitted envelope codes forwarded through /v1/* also give up', () => {
+    // not_found (apifybackend/handlers.go:148), method_not_allowed
+    // (xrobackend/handlers.go:75), request_too_large
+    // (newsapibackend/handlers.go:80), owner_data_forbidden
+    // (xrobackend/handlers.go:80). None is in ABORT_CODES or RETRY_CODES, and
+    // none should be: another provider's identical call would not fix any of
+    // them.
+    for (const [code, status] of [
+      ['not_found', 404],
+      ['method_not_allowed', 405],
+      ['request_too_large', 413],
+      ['owner_data_forbidden', 403],
+    ] as const) {
+      const result = classifyFailure(gatewayFailure(code, status));
+      expect(result.decision, code).toBe('give_up');
+      expect(result.gatewayCode, code).toBe(code);
+      expect(result.httpStatus, code).toBe(status);
+    }
   });
 });
 
