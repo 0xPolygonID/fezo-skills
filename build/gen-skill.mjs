@@ -24,12 +24,33 @@ export const step0Path = join(here, 'step0.md');
 export const invocationPath = join(here, 'invocation.sh');
 export const defaultOutPath = join(repoRoot, 'skills', 'fezo', 'SKILL.md');
 
-// This is the one and only place `SKILL_VERSION` is defined. It is written
-// into the frontmatter's `version:` field AND baked into the invocation
-// block as `SKILL_VERSION="<value>"` — the two can never drift apart because
-// they are the same JS string used in both places.
+// ONE version number, not two. `SKILL_VERSION` is *derived from*
+// `package.json`'s `version` rather than hardcoded here, because it is used
+// for two things that are both PACKAGE facts:
+//
+//   - the tier-5 pin, `npx -y fezo-skills@$SKILL_VERSION`, which must name a
+//     version that actually exists on the registry, and
+//   - the tier-4 exact-match comparison against a global install's
+//     `fezoctl --version`, which reports the installed package's version.
+//
+// A hardcoded copy here drifted to `1.0.0` while `package.json` sat at
+// `0.1.0`, which pinned the unpublishable `fezo-skills@1.0.0` and made the
+// bottom of the ladder resolve to a package that does not exist. Deriving it
+// makes that drift impossible by construction; `tests/skill_contract.test.ts`
+// and CI additionally assert the frontmatter and package.json agree.
 export const SKILL_NAME = 'fezo';
-export const SKILL_VERSION = '1.0.0';
+export const packageJsonPath = join(repoRoot, 'package.json');
+
+function readPackageVersion() {
+  const parsed = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+  const version = parsed?.version;
+  if (typeof version !== 'string' || version.length === 0) {
+    throw new Error(`could not read a string "version" from ${packageJsonPath}`);
+  }
+  return version;
+}
+
+export const SKILL_VERSION = readPackageVersion();
 
 const FRONTMATTER = `---
 name: ${SKILL_NAME}

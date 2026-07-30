@@ -17,7 +17,7 @@
 // Usage: node build/pack-check.mjs   (also wired as `pnpm pack:check`)
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,6 +55,19 @@ function run() {
     if (entry === undefined) throw new Error('npm pack produced no output entry');
     const files = entry.files.map((f) => f.path);
 
+    // Extract the tarball we just produced, so every content check below
+    // inspects THE PUBLISHED BYTES rather than the working tree's copy of the
+    // same path. Reading from repoRoot would pass even if npm shipped a
+    // different (or truncated, or absent) file — precisely the class of bug
+    // this script exists to catch. npm tarballs root everything under
+    // `package/`.
+    if (typeof entry.filename !== 'string') throw new Error('npm pack --json did not report a filename');
+    const tarballPath = join(scratch, entry.filename);
+    const extractRoot = join(scratch, 'extracted');
+    mkdirSync(extractRoot, { recursive: true });
+    execFileSync('tar', ['-xzf', tarballPath, '-C', extractRoot], { encoding: 'utf8' });
+    const packageRoot = join(extractRoot, 'package');
+
     // --- carry-forward #1: the gitignored skill-local bundle must be
     // present in the tarball despite never being tracked by git. ---
     const skillScript = 'skills/fezo/scripts/fezoctl.mjs';
@@ -85,10 +98,19 @@ function run() {
     if (skillFiles.length === 0) {
       fail('no files under skills/ were present in npm pack output');
     }
+    let scriptsInspected = 0;
     for (const relPath of skillFiles) {
       if (!/\.(mjs|js|cjs)$/.test(relPath)) continue;
-      const absPath = join(repoRoot, relPath);
-      if (!existsSync(absPath)) continue; // covered by the presence check above
+      // From the EXTRACTED tarball, not from repoRoot.
+      const absPath = join(packageRoot, relPath);
+      if (!existsSync(absPath)) {
+        // Not `continue`: npm listed this path in the tarball, so it must be
+        // extractable. Silently skipping here is how a missing or unreadable
+        // shipped script previously passed the self-containment check.
+        fail(`${relPath} is listed in the npm pack file list but is absent from the extracted tarball`);
+        continue;
+      }
+      scriptsInspected += 1;
       const text = readFileSync(absPath, 'utf8');
       const skillDirRel = relPath.split('/').slice(0, 2).join('/'); // "skills/<name>"
       const importSpecifiers = [...text.matchAll(/(?:require\(|from\s+|import\()\s*['"]([^'"]+)['"]/g)].map((m) => m[1]);
@@ -114,8 +136,36 @@ function run() {
       }
     }
 
+    // The self-containment check is only meaningful if it actually read
+    // something. Zero inspected scripts means the loop above found no shipped
+    // script at all, which is a failure of this check, not a pass.
+    if (scriptsInspected === 0) {
+      fail('no shippable script under skills/ was inspected for self-containment');
+    }
+
+    // --- the shipped skill-local bundle must be byte-identical to the
+    // committed dist/fezoctl.mjs, and must be able to report its own version
+    // from inside the tarball's layout (two levels below the package root,
+    // where a `../package.json` walk misses). ---
+    const shippedSkillScript = join(packageRoot, skillScript);
+    if (existsSync(shippedSkillScript)) {
+      const shipped = readFileSync(shippedSkillScript);
+      const committedDist = readFileSync(join(repoRoot, 'dist', 'fezoctl.mjs'));
+      if (!shipped.equals(committedDist)) {
+        fail(`${skillScript} in the tarball is not byte-identical to the committed dist/fezoctl.mjs`);
+      }
+      const expectedVersion = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version;
+      const reported = execFileSync('node', [shippedSkillScript, '--version'], { encoding: 'utf8' }).trim();
+      if (reported !== `fezoctl ${expectedVersion}`) {
+        fail(`${skillScript} in the tarball reports "${reported}", expected "fezoctl ${expectedVersion}"`);
+      }
+    }
+
     if (!failed) {
-      process.stdout.write(`pack:check: OK (${files.length} files; ${skillScript} present; no .env; no dev-only paths; skills/ self-contained)\n`);
+      process.stdout.write(
+        `pack:check: OK (${files.length} files; ${skillScript} present; no .env; no dev-only paths; ` +
+          `${scriptsInspected} shipped script(s) self-contained; shipped bundle reports its own version)\n`,
+      );
     }
   } finally {
     rmSync(scratch, { recursive: true, force: true });

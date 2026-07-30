@@ -1,6 +1,6 @@
 {
   "name": "fezo-skills",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Agent skill and CLI (fezoctl) for discovering and calling Fezo/Zug API gateway tools from the live catalog.",
   "license": "MIT",
   "type": "module",

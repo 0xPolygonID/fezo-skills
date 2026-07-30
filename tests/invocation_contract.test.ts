@@ -9,8 +9,8 @@
 // would silently mis-split on that space while a Bash *array* (this
 // project's argv-array decision) does not. Every scenario below uses a
 // SKILL_DIR with a literal space in it for exactly this reason.
-import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -70,17 +70,49 @@ function resolveViaLadder(env: LadderEnv): string[] {
   return raw.split('\0').filter((part) => part.length > 0);
 }
 
-/** Writes an executable fake `fezoctl` at `dir/fezoctl` that prints `version`
- * on `--version` and exits 0 for anything else, so tier 4's `command -v` +
- * `--version` check has something real to run. */
+/** Writes an executable fake `fezoctl` at `dir/fezoctl` so tier 4's `command
+ * -v` + `--version` check has something real to run.
+ *
+ * CRITICAL: the fake prints `fezoctl <version>` — the EXACT format the real
+ * binary produces (`src/engine/render.ts`'s `renderVersion`: `return
+ * \`fezoctl ${version}\``), NOT a bare version. An earlier revision of this
+ * helper printed a bare version, which made both tier-4 tests certify a
+ * comparison (`[ "$(fezoctl --version)" = "$SKILL_VERSION" ]`) that can never
+ * be true against the real binary — a matching global install was silently
+ * skipped in production while the suite stayed green. A fake MUST produce the
+ * same shape the real thing produces. */
 function writeFakeGlobalFezoctl(dir: string, version: string): void {
   const path = join(dir, 'fezoctl');
   writeFileSync(
     path,
-    `#!/usr/bin/env bash\nif [ "\${1:-}" = "--version" ]; then printf '%s' "${version}"; fi\nexit 0\n`,
+    `#!/usr/bin/env bash\nif [ "\${1:-}" = "--version" ]; then printf 'fezoctl %s' "${version}"; fi\nexit 0\n`,
   );
   chmodSync(path, 0o755);
 }
+
+describe('the tier-4 fake global fezoctl matches the real binary', () => {
+  // This is the guard that makes every tier-4 scenario below meaningful: if
+  // `writeFakeGlobalFezoctl` ever drifts from the real `--version` output
+  // format again, THIS test fails rather than the tier-4 tests quietly
+  // certifying an impossible comparison.
+  it("prints --version in exactly the format dist/fezoctl.mjs prints", () => {
+    const distBundlePath = join(repoRoot, 'dist', 'fezoctl.mjs');
+    const pkg: unknown = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
+    const pkgVersion = pkg !== null && typeof pkg === 'object' ? Reflect.get(pkg, 'version') : undefined;
+    expect(typeof pkgVersion).toBe('string');
+
+    const realOutput = execFileSync('node', [distBundlePath, '--version'], { encoding: 'utf8' }).trim();
+
+    const binDir = makeScratchDir('fake-global-shape-');
+    writeFakeGlobalFezoctl(binDir, String(pkgVersion));
+    const fakeOutput = execFileSync(join(binDir, 'fezoctl'), ['--version'], { encoding: 'utf8' }).trim();
+
+    // Same version in, so the two must be byte-identical strings.
+    expect(fakeOutput).toBe(realOutput);
+    // And pin the shape itself, so "both are bare versions" cannot satisfy it.
+    expect(realOutput).toBe(`fezoctl ${String(pkgVersion)}`);
+  });
+});
 
 describe('build/invocation.sh resolution ladder — SKILL_DIR containing a space', () => {
   it('tier 1: a set, executable $FEZOCTL wins outright', () => {
@@ -190,6 +222,33 @@ describe('build/invocation.sh resolution ladder — SKILL_DIR containing a space
       pathOverride: `${binDir}:/usr/bin:/bin`,
     });
     expect(argv).toEqual(['node', scriptPath]);
+  });
+});
+
+describe('build/invocation.sh — SKILL_DIR guard', () => {
+  /** Runs the ladder with a deliberately broken SKILL_DIR and returns the
+   * child's status + stderr, rather than letting `execFileSync` throw. */
+  function resolveExpectingFailure(skillDir: string | undefined): { status: number | null; stderr: string } {
+    const childEnv: NodeJS.ProcessEnv = {
+      PATH: '/usr/bin:/bin',
+      INVOCATION_SH: invocationShPath,
+      SKILL_VERSION: '1.0.0',
+    };
+    if (skillDir !== undefined) childEnv['SKILL_DIR'] = skillDir;
+    const result = spawnSync('bash', ['-c', HARNESS_SCRIPT], { env: childEnv, encoding: 'utf8' });
+    return { status: result.status, stderr: result.stderr };
+  }
+
+  it('fails loudly when SKILL_DIR is unset, instead of silently landing on tier 5', () => {
+    const { status, stderr } = resolveExpectingFailure(undefined);
+    expect(status).not.toBe(0);
+    expect(stderr).toContain('SKILL_DIR must be set to the directory containing SKILL.md');
+  });
+
+  it('fails loudly when SKILL_DIR is set but empty', () => {
+    const { status, stderr } = resolveExpectingFailure('');
+    expect(status).not.toBe(0);
+    expect(stderr).toContain('SKILL_DIR must be set to the directory containing SKILL.md');
   });
 });
 

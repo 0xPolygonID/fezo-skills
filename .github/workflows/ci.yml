@@ -27,16 +27,30 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
+      # Runs the suite ONCE and tees its combined output to a file, so the
+      # pristine-output check below can inspect it without paying for a second
+      # full `vitest run` (which also re-triggered every build side effect).
+      # `pipefail` + PIPESTATUS keep a real test failure failing this step.
       - name: Test
-        run: pnpm test
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          pnpm test 2>&1 | tee /tmp/vitest-output.txt
+          exit "${PIPESTATUS[0]}"
 
+      # Only meaningful because the step above already passed: a FAILING suite
+      # prints assertion diffs that legitimately contain the word "fezoctl",
+      # which this grep would misattribute as "a test is writing to a real
+      # stream". Guarding on the previous step's success removes that
+      # misdiagnosis.
       - name: Test output is pristine (no stray "fezoctl" lines on the runner)
         run: |
           set -euo pipefail
-          count="$(pnpm exec vitest run 2>&1 | grep -c fezoctl || true)"
+          count="$(grep -c fezoctl /tmp/vitest-output.txt || true)"
           echo "fezoctl mention count: ${count}"
           if [ "${count}" != "0" ]; then
             echo "vitest output is not pristine — a test is writing to a real stream instead of capturing it" >&2
+            grep -n fezoctl /tmp/vitest-output.txt >&2 || true
             exit 1
           fi
 
@@ -48,6 +62,10 @@ jobs:
           set -euo pipefail
           if ! git diff --exit-code -- dist/fezoctl.mjs; then
             echo "dist/fezoctl.mjs is stale: commit the output of 'pnpm bundle'." >&2
+            echo "NOTE: package.json's version is baked into the bundle at build time" >&2
+            echo "(esbuild --define __FEZOCTL_VERSION__), so BUMPING THE VERSION ALONE" >&2
+            echo "changes these bytes. If you just bumped package.json, this is expected:" >&2
+            echo "run 'pnpm bundle' and 'pnpm gen-skill' and commit both artifacts." >&2
             exit 1
           fi
 
@@ -59,10 +77,37 @@ jobs:
           set -euo pipefail
           if ! git diff --exit-code -- skills/fezo/SKILL.md; then
             echo "skills/fezo/SKILL.md is stale: commit the output of 'pnpm gen-skill'." >&2
+            echo "NOTE: SKILL.md's frontmatter version and baked-in SKILL_VERSION are" >&2
+            echo "derived from package.json's version, so bumping the version alone" >&2
+            echo "changes this file too." >&2
             exit 1
           fi
 
-      - name: Built artifact --version matches package.json's version
+      # ONE version number. The frontmatter `version` is the value baked in as
+      # `SKILL_VERSION`, which pins tier 5 (`npx -y fezo-skills@$SKILL_VERSION`)
+      # and drives tier 4's exact-match comparison — both PACKAGE facts. A
+      # frontmatter version that drifts from package.json's pins a release that
+      # cannot exist.
+      - name: SKILL.md frontmatter version equals package.json's version
+        run: |
+          set -euo pipefail
+          expected="$(node -p "require('./package.json').version")"
+          frontmatter="$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' skills/fezo/SKILL.md | head -n 1)"
+          baked="$(sed -n 's/^SKILL_VERSION="\(.*\)"$/\1/p' skills/fezo/SKILL.md | head -n 1)"
+          echo "package.json: ${expected}"
+          echo "frontmatter:  ${frontmatter}"
+          echo "SKILL_VERSION: ${baked}"
+          if [ -z "${frontmatter}" ] || [ -z "${baked}" ]; then
+            echo "could not read the frontmatter version and/or the baked-in SKILL_VERSION from SKILL.md" >&2
+            exit 1
+          fi
+          if [ "${frontmatter}" != "${expected}" ] || [ "${baked}" != "${expected}" ]; then
+            echo "SKILL.md's version(s) disagree with package.json's version; the tier-5 npx pin" >&2
+            echo "would name a package version that does not exist." >&2
+            exit 1
+          fi
+
+      - name: Committed bundle --version matches package.json's version
         run: |
           set -euo pipefail
           built="$(node dist/fezoctl.mjs --version)"
@@ -71,6 +116,25 @@ jobs:
           echo "expected: ${expected}"
           if [ "${built}" != "${expected}" ]; then
             echo "dist/fezoctl.mjs --version does not match package.json's version" >&2
+            exit 1
+          fi
+
+      # The check above only exercises dist/fezoctl.mjs, which sits ONE level
+      # below the package root and therefore always could find ../package.json.
+      # The skill-local copy sits TWO levels below it and is the artifact most
+      # users install, so it is asserted separately and explicitly.
+      - name: Skill-local bundle --version matches package.json's version
+        run: |
+          set -euo pipefail
+          test -f skills/fezo/scripts/fezoctl.mjs
+          built="$(node skills/fezo/scripts/fezoctl.mjs --version)"
+          expected="fezoctl $(node -p "require('./package.json').version")"
+          echo "built: ${built}"
+          echo "expected: ${expected}"
+          if [ "${built}" != "${expected}" ]; then
+            echo "skills/fezo/scripts/fezoctl.mjs --version does not match package.json's version." >&2
+            echo "The version is injected at bundle time (esbuild --define); this copy cannot" >&2
+            echo "read ../package.json because it lives two levels below the package root." >&2
             exit 1
           fi
 

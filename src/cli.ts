@@ -135,9 +135,32 @@ function parseArgv(argv: readonly string[]): ParseResult {
 }
 
 // ---------------------------------------------------------------------------
-// --version: reads package.json rather than a hardcoded string, so a drifting
-// version cannot silently break the invocation ladder's tier-3 version check.
+// --version: never a hardcoded string, so a drifting version cannot silently
+// break the invocation ladder's tier-4 version comparison.
+//
+// Two mechanisms, in this order:
+//
+//   1. `__FEZOCTL_VERSION__`, substituted at BUNDLE time by `build/bundle.mjs`
+//      via esbuild's `--define` from package.json's own `version`. The bundle
+//      is copied to `skills/fezo/scripts/fezoctl.mjs`, which sits TWO levels
+//      below the package root, so the `../package.json` walk below misses it
+//      entirely (`ENOENT .../skills/fezo/package.json`) — the artifact most
+//      users install could not report its own version. Baking the value in
+//      removes the filesystem dependency for every shipped copy.
+//   2. `resolvePackageVersion()`, the filesystem fallback, kept because
+//      `tsc`/vitest run this module UN-bundled from `src/*.ts`, where nothing
+//      defines `__FEZOCTL_VERSION__`. That path also still covers
+//      `dist/fezoctl.mjs` if the define is ever dropped.
+//
+// Consequence to be aware of: because the version is now baked into the
+// bundle's bytes, bumping package.json's `version` changes dist/fezoctl.mjs
+// and CI's bundle-freshness gate will (correctly) go red until `pnpm bundle`
+// is re-run. CI's failure message says so explicitly.
 // ---------------------------------------------------------------------------
+
+/** Injected by esbuild `--define` at bundle time; genuinely absent when this
+ * module runs un-bundled, hence the `typeof` guard at every use. */
+declare const __FEZOCTL_VERSION__: string | undefined;
 
 export function resolvePackageVersion(): string {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -149,6 +172,16 @@ export function resolvePackageVersion(): string {
     if (typeof version === 'string') return version;
   }
   throw new Error(`could not read "version" from ${packageJsonPath}`);
+}
+
+/** The version `--version` reports: the build-time constant when present,
+ * otherwise read from package.json. `typeof` rather than a bare reference,
+ * because an un-substituted identifier would be a ReferenceError. */
+export function resolveVersion(): string {
+  if (typeof __FEZOCTL_VERSION__ === 'string' && __FEZOCTL_VERSION__.length > 0) {
+    return __FEZOCTL_VERSION__;
+  }
+  return resolvePackageVersion();
 }
 
 // ---------------------------------------------------------------------------
@@ -861,15 +894,15 @@ export async function runCli(argv: readonly string[], deps: CliDeps = {}): Promi
     return finish(EXIT_OK);
   }
   if (first === '--version') {
-    // Guarded, because `resolvePackageVersion` reads a file and can throw: an
-    // unhandled rejection here would print a stack trace where a version string
-    // belongs, and the skill's invocation ladder compares a global `fezoctl
-    // --version` against the skill's own version to decide whether to use it —
-    // so a thrown error becomes silent mis-resolution rather than a visible
-    // failure.
+    // Still guarded, because `resolveVersion`'s fallback reads a file and can
+    // throw: an unhandled rejection here would print a stack trace where a
+    // version string belongs, and the skill's invocation ladder compares a
+    // global `fezoctl --version` against the skill's own version to decide
+    // whether to use it — so a thrown error becomes silent mis-resolution
+    // rather than a visible failure.
     let version: string;
     try {
-      version = resolvePackageVersion();
+      version = resolveVersion();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       emitFailure(preParseEmit, 'version-unavailable', `could not determine fezoctl's own version: ${message}`);
