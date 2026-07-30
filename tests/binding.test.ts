@@ -24,6 +24,27 @@ function candidate(overrides: Partial<ToolCandidate> & Pick<ToolCandidate, 'path
   };
 }
 
+/**
+ * Runs `fn` with process.stderr.write mocked out and returns everything it
+ * wrote, joined. Writes are collected into a local array rather than read off
+ * the spy afterwards: vitest's `mockRestore` also resets the spy's call
+ * history, so any assertion made on the spy after restoring would read an
+ * empty history and pass vacuously.
+ */
+function captureStderr(fn: () => void): string {
+  const writes: string[] = [];
+  const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+    writes.push(String(chunk));
+    return true;
+  });
+  try {
+    fn();
+  } finally {
+    spy.mockRestore();
+  }
+  return writes.join('');
+}
+
 describe('bindArgs — path substitution', () => {
   it('substitutes a multi-segment value, preserving slashes as path separators', () => {
     const bound = bindArgs(
@@ -156,40 +177,38 @@ describe('bindArgs — query binding', () => {
     expect(bound.query).toEqual({ query: '', country: '' });
   });
 
-  it('treats an explicitly null query value as missing (never sent), matching the reference client', () => {
-    const bound = bindArgs(
-      candidate({ path: '/google/search', httpMethod: 'GET', bindings: { query: ['query', 'country'] } }),
-      { query: 'cats', country: null },
-    );
+  it('treats an explicitly null query value as missing (never sent) but warns that it was dropped', () => {
+    let bound!: ReturnType<typeof bindArgs>;
+    const stderr = captureStderr(() => {
+      bound = bindArgs(
+        candidate({ path: '/google/search', httpMethod: 'GET', bindings: { query: ['query', 'country'] } }),
+        { query: 'cats', country: null },
+      );
+    });
     expect(bound.query).toEqual({ query: 'cats' });
+    // A null-valued declared query parameter is not sent, and since a GET has
+    // nowhere else to put it the caller is told rather than left guessing.
+    expect(stderr).toContain('not sending argument(s)');
+    expect(stderr).toContain('country');
   });
 
   it('warns on stderr about args a GET request cannot send anywhere', () => {
-    const writes: string[] = [];
-    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-      writes.push(String(chunk));
-      return true;
-    });
-    try {
-      const bound = bindArgs(
+    let bound!: ReturnType<typeof bindArgs>;
+    const stderr = captureStderr(() => {
+      bound = bindArgs(
         candidate({ path: '/google/search', httpMethod: 'GET', bindings: { method: 'GET', query: ['query'] } }),
         { query: 'cats', contry: 'US' }, // note the typo: no binding claims "contry"
       );
-      expect(bound.query).toEqual({ query: 'cats' });
-    } finally {
-      spy.mockRestore();
-    }
-    expect(writes.join('')).toContain('contry');
+    });
+    expect(bound.query).toEqual({ query: 'cats' });
+    expect(stderr).toContain('contry');
   });
 
   it('says nothing when a GET leaves no args unbound', () => {
-    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    try {
+    const stderr = captureStderr(() => {
       bindArgs(candidate({ path: '/s', httpMethod: 'GET', bindings: { query: ['query'] } }), { query: 'cats' });
-    } finally {
-      spy.mockRestore();
-    }
-    expect(spy).not.toHaveBeenCalled();
+    });
+    expect(stderr).toBe('');
   });
 });
 
@@ -339,10 +358,15 @@ describe('bindArgs — body-source rule', () => {
     expect(bound.body).toEqual({ url: 'https://example.com', render_js: true });
   });
 
-  it('never attaches a body to a GET request, even when args has unbound leftovers', () => {
+  it('never attaches a body to a GET request, even when args has unbound leftovers (which it warns about)', () => {
     const method = candidate({ path: '/lookup', httpMethod: 'GET', bindings: { query: ['q'] } });
-    const bound = bindArgs(method, { q: 'x', leftover: 'ignored-for-get' });
+    let bound!: ReturnType<typeof bindArgs>;
+    const stderr = captureStderr(() => {
+      bound = bindArgs(method, { q: 'x', leftover: 'ignored-for-get' });
+    });
     expect(Object.hasOwn(bound, 'body')).toBe(false);
+    expect(stderr).toContain('not sending argument(s)');
+    expect(stderr).toContain('leftover');
   });
 
   it('throws BindingError("missing-body-param") when a required, unbound property has nowhere to go', () => {
