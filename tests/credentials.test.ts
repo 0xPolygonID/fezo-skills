@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
 import { Readable } from 'node:stream';
 
 import {
+  defaultDotEnvPath,
   maskSecret,
   parseDotEnv,
   readDotEnvFile,
@@ -14,6 +15,9 @@ import {
   storeCredentials,
   writeDotEnvFile,
   writeKeychainSecret,
+  KEYCHAIN_ACCOUNT,
+  KEYCHAIN_SERVICE_API_KEY,
+  KEYCHAIN_SERVICE_URL,
 } from '../src/engine/credentials.js';
 import type { KeychainCommandResult, KeychainRunner } from '../src/engine/credentials.js';
 
@@ -105,7 +109,7 @@ describe('resolveCredentials — precedence', () => {
         warnedAliases: new Set(),
       });
 
-      expect(resolution.apiKey).toEqual({ value: 'sk-from-canonical-env', source: 'env' });
+      expect(resolution.apiKey).toEqual({ value: 'sk-from-canonical-env', masked: 'sk-f…', source: 'env' });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -118,7 +122,7 @@ describe('resolveCredentials — precedence', () => {
         dotEnvPath: '/nonexistent/.env',
         warnedAliases: new Set(),
       });
-      expect(resolution.url).toEqual({ value: 'https://alias.example.com', source: 'deprecated-env' });
+      expect(resolution.url).toEqual({ value: 'https://alias.example.com', masked: 'http…', source: 'deprecated-env' });
     });
     expect(stderr).toContain('ZUG_URL');
     expect(stderr).toContain('FEZO_URL');
@@ -132,7 +136,7 @@ describe('resolveCredentials — precedence', () => {
       keychain: runner,
       warnedAliases: new Set(),
     });
-    expect(resolution.apiKey).toEqual({ value: 'sk-from-keychain', source: 'keychain' });
+    expect(resolution.apiKey).toEqual({ value: 'sk-from-keychain', masked: 'sk-f…', source: 'keychain' });
     expect(calls.length).toBeGreaterThan(0);
   });
 
@@ -148,7 +152,7 @@ describe('resolveCredentials — precedence', () => {
         keychain: runner,
         warnedAliases: new Set(),
       });
-      expect(resolution.apiKey).toEqual({ value: 'sk-from-dotenv', source: 'dotenv' });
+      expect(resolution.apiKey).toEqual({ value: 'sk-from-dotenv', masked: 'sk-f…', source: 'dotenv' });
     });
   });
 
@@ -162,8 +166,8 @@ describe('resolveCredentials — precedence', () => {
         dotEnvPath,
         warnedAliases: new Set(),
       });
-      expect(resolution.apiKey).toEqual({ value: 'sk-from-env', source: 'env' });
-      expect(resolution.url).toEqual({ value: 'https://dotenv.example.com', source: 'dotenv' });
+      expect(resolution.apiKey).toEqual({ value: 'sk-from-env', masked: 'sk-f…', source: 'env' });
+      expect(resolution.url).toEqual({ value: 'https://dotenv.example.com', masked: 'http…', source: 'dotenv' });
     });
   });
 
@@ -186,7 +190,7 @@ describe('resolveCredentials — precedence', () => {
         dotEnvPath,
         warnedAliases: new Set(),
       });
-      expect(resolution.apiKey).toEqual({ value: 'sk-from-dotenv', source: 'dotenv' });
+      expect(resolution.apiKey).toEqual({ value: 'sk-from-dotenv', masked: 'sk-f…', source: 'dotenv' });
     });
   });
 });
@@ -255,6 +259,46 @@ describe('resolveCredentials — deprecated alias warning', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Storage locations and identifiers. These are pinned by name because they are
+// effectively a storage format: the config directory is mandated by the design
+// spec (`~/.config/fezo/`), and the Keychain account/service names cannot be
+// changed after a release without orphaning every already-stored secret.
+// ---------------------------------------------------------------------------
+
+describe('defaultDotEnvPath', () => {
+  it('honours XDG_CONFIG_HOME and puts .env under a "fezo" directory', () => {
+    const path = defaultDotEnvPath({ XDG_CONFIG_HOME: '/xdg-config' });
+    expect(path).toBe(join('/xdg-config', 'fezo', '.env'));
+    expect(path.split(sep)).toContain('fezo');
+  });
+
+  it('falls back to ~/.config/fezo/.env when XDG_CONFIG_HOME is unset', () => {
+    const path = defaultDotEnvPath({});
+    expect(path).toBe(join(homedir(), '.config', 'fezo', '.env'));
+  });
+
+  it('treats an empty XDG_CONFIG_HOME as unset', () => {
+    expect(defaultDotEnvPath({ XDG_CONFIG_HOME: '' })).toBe(join(homedir(), '.config', 'fezo', '.env'));
+  });
+
+  it('names the config directory after the product, never after the binary', () => {
+    // The design spec says `~/.config/fezo/`; the binary happens to be called
+    // something else, and this asserts the directory does not drift to it.
+    const segments = defaultDotEnvPath({ XDG_CONFIG_HOME: '/xdg-config' }).split(sep);
+    expect(segments).toContain('fezo');
+    expect(segments).not.toContain('fezoctl');
+  });
+});
+
+describe('Keychain identifiers', () => {
+  it('are pinned: renaming them would orphan secrets already in users Keychains', () => {
+    expect(KEYCHAIN_ACCOUNT).toBe('fezo');
+    expect(KEYCHAIN_SERVICE_URL).toBe('fezo-url');
+    expect(KEYCHAIN_SERVICE_API_KEY).toBe('fezo-api-key');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // .env file creation: mode 0600 at open time, refuses to clobber.
 // ---------------------------------------------------------------------------
 
@@ -276,6 +320,77 @@ describe('writeDotEnvFile', () => {
       const contents = readFileSync(path, 'utf8');
       expect(contents).toContain('FEZO_API_KEY=sk-test-value');
       expect(contents).toContain('FEZO_URL=https://gw.example.com');
+    });
+  });
+
+  it('creates a missing parent directory chain, with mode 0700 on every directory it makes', () => {
+    withTmpDir((dir) => {
+      // The first-run shape: nothing below the temp dir exists yet, exactly
+      // like `~/.config/fezo/` on a machine that has never run setup.
+      const configDir = join(dir, 'config');
+      const productDir = join(configDir, 'fezo');
+      const path = join(productDir, '.env');
+      expect(existsSync(configDir)).toBe(false);
+
+      const result = writeDotEnvFile(path, { FEZO_API_KEY: 'sk-first-run' });
+
+      expect(result).toEqual({ ok: true });
+      expect(readFileSync(path, 'utf8')).toContain('FEZO_API_KEY=sk-first-run');
+      // 0700, not just "not world-writable": a readable directory advertises
+      // that a credential file exists even though the file itself is 0600.
+      expect(statSync(configDir).mode & 0o777).toBe(0o700);
+      expect(statSync(productDir).mode & 0o777).toBe(0o700);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    });
+  });
+
+  it('an existing parent directory is left alone (no mode changes, no failure)', () => {
+    withTmpDir((dir) => {
+      const before = statSync(dir).mode & 0o777;
+      const result = writeDotEnvFile(join(dir, '.env'), { FEZO_API_KEY: 'sk-existing-parent' });
+      expect(result).toEqual({ ok: true });
+      expect(statSync(dir).mode & 0o777).toBe(before);
+    });
+  });
+
+  it('a failure mid-write reports reason "error" and removes the partial file so a retry can succeed', () => {
+    withTmpDir((dir) => {
+      const path = join(dir, '.env');
+
+      // A real, unmocked failure raised while the contents are being built --
+      // after `openSync` has already created the file, which is precisely the
+      // window that used to wedge: the throw escaped the function, and every
+      // later attempt then hit `wx`'s EEXIST against the empty file left behind.
+      const hostile: Record<string, string> = {};
+      Object.defineProperty(hostile, 'FEZO_API_KEY', {
+        enumerable: true,
+        get(): string {
+          throw new Error('simulated write-path failure');
+        },
+      });
+
+      const failed = writeDotEnvFile(path, hostile);
+      expect(failed.ok).toBe(false);
+      expect(failed.reason).toBe('error');
+      expect(failed.message).toContain('simulated write-path failure');
+
+      // The wedge is gone: no leftover file, so the retry is not an 'exists'.
+      expect(existsSync(path)).toBe(false);
+      const retried = writeDotEnvFile(path, { FEZO_API_KEY: 'sk-after-retry' });
+      expect(retried).toEqual({ ok: true });
+      expect(readFileSync(path, 'utf8')).toContain('FEZO_API_KEY=sk-after-retry');
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    });
+  });
+
+  it('reports reason "error", not "exists", when a file sits where the parent directory should be', () => {
+    withTmpDir((dir) => {
+      const inTheWay = join(dir, 'not-a-directory');
+      expect(writeDotEnvFile(inTheWay, { FEZO_API_KEY: 'sk-blocker' })).toEqual({ ok: true });
+
+      const result = writeDotEnvFile(join(inTheWay, '.env'), { FEZO_API_KEY: 'sk-blocked' });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe('error');
     });
   });
 
@@ -306,7 +421,7 @@ describe('writeKeychainSecret', () => {
     const secret = 'sk-super-secret-value-12345';
     const { runner, calls } = recordingKeychainRunner(OK);
 
-    const result = writeKeychainSecret(runner, 'fezoctl-api-key', 'fezoctl', secret);
+    const result = writeKeychainSecret(runner, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT, secret);
 
     expect(result.ok).toBe(true);
     expect(calls.length).toBe(1);
@@ -328,7 +443,7 @@ describe('writeKeychainSecret', () => {
 
   it('uses the recommended trailing "-w" form (no value follows it in argv)', () => {
     const { runner, calls } = recordingKeychainRunner(OK);
-    writeKeychainSecret(runner, 'fezoctl-api-key', 'fezoctl', 'sk-anything');
+    writeKeychainSecret(runner, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT, 'sk-anything');
     const call = calls[0];
     expect(call).toBeDefined();
     if (call === undefined) throw new Error('unreachable');
@@ -337,7 +452,7 @@ describe('writeKeychainSecret', () => {
 
   it('reports a non-zero exit as a failed outcome with the command\'s stderr as the message', () => {
     const { runner } = recordingKeychainRunner({ status: 1, stdout: '', stderr: 'security: SecKeychainAddGenericPassword: boom' });
-    const result = writeKeychainSecret(runner, 'fezoctl-api-key', 'fezoctl', 'sk-whatever');
+    const result = writeKeychainSecret(runner, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT, 'sk-whatever');
     expect(result.ok).toBe(false);
     expect(result.message).toContain('boom');
   });
@@ -346,14 +461,14 @@ describe('writeKeychainSecret', () => {
 describe('readKeychainSecret', () => {
   it('reads the value from stdout and trims a trailing newline', () => {
     const { runner } = recordingKeychainRunner({ status: 0, stdout: 'sk-round-tripped\n', stderr: '' });
-    const result = readKeychainSecret(runner, 'fezoctl-api-key', 'fezoctl');
+    const result = readKeychainSecret(runner, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT);
     expect(result.ok).toBe(true);
     expect(result.value).toBe('sk-round-tripped');
   });
 
   it('reports "not found" as a structured failure rather than throwing', () => {
     const { runner } = recordingKeychainRunner(NOT_FOUND);
-    const result = readKeychainSecret(runner, 'fezoctl-api-key', 'fezoctl');
+    const result = readKeychainSecret(runner, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT);
     expect(result.ok).toBe(false);
     expect(result.value).toBeUndefined();
   });
@@ -457,6 +572,22 @@ describe('storeCredentials', () => {
     });
   });
 
+  it('dotenv storage works on a first run, where the config directory does not exist yet', () => {
+    withTmpDir((dir) => {
+      const dotEnvPath = join(dir, 'config', 'fezo', '.env');
+      const result = storeCredentials({
+        storage: 'dotenv',
+        apiKey: 'sk-first-run-setup',
+        url: 'https://gw.example.com',
+        dotEnvPath,
+      });
+      expect(result.apiKey).toEqual({ ok: true });
+      expect(result.url).toEqual({ ok: true });
+      expect(readFileSync(dotEnvPath, 'utf8')).toContain('FEZO_API_KEY=sk-first-run-setup');
+      expect(statSync(dotEnvPath).mode & 0o777).toBe(0o600);
+    });
+  });
+
   it('keychain storage stores the secret via the injected runner, never in argv', () => {
     const { runner, calls } = recordingKeychainRunner(OK);
     const result = storeCredentials({
@@ -471,6 +602,10 @@ describe('storeCredentials', () => {
     for (const call of calls) {
       expect(call.argv.join(' ')).not.toContain('sk-stored-in-keychain');
     }
+    // Pins the identifiers the writes actually use, not just the constants'
+    // values: a resolver looking under different names would find nothing.
+    expect(calls[0]?.argv).toEqual(['add-generic-password', '-a', 'fezo', '-s', 'fezo-api-key', '-U', '-w']);
+    expect(calls[1]?.argv).toEqual(['add-generic-password', '-a', 'fezo', '-s', 'fezo-url', '-U', '-w']);
   });
 
   it('keychain storage without a runner reports a structured failure instead of throwing', () => {
@@ -480,32 +615,168 @@ describe('storeCredentials', () => {
 });
 
 // ---------------------------------------------------------------------------
-// No leakage: neither the raw secret nor an Authorization header value ever
-// appears in anything this module writes to stderr or returns.
+// storeCredentials must not accept a key that resolveCredentials would then
+// report as absent -- an empty stdin (Ctrl-D with nothing pasted) is the real
+// case this closes.
 // ---------------------------------------------------------------------------
 
-describe('no secret or Authorization-header leakage', () => {
+describe('storeCredentials — empty API key', () => {
+  it('rejects an empty key for dotenv storage and writes no file at all', () => {
+    withTmpDir((dir) => {
+      const dotEnvPath = join(dir, '.env');
+      const result = storeCredentials({ storage: 'dotenv', apiKey: '', url: 'https://gw.example.com', dotEnvPath });
+
+      expect(result.apiKey.ok).toBe(false);
+      expect(result.apiKey.reason).toBe('empty-api-key');
+      expect(result.url?.ok).toBe(false);
+      // Nothing written: not even an empty `FEZO_API_KEY=` line, which would
+      // both look configured and resolve as unconfigured.
+      expect(existsSync(dotEnvPath)).toBe(false);
+    });
+  });
+
+  it('rejects a whitespace-only key for dotenv storage', () => {
+    withTmpDir((dir) => {
+      const dotEnvPath = join(dir, '.env');
+      const result = storeCredentials({ storage: 'dotenv', apiKey: '   ', dotEnvPath });
+      expect(result.apiKey.ok).toBe(false);
+      expect(result.apiKey.reason).toBe('empty-api-key');
+      expect(existsSync(dotEnvPath)).toBe(false);
+    });
+  });
+
+  it('rejects an empty key for keychain storage without invoking the runner', () => {
+    const { runner, calls } = recordingKeychainRunner(OK);
+    const result = storeCredentials({ storage: 'keychain', apiKey: '', keychain: runner });
+    expect(result.apiKey.ok).toBe(false);
+    expect(result.apiKey.reason).toBe('empty-api-key');
+    expect(calls.length).toBe(0);
+  });
+
+  it('rejects a whitespace-only key for keychain storage without invoking the runner', () => {
+    const { runner, calls } = recordingKeychainRunner(OK);
+    const result = storeCredentials({ storage: 'keychain', apiKey: '   ', keychain: runner });
+    expect(result.apiKey.ok).toBe(false);
+    expect(result.apiKey.reason).toBe('empty-api-key');
+    expect(calls.length).toBe(0);
+  });
+
+  it("what setup stores, resolveCredentials reports -- the two halves agree on 'no credential'", () => {
+    withTmpDir((dir) => {
+      const dotEnvPath = join(dir, '.env');
+      const stored = storeCredentials({ storage: 'dotenv', apiKey: '', dotEnvPath });
+      expect(stored.apiKey.ok).toBe(false);
+
+      const resolution = resolveCredentials({ env: {}, dotEnvPath, warnedAliases: new Set() });
+      expect(Object.hasOwn(resolution, 'apiKey')).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// No leakage. Stated precisely, because "the secret never appears in the
+// result" is NOT the invariant for resolveCredentials: it deliberately returns
+// the raw key so client.ts can send it. The invariant is that the raw key lives
+// in exactly one field (`apiKey.value`), and that everything else -- stderr,
+// `masked`, and the whole of storeCredentials' result -- is free of it.
+// ---------------------------------------------------------------------------
+
+describe('no secret leakage', () => {
   it('resolveCredentials never writes the resolved secret to stderr', () => {
     const secret = 'sk-should-never-appear-in-logs';
-    const { stderr, result } = captureStderrWithResult(() =>
+    const { stderr } = captureStderrWithResult(() =>
       resolveCredentials({
         env: { ZUG_API_KEY: secret },
         dotEnvPath: '/nonexistent/.env',
         warnedAliases: new Set(),
       }),
     );
+    // The alias warning fires here, so this is a real check of a real line.
+    expect(stderr).toContain('ZUG_API_KEY');
     expect(stderr).not.toContain(secret);
-    expect(stderr).not.toContain('Authorization');
-    expect(JSON.stringify(result)).not.toContain('Authorization');
   });
 
-  it('storeCredentials never writes the secret to stderr, and its result contains no Authorization value', () => {
+  it('resolveCredentials carries the raw secret in apiKey.value and nowhere else', () => {
+    const secret = 'sk-should-appear-exactly-once';
+    const result = resolveCredentials({
+      env: { FEZO_API_KEY: secret },
+      dotEnvPath: '/nonexistent/.env',
+      warnedAliases: new Set(),
+    });
+
+    // The field set is closed: a future field carrying the secret in another
+    // shape (a rendered summary, a header, a copy) fails this.
+    expect(Object.keys(result.apiKey ?? {}).sort()).toEqual(['masked', 'source', 'value']);
+    expect(result.apiKey?.value).toBe(secret);
+
+    // Serialized, the secret occurs exactly once -- under `value`. Redacting
+    // that one field must leave nothing behind.
+    const serialized = JSON.stringify(result);
+    expect(serialized.split(secret).length - 1).toBe(1);
+    expect(serialized.replace(secret, '<redacted>')).not.toContain(secret);
+  });
+
+  it('the masked companion never contains the full secret, whatever the source', () => {
+    withTmpDir((dir) => {
+      const secret = 'sk-masking-must-hold-for-every-source';
+      const dotEnvPath = join(dir, '.env');
+      writeDotEnvFile(dotEnvPath, { FEZO_API_KEY: secret });
+
+      const fromDotEnv = resolveCredentials({ env: {}, dotEnvPath, warnedAliases: new Set() });
+      expect(fromDotEnv.apiKey?.masked).toBe('sk-m…');
+      expect(fromDotEnv.apiKey?.masked).not.toContain(secret);
+
+      const { runner } = recordingKeychainRunner({ status: 0, stdout: `${secret}\n`, stderr: '' });
+      const fromKeychain = resolveCredentials({
+        env: {},
+        dotEnvPath: '/nonexistent/.env',
+        keychain: runner,
+        warnedAliases: new Set(),
+      });
+      expect(fromKeychain.apiKey?.masked).toBe('sk-m…');
+      expect(fromKeychain.apiKey?.masked).not.toContain(secret);
+
+      const fromEnv = resolveCredentials({ env: { FEZO_API_KEY: secret }, dotEnvPath: '/nonexistent/.env', warnedAliases: new Set() });
+      expect(fromEnv.apiKey?.masked).not.toContain(secret);
+      expect(maskSecret(secret).length).toBeLessThan(secret.length);
+    });
+  });
+
+  it('storeCredentials never writes the secret to stderr and never returns it', () => {
     const secret = 'sk-should-never-appear-either';
     const { runner } = recordingKeychainRunner(OK);
     const { stderr, result } = captureStderrWithResult(() =>
+      storeCredentials({ storage: 'keychain', apiKey: secret, url: 'https://gw.example.com', keychain: runner }),
+    );
+    expect(stderr).toBe('');
+    // storeCredentials reports outcomes, never values: unlike resolveCredentials
+    // it has no legitimate reason to hand the key back, so absence is the
+    // invariant here.
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it('storeCredentials does not echo the secret back in a failure message either', () => {
+    const secret = 'sk-not-in-the-error-message';
+    const { runner } = recordingKeychainRunner({ status: 1, stdout: '', stderr: 'security: SecKeychainAddGenericPassword: boom' });
+    const { stderr, result } = captureStderrWithResult(() =>
       storeCredentials({ storage: 'keychain', apiKey: secret, keychain: runner }),
     );
-    expect(stderr).not.toContain(secret);
-    expect(JSON.stringify(result)).not.toContain('Authorization');
+    expect(result.apiKey.ok).toBe(false);
+    expect(stderr).toBe('');
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it('a dotenv store writes the secret to the file and to nothing else', () => {
+    withTmpDir((dir) => {
+      const secret = 'sk-only-in-the-file';
+      const dotEnvPath = join(dir, 'config', 'fezo', '.env');
+      const { stderr, result } = captureStderrWithResult(() =>
+        storeCredentials({ storage: 'dotenv', apiKey: secret, dotEnvPath }),
+      );
+      expect(result.apiKey.ok).toBe(true);
+      expect(stderr).toBe('');
+      expect(JSON.stringify(result)).not.toContain(secret);
+      expect(readFileSync(dotEnvPath, 'utf8')).toContain(secret);
+    });
   });
 });

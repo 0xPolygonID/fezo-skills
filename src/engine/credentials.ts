@@ -23,10 +23,15 @@
 //      `ps`), and nothing in this module ever accepts a key via a CLI flag.
 //   3. `.env` is opened with `fs.openSync(path, 'wx', 0o600)` — mode set AT
 //      OPEN TIME, not chmod'ed after the fact, and `wx` refuses to clobber an
-//      existing file (see `writeDotEnvFile`).
-//   4. Every value this module renders back to a caller is either non-secret
-//      (a `CredentialSource`, a file path, a boolean) or has gone through
-//      `maskSecret`. This module never constructs or logs an `Authorization`
+//      existing file (see `writeDotEnvFile`). Its parent directory is created
+//      `0700` for the same reason: a world-readable directory advertises the
+//      file's existence even when the file itself is unreadable.
+//   4. Exactly ONE field in this module's output carries a raw secret:
+//      `ResolvedValue.value`, which exists because client.ts and catalog.ts
+//      need the real key to call the gateway. Every `ResolvedValue` also
+//      carries `masked` (via `maskSecret`), which is what any renderer
+//      (`doctor`, `--json`) must print; `storeCredentials`'s result carries no
+//      secret at all. This module never constructs or logs an `Authorization`
 //      header — it has no reason to; that header is client.ts's job.
 //
 // Resolution order (identical for both `FEZO_URL`/`FEZO_API_KEY`): canonical
@@ -36,9 +41,9 @@
 // not a legacy stub to delete later.
 
 import { spawnSync } from 'node:child_process';
-import { closeSync, openSync, readFileSync, writeSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { Readable } from 'node:stream';
 
 // ---------------------------------------------------------------------------
@@ -137,15 +142,24 @@ export interface KeychainRunner {
   run(argv: readonly string[], stdin?: string): KeychainCommandResult;
 }
 
+/** The macOS `security` binary, spelled absolutely — see `systemKeychainRunner`. */
+const SECURITY_BINARY = '/usr/bin/security';
+
 /**
  * The real implementation, backed by `/usr/bin/security` via `spawnSync`.
  * Not used by any test in this repo (no `security` binary in CI) — it exists
  * so a later task has a working default to pass when actually running on
  * macOS, without reimplementing the subprocess plumbing.
+ *
+ * The binary is named by ABSOLUTE PATH, not as bare `security` resolved
+ * through `PATH`: this runner pipes a live API key to that process's stdin,
+ * so an attacker-controlled or merely accidental `security` earlier on `PATH`
+ * would be handed the secret. `/usr/bin/security` is a fixed part of macOS,
+ * so there is no portability cost to pinning it.
  */
 export const systemKeychainRunner: KeychainRunner = {
   run(argv, stdin) {
-    const result = spawnSync('security', Array.from(argv), {
+    const result = spawnSync(SECURITY_BINARY, Array.from(argv), {
       input: stdin ?? '',
       encoding: 'utf8',
     });
@@ -157,10 +171,19 @@ export const systemKeychainRunner: KeychainRunner = {
   },
 };
 
-/** Fixed identifiers this module stores/looks up Keychain items under. */
-export const KEYCHAIN_ACCOUNT = 'fezoctl';
-export const KEYCHAIN_SERVICE_URL = 'fezoctl-url';
-export const KEYCHAIN_SERVICE_API_KEY = 'fezoctl-api-key';
+/**
+ * Fixed identifiers this module stores/looks up Keychain items under.
+ *
+ * `fezo`-prefixed to match the rest of the product's naming (`~/.config/fezo/`,
+ * `FEZO_URL`, `FEZO_API_KEY`) rather than the binary name. These three strings
+ * are effectively a storage format: changing them after a release would leave
+ * every already-stored secret orphaned in users' Keychains under the old names,
+ * with `fezoctl` reporting "no credential found" and no migration path — so
+ * they are pinned by a test and must not be renamed.
+ */
+export const KEYCHAIN_ACCOUNT = 'fezo';
+export const KEYCHAIN_SERVICE_URL = 'fezo-url';
+export const KEYCHAIN_SERVICE_API_KEY = 'fezo-api-key';
 
 export interface KeychainWriteResult {
   ok: boolean;
@@ -232,7 +255,10 @@ export function readKeychainSecret(runner: KeychainRunner, service: string, acco
 
 /**
  * Where `.env` lives when a caller does not name a path explicitly:
- * `$XDG_CONFIG_HOME/fezoctl/.env`, falling back to `~/.config/fezoctl/.env`.
+ * `$XDG_CONFIG_HOME/fezo/.env`, falling back to `~/.config/fezo/.env` — the
+ * config directory the design spec mandates (§3's "Config directory
+ * `~/.config/fezo/`" and the naming-migration clause: config `~/.config/fezo/`,
+ * binary `fezoctl`; the directory follows the product name, not the binary's).
  * `fezoctl` is a globally installed CLI (see `package.json`'s `bin.fezoctl`),
  * not a per-project tool, so credentials belong in the user's config
  * directory rather than in whatever directory happens to be the current
@@ -246,7 +272,7 @@ export function readKeychainSecret(runner: KeychainRunner, service: string, acco
  */
 export function defaultDotEnvPath(env: NodeJS.ProcessEnv = process.env): string {
   const configHome = env.XDG_CONFIG_HOME && env.XDG_CONFIG_HOME.length > 0 ? env.XDG_CONFIG_HOME : join(homedir(), '.config');
-  return join(configHome, 'fezoctl', '.env');
+  return join(configHome, 'fezo', '.env');
 }
 
 /**
@@ -311,8 +337,32 @@ export interface DotEnvWriteResult {
  * function has no way to know whether an existing `.env` holds credentials
  * the caller does not intend to overwrite, so it reports that back as an
  * ordinary (`reason: 'exists'`) outcome instead of guessing.
+ *
+ * The parent directory is created first (`recursive`, mode `0700`) because on a
+ * first run it does not exist yet — without this, the primary documented setup
+ * path fails with a raw `ENOENT` the first time anyone uses it. `0700` rather
+ * than the default `0777`-minus-umask is deliberate: a world-readable config
+ * directory advertises that a credential file exists (and its size and mtime)
+ * even though the file itself is `0600`. Mode `0700` is also umask-proof — a
+ * umask can only clear bits, and there are no group/other bits here to clear.
+ *
+ * Never throws: every failure — including one that strikes mid-write, after
+ * `openSync` has already created the file — comes back as a structured result.
+ * A mid-write failure additionally REMOVES the partial file, because leaving it
+ * behind would make every subsequent attempt fail with `reason: 'exists'`
+ * against a truncated `.env`: a permanent wedge only a manual `rm` could clear.
  */
 export function writeDotEnvFile(path: string, values: Readonly<Record<string, string>>): DotEnvWriteResult {
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  } catch (err) {
+    // Not folded into the `openSync` catch below: `mkdirSync` reports an
+    // existing *file* in the directory's place as `EEXIST` too, which that
+    // catch would mistranslate into the "refusing to overwrite" outcome.
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: 'error', message };
+  }
+
   let fd: number;
   try {
     fd = openSync(path, 'wx', 0o600);
@@ -324,13 +374,35 @@ export function writeDotEnvFile(path: string, values: Readonly<Record<string, st
     return { ok: false, reason: 'error', message };
   }
 
+  // `failure` is a box rather than the raw `unknown` so that "no failure" is
+  // distinguishable from a falsy thrown value, and so the first failure wins:
+  // `closeSync` can itself fail (a buffered ENOSPC surfaces there), but the
+  // write's own error is the more informative one to report.
+  let failure: { readonly err: unknown } | undefined;
   try {
     const contents = Object.entries(values)
       .map(([key, value]) => `${key}=${value}\n`)
       .join('');
     writeSync(fd, contents, null, 'utf8');
-  } finally {
+  } catch (err) {
+    failure = { err };
+  }
+  try {
     closeSync(fd);
+  } catch (err) {
+    failure ??= { err };
+  }
+
+  if (failure !== undefined) {
+    try {
+      unlinkSync(path);
+    } catch {
+      // Deliberately swallowed: the write error is what the caller needs to
+      // see, and masking it with a cleanup error would hide the real cause.
+      // The worst case is the pre-existing behavior (a stale empty `.env`).
+    }
+    const message = failure.err instanceof Error ? failure.err.message : String(failure.err);
+    return { ok: false, reason: 'error', message };
   }
   return { ok: true };
 }
@@ -342,7 +414,22 @@ export function writeDotEnvFile(path: string, values: Readonly<Record<string, st
 export type CredentialSource = 'env' | 'deprecated-env' | 'keychain' | 'dotenv';
 
 export interface ResolvedValue {
+  /**
+   * The raw value. For the API key this is the live secret: it is here because
+   * client.ts and catalog.ts need it to call the gateway, and it is the ONLY
+   * field in this module's output that carries one. Anything that renders a
+   * credential to a human, a log line, or `--json` must use `masked` instead.
+   */
   value: string;
+  /**
+   * `maskSecret(value)` — a short prefix and an ellipsis, never the full value
+   * or even its length. Precomputed rather than left to each caller so that
+   * the safe field is the obvious one to reach for: a renderer that
+   * `JSON.stringify`s a `ResolvedValue` wholesale is a leak, and a renderer
+   * that has to call a function to get a printable form is a renderer that
+   * will eventually forget to.
+   */
+  masked: string;
   source: CredentialSource;
 }
 
@@ -371,6 +458,11 @@ export interface ResolveCredentialsOptions {
 /** Shared for the lifetime of the process when a caller does not inject its own tracker. */
 const PROCESS_ALIAS_WARNINGS = new Set<string>();
 
+/** The one place a `ResolvedValue` is built, so `masked` can never be forgotten at a call site. */
+function resolved(value: string, source: CredentialSource): ResolvedValue {
+  return { value, masked: maskSecret(value), source };
+}
+
 interface ResolveOneOptions {
   canonicalName: 'FEZO_URL' | 'FEZO_API_KEY';
   deprecatedName: 'ZUG_URL' | 'ZUG_API_KEY';
@@ -396,7 +488,7 @@ interface ResolveOneOptions {
 function resolveOne(options: ResolveOneOptions): ResolvedValue | undefined {
   const canonical = options.env[options.canonicalName];
   if (canonical !== undefined && canonical.length > 0) {
-    return { value: canonical, source: 'env' };
+    return resolved(canonical, 'env');
   }
 
   const deprecated = options.env[options.deprecatedName];
@@ -405,19 +497,19 @@ function resolveOne(options: ResolveOneOptions): ResolvedValue | undefined {
       options.warnedAliases.add(options.deprecatedName);
       warn(`${options.deprecatedName} is deprecated; use ${options.canonicalName} instead`);
     }
-    return { value: deprecated, source: 'deprecated-env' };
+    return resolved(deprecated, 'deprecated-env');
   }
 
   if (options.keychain) {
     const found = readKeychainSecret(options.keychain, options.keychainService, KEYCHAIN_ACCOUNT);
     if (found.ok && found.value !== undefined && found.value.length > 0) {
-      return { value: found.value, source: 'keychain' };
+      return resolved(found.value, 'keychain');
     }
   }
 
   const fromDotEnv = options.dotEnv[options.canonicalName];
   if (fromDotEnv !== undefined && fromDotEnv.length > 0) {
-    return { value: fromDotEnv, source: 'dotenv' };
+    return resolved(fromDotEnv, 'dotenv');
   }
 
   return undefined;
@@ -515,8 +607,29 @@ export interface StoreCredentialsResult {
  * for a non-secret too. If the caller picks `keychain` storage without
  * supplying a `KeychainRunner`, that is reported as an ordinary failed
  * outcome (a caller/config mistake, not a fault worth throwing over).
+ *
+ * An empty or whitespace-only `apiKey` is rejected BEFORE any write. That is
+ * not defensive boilerplate: `readSecretFromStream` returns `''` when the user
+ * hits Ctrl-D without pasting anything, and without this check `setup` would
+ * happily write `FEZO_API_KEY=` (or an empty Keychain item) and report success,
+ * while `resolveOne` — which treats an empty value as "not set" — would then
+ * report no credential at all. The two halves of this module have to agree on
+ * what counts as a credential.
  */
 export function storeCredentials(options: StoreCredentialsOptions): StoreCredentialsResult {
+  if (options.apiKey.trim().length === 0) {
+    const outcome: FieldStoreOutcome = {
+      ok: false,
+      reason: 'empty-api-key',
+      message: 'no API key was provided; nothing was stored',
+    };
+    return {
+      storage: options.storage,
+      apiKey: outcome,
+      ...(options.url !== undefined ? { url: outcome } : {}),
+    };
+  }
+
   if (options.storage === 'dotenv') {
     const dotEnvPath = options.dotEnvPath ?? defaultDotEnvPath();
     const values: Record<string, string> = { FEZO_API_KEY: options.apiKey };
