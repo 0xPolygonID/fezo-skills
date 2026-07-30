@@ -11,7 +11,7 @@ import {
   selectForRun,
   tokenize,
 } from '../src/engine/rank.js';
-import type { SearchMatch } from '../src/engine/rank.js';
+import type { RunSelection, SearchMatch } from '../src/engine/rank.js';
 import { methodToToolName } from '../src/engine/tool-name.js';
 
 // ---------------------------------------------------------------------------
@@ -34,6 +34,22 @@ const SCRAPERAPI_INFO =
   'Scrape any URL (with JS rendering, geotargeting, premium proxies), collect structured data from Amazon, eBay, Walmart, Google, and Redfin, and run large/hard scrapes via the async jobs API. Billed per ScraperAPI credit.';
 const BRIGHTDATA_INFO =
   'Fetch any URL through the Web Unlocker, run search-engine queries via the SERP API, and collect structured data from any Bright Data dataset (including the Social Media scrapers) via the async trigger/poll/download flow. Billed per request and per collected record.';
+const FALAI_INFO =
+  'Run Fal AI models for image, video, audio, and other generative tasks — synchronously, or submitted to the Fal job queue and polled for results.';
+
+// falai's `queue.result` and its synchronous neighbour `run`, verbatim from
+// zug/internal/falaibackend/manifest.go. `queue.result` is the only live
+// method whose async nature is carried by nothing but the phrase "request id"
+// in its own description — no async name suffix, no `poll`, and an output
+// schema that is the real model result rather than an id. `run` is its
+// synchronous neighbour, quoted so the same fixtures can show the phrase does
+// not over-reach.
+const FALAI_QUEUE_RESULT_TITLE = 'Get queued request result';
+const FALAI_QUEUE_RESULT_DESCRIPTION =
+  'Fetch the result of a completed queued Fal AI request by its request id.';
+const FALAI_RUN_TITLE = 'Run a model (synchronous)';
+const FALAI_RUN_DESCRIPTION =
+  "Run a Fal AI model and wait for the result. The path is the Fal model id; the JSON body is the model's input.";
 
 function makeCandidate(
   overrides: Partial<ToolCandidate> & Pick<ToolCandidate, 'backendId' | 'method'>,
@@ -307,6 +323,64 @@ describe('isAsyncLifecycleMethod', () => {
       backendInfoText: FIRECRAWL_INFO,
     });
     expect(isAsyncLifecycleMethod(map)).toBe(false);
+  });
+
+  it('excludes falai_queue_result, whose ONLY async signal is the phrase "request id"', () => {
+    // Real title/description/output schema from
+    // zug/internal/falaibackend/manifest.go. This method downloads the result
+    // of a completed queued job, so `run` must never auto-call it — a 2xx is
+    // billed. Every other detector misses it on purpose:
+    //   - name: tool is `falai_queue_result`; no ASYNC_NAME_SUFFIXES match and
+    //     the method is not exactly `crawl`;
+    //   - output shape: it is the free-form model result envelope (no
+    //     properties at all), not "an id to poll later";
+    //   - backendInfoText ("...polled for results") is deliberately not read.
+    // So the phrase list is the whole defence, and it needs the SPACED
+    // spelling: the prose says "request id", not "request_id".
+
+    // falai's modelResultSchema, shared verbatim by `run` and `queue.result`.
+    const modelResultSchema = {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      description: 'Model-specific result; shape depends on the model.',
+      additionalProperties: true,
+    };
+
+    const queueResult = makeCandidate({
+      backendId: 'falai',
+      method: 'queue.result',
+      title: FALAI_QUEUE_RESULT_TITLE,
+      description: FALAI_QUEUE_RESULT_DESCRIPTION,
+      outputSchema: modelResultSchema,
+      backendInfoText: FALAI_INFO,
+    });
+
+    expect(queueResult.tool).toBe('falai_queue_result');
+    expect(isAsyncLifecycleMethod(queueResult)).toBe(true);
+
+    // Guards the premise, and is what makes the assertion above a real test of
+    // the added phrase rather than of some other detector: strike "request id"
+    // out of the description and nothing else catches this candidate. Drop
+    // 'request id' from ASYNC_TEXT_PHRASES and the assertion above fails while
+    // this one still passes.
+    const withoutPhrase: ToolCandidate = {
+      ...queueResult,
+      description: FALAI_QUEUE_RESULT_DESCRIPTION.replace('request id', 'identifier'),
+    };
+    expect(withoutPhrase.description).not.toContain('request id');
+    expect(isAsyncLifecycleMethod(withoutPhrase)).toBe(false);
+
+    // ...and the phrase does not over-reach: falai's synchronous `run` method
+    // shares the same backend info text and output schema and stays eligible.
+    const run = makeCandidate({
+      backendId: 'falai',
+      method: 'run',
+      title: FALAI_RUN_TITLE,
+      description: FALAI_RUN_DESCRIPTION,
+      outputSchema: modelResultSchema,
+      backendInfoText: FALAI_INFO,
+    });
+    expect(isAsyncLifecycleMethod(run)).toBe(false);
   });
 
   it('excludes a *_status method whose tool name was hash-capped for length', () => {
@@ -687,11 +761,13 @@ describe('selectForRun', () => {
 
     const result = selectForRun(candidates, 'list widgets');
 
-    expect(result.outcome).toBe('refused');
-    if (result.outcome === 'refused' && 'ranked' in result) {
+    expect(result.outcome).toBe('refused-unhinted-multi-backend');
+    if (result.outcome === 'refused-unhinted-multi-backend') {
       expect(result.reason).toEqual({ kind: 'unhinted-multi-backend', backends: ['acme', 'beta'] });
       // This is the ONE overridable refusal, so it — and only it — hands back a
-      // ranked list whose head `--allow-unhinted-auto-pick` may promote.
+      // ranked list whose head `--allow-unhinted-auto-pick` may promote. The
+      // outer `outcome` literal is what makes `ranked` visible here, so the
+      // promotion branch cannot be written without naming this state.
       expect(result.ranked).toHaveLength(2);
     } else {
       expect.unreachable('expected an unhinted-multi-backend refusal');
@@ -725,16 +801,15 @@ describe('selectForRun', () => {
 
     const result = selectForRun(candidates, 'serp scrape');
 
-    expect(result.outcome).toBe('refused');
-    if (result.outcome === 'refused' && 'alternatives' in result) {
+    expect(result.outcome).toBe('refused-ambiguous-capability');
+    if (result.outcome === 'refused-ambiguous-capability') {
       expect(result.reason.kind).toBe('ambiguous-capability');
       // Copy before sorting: `.sort()` mutates in place, and this array is the
       // engine's own, not a defensive copy.
       expect([...result.reason.capabilities].sort()).toEqual(['scrape', 'serp']);
       // Ambiguous capability is NOT overridable by --allow-unhinted-auto-pick,
       // so this variant offers no promotable `ranked` list — only display-only
-      // alternatives. `'ranked' in result` is the type-level gate for the
-      // overridable path.
+      // alternatives.
       expect('ranked' in result).toBe(false);
       expect(result.alternatives).toHaveLength(2);
     } else {
@@ -750,8 +825,8 @@ describe('selectForRun', () => {
 
     const result = selectForRun(candidates, 'serp scrape');
 
-    expect(result.outcome).toBe('refused');
-    if (result.outcome === 'refused' && result.reason.kind === 'ambiguous-capability') {
+    expect(result.outcome).toBe('refused-ambiguous-capability');
+    if (result.outcome === 'refused-ambiguous-capability') {
       // CAPABILITY_LIST order in preference.ts, not intent order: scrape first.
       expect(result.reason.capabilities).toEqual(['scrape', 'serp']);
     }
@@ -804,6 +879,46 @@ describe('selectForRun', () => {
     }
   });
 
+  it('does not auto-pick (and bill) falai_queue_result for "queued request result"', () => {
+    // The billing hazard the "request id" phrase closes, end to end. falai's
+    // other two queue methods were already detected (`queue.submit` says
+    // "...a request id to poll", `queue.status` ends in `_status`), so
+    // `queue.result` was the single undetected async method in the live
+    // catalog: it is falai's only match for this intent, falai is the only
+    // backend in the set, and an unhinted single-backend set is auto-pickable
+    // — i.e. `run` would have issued a billed call to a result-download
+    // endpoint.
+    const queueResult = makeCandidate({
+      backendId: 'falai',
+      method: 'queue.result',
+      title: FALAI_QUEUE_RESULT_TITLE,
+      description: FALAI_QUEUE_RESULT_DESCRIPTION,
+      backendInfoText: FALAI_INFO,
+    });
+    const run = makeCandidate({
+      backendId: 'falai',
+      method: 'run',
+      title: FALAI_RUN_TITLE,
+      description: FALAI_RUN_DESCRIPTION,
+      backendInfoText: FALAI_INFO,
+    });
+
+    const result = selectForRun([run, queueResult], 'queued request result');
+
+    expect(result.outcome).toBe('async-excluded');
+    if (result.outcome === 'async-excluded') {
+      expect(result.asyncExcluded.map((c) => c.tool)).toEqual(['falai_queue_result']);
+    }
+
+    // The remedies still work, and `call` is unaffected.
+    expect(selectForRun([run, queueResult], queueResult.tool).outcome).toBe('selected');
+
+    // And the synchronous sibling is still selectable on its own terms.
+    const sync = selectForRun([run, queueResult], 'run a model');
+    expect(sync.outcome).toBe('selected');
+    if (sync.outcome === 'selected') expect(sync.chosen.candidate.method).toBe('run');
+  });
+
   it('returns no-match when nothing matches the query', () => {
     const candidates = [makeCandidate({ backendId: 'acme', method: 'lookup', description: 'irrelevant' })];
     const result = selectForRun(candidates, 'completely unrelated gibberish query');
@@ -833,5 +948,131 @@ describe('selectForRun', () => {
     // And the remedies both work.
     expect(selectForRun([asyncOnly], 'collected record count snapshot').outcome).toBe('selected');
     expect(selectForRun([asyncOnly], asyncOnly.tool).outcome).toBe('selected');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RunSelection's discriminant. `run` decides here whether a BILLED gateway
+// call happens, and only two of the five outcomes may lead to one, so the
+// shape must let the compiler — not a comment — enforce which branch can
+// promote a candidate.
+// ---------------------------------------------------------------------------
+
+/**
+ * Compile-time proof that `outcome` alone discriminates all five states.
+ *
+ * This is the real test for finding 2, and it is enforced by `pnpm typecheck`
+ * rather than by an assertion:
+ *
+ *   - the `never` default arm fails to compile if a sixth state is added
+ *     without being handled here;
+ *   - the two `refused-*` case labels fail to compile (TS2678, "not
+ *     comparable") if the refusals ever collapse back into a single
+ *     `outcome: 'refused'` discriminated only by a nested `reason.kind`;
+ *   - `result.ranked` is reachable in exactly one refusal arm, so the
+ *     `--allow-unhinted-auto-pick` promotion cannot be written on a guard that
+ *     also matches `selected` (which carries `ranked` too — the trap that
+ *     `'ranked' in result` fell into).
+ */
+function summarizeOutcome(result: RunSelection): string {
+  switch (result.outcome) {
+    case 'no-match':
+      return 'no-match';
+    case 'async-excluded':
+      return `async-excluded:${result.asyncExcluded.length}`;
+    case 'selected':
+      return `selected:${result.chosen.candidate.tool}`;
+    case 'refused-ambiguous-capability':
+      // Display only: no `ranked`, because this refusal is not overridable.
+      return `refused-ambiguous-capability:${result.reason.capabilities.join('+')}`;
+    case 'refused-unhinted-multi-backend':
+      // The one branch that may promote a candidate, and only under the flag.
+      return `refused-unhinted-multi-backend:${result.reason.backends.join('+')}:${result.ranked.length}`;
+    default: {
+      const exhaustive: never = result;
+      return exhaustive;
+    }
+  }
+}
+
+describe('RunSelection outcome discriminant', () => {
+  it('gives all five states — including each refusal — a distinct outcome literal', () => {
+    const noMatch = selectForRun(
+      [makeCandidate({ backendId: 'acme', method: 'lookup', description: 'irrelevant' })],
+      'completely unrelated gibberish query',
+    );
+    const asyncExcluded = selectForRun(
+      [makeCandidate({ backendId: 'acme', method: 'export_dataset', description: 'Export the full result set' })],
+      'export the full result set',
+    );
+    const selected = selectForRun(
+      [makeCandidate({ backendId: 'acme', method: 'list_widgets', description: 'List all widgets' })],
+      'list widgets',
+    );
+    const ambiguous = selectForRun(
+      [
+        makeCandidate({
+          backendId: 'firecrawl',
+          method: 'scrape',
+          description: 'Scrape a page or look up serp data',
+        }),
+        makeCandidate({ backendId: 'scraperapi', method: 'serp_lookup', description: 'Query SERP results' }),
+      ],
+      'serp scrape',
+    );
+    const unhinted = selectForRun(
+      ['acme', 'beta'].map((backendId) =>
+        makeCandidate({ backendId, method: 'list_widgets', description: 'List all widgets' }),
+      ),
+      'list widgets',
+    );
+
+    const outcomes = [noMatch, asyncExcluded, selected, ambiguous, unhinted].map((r) => r.outcome);
+    expect(outcomes).toEqual([
+      'no-match',
+      'async-excluded',
+      'selected',
+      'refused-ambiguous-capability',
+      'refused-unhinted-multi-backend',
+    ]);
+    // Would collapse to 4 if the two refusals ever shared one literal again.
+    expect(new Set(outcomes).size).toBe(5);
+
+    // Exercise the exhaustive switch above at runtime too, so the compile-time
+    // guard is not dead code.
+    expect([noMatch, asyncExcluded, selected, ambiguous, unhinted].map(summarizeOutcome)).toEqual([
+      'no-match',
+      'async-excluded:1',
+      'selected:acme_list_widgets',
+      'refused-ambiguous-capability:scrape+serp',
+      'refused-unhinted-multi-backend:acme+beta:2',
+    ]);
+  });
+
+  it('offers a promotable `ranked` list on the overridable refusal only', () => {
+    const candidates = ['acme', 'beta'].map((backendId) =>
+      makeCandidate({ backendId, method: 'list_widgets', description: 'List all widgets' }),
+    );
+    const unhinted = selectForRun(candidates, 'list widgets');
+    const ambiguous = selectForRun(
+      [
+        makeCandidate({
+          backendId: 'firecrawl',
+          method: 'scrape',
+          description: 'Scrape a page or look up serp data',
+        }),
+        makeCandidate({ backendId: 'scraperapi', method: 'serp_lookup', description: 'Query SERP results' }),
+      ],
+      'serp scrape',
+    );
+
+    // How Task 8 must write the override: keyed on the outcome literal, which
+    // is the only narrowing that exposes `ranked` on a refusal.
+    const promote = (result: RunSelection): string | undefined =>
+      result.outcome === 'refused-unhinted-multi-backend' ? result.ranked[0]?.candidate.tool : undefined;
+
+    expect(promote(unhinted)).toBe('acme_list_widgets');
+    expect(promote(ambiguous)).toBeUndefined();
+    expect('ranked' in ambiguous).toBe(false);
   });
 });

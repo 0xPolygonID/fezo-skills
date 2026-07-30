@@ -11,10 +11,13 @@
 // `selectForRun` is the entry point later tasks (the `run` CLI command,
 // Task 8) build on. It never reads `--allow-unhinted-auto-pick` — that flag
 // is a CLI concern. Instead, the one refusal that flag can override
-// ("unhinted-multi-backend") returns the full ranked candidate list, so the
-// caller can override it itself by taking `ranked[0]`. The refusals that flag
-// cannot override carry no `ranked` field at all, so the type never offers a
-// caller a candidate it is not allowed to promote.
+// (`refused-unhinted-multi-backend`) returns the full ranked candidate list,
+// so the caller can override it itself by taking `ranked[0]`. The refusals
+// that flag cannot override carry no `ranked` field at all, so the type never
+// offers a caller a candidate it is not allowed to promote. Each refusal has
+// its own `outcome` literal so a `switch (result.outcome)` is exhaustive over
+// all five states and the overridable branch is reachable only by naming it;
+// see the doc comment on `RunSelection`.
 
 import type { ToolCandidate } from './catalog.js';
 import type { Capability } from './preference.js';
@@ -214,6 +217,17 @@ export function searchCandidates(candidates: readonly ToolCandidate[], query: st
 // backend id like "firecrawl".
 const ASYNC_NAME_SUFFIXES = ['_async', '_status', '_progress', '_snapshot', '_get', '_dataset'] as const;
 
+// Both spellings of every id phrase must be listed: the underscore form
+// (`snapshot_id`, `request_id`) matches a schema field name quoted in prose,
+// the spaced form (`snapshot id`, `request id`) matches prose that names the
+// field in words. The list once carried `snapshot_id`/`snapshot id` but only
+// `request_id`, and that asymmetry was a live billing hazard: falai's
+// `queue.result` describes itself as "Fetch the result of a completed queued
+// Fal AI request by its request id", so once `backendInfoText` was (correctly)
+// removed from async detection, nothing excluded it and an async
+// result-download endpoint became `run`-selectable — auto-picked as the single
+// backend for an intent like "queued request result", and billed. If a new id
+// phrase is ever added here, add both of its spellings.
 const ASYNC_TEXT_PHRASES = [
   'asynchronous',
   'async',
@@ -221,6 +235,7 @@ const ASYNC_TEXT_PHRASES = [
   'snapshot_id',
   'snapshot id',
   'request_id',
+  'request id',
   'poll',
   'status endpoint',
   'progress endpoint',
@@ -481,9 +496,38 @@ export interface UnhintedMultiBackendRefusal {
  * a caller to render a useful message and (for `unhinted-multi-backend`) to
  * decide whether to override via `--allow-unhinted-auto-pick` — that flag
  * check belongs to the CLI, not here; see the module doc comment.
+ *
+ * `kind` mirrors the owning `RunSelection.outcome` literal
+ * (`refused-<kind>`), so a helper that formats a reason on its own can switch
+ * exhaustively over this union too. The outer `outcome` is the authoritative
+ * discriminant for `RunSelection`; see the note there.
  */
 export type RunRefusalReason = AmbiguousCapabilityRefusal | UnhintedMultiBackendRefusal;
 
+/**
+ * What `run` decided to do about an intent: five mutually exclusive outcomes,
+ * discriminated by the `outcome` literal alone.
+ *
+ * HANDLE THIS WITH AN EXHAUSTIVE `switch (result.outcome)` (a `default` arm
+ * that assigns the narrowed value to `never` makes the compiler enforce it).
+ * That is not style advice — this union sits on the branch that decides
+ * whether a *billed* gateway call happens, and only two of the five outcomes
+ * may lead to one:
+ *
+ *   - `selected` — call it.
+ *   - `refused-unhinted-multi-backend` — call `ranked[0]` **only** with
+ *     `--allow-unhinted-auto-pick`.
+ *   - `no-match`, `async-excluded`, `refused-ambiguous-capability` — never
+ *     call anything.
+ *
+ * The two refusals therefore carry distinct outer `outcome` literals rather
+ * than a shared `'refused'` plus a nested `reason.kind`: TypeScript does not
+ * narrow an outer union on a nested discriminant, so a shared literal forced
+ * callers onto structural guards like `'ranked' in result` — which compiles
+ * happily and *also* fires on `selected`, silently promoting a candidate on a
+ * path meant to be gated by a flag. With distinct literals the compiler, not
+ * a comment, keeps the promotable candidate reachable from exactly one branch.
+ */
 export type RunSelection =
   /** Nothing matched the query at all. */
   | { outcome: 'no-match' }
@@ -505,27 +549,24 @@ export type RunSelection =
    * candidate it is not allowed to promote. `alternatives` is for display
    * only.
    */
-  | { outcome: 'refused'; reason: AmbiguousCapabilityRefusal; alternatives: RankedCandidate[] }
+  | { outcome: 'refused-ambiguous-capability'; reason: AmbiguousCapabilityRefusal; alternatives: RankedCandidate[] }
   /**
    * Refused because the matched set spans multiple backends and no capability
    * hint applies. This is the ONE overridable refusal: a CLI that sees
-   * `--allow-unhinted-auto-pick` may promote `ranked[0]`.
-   *
-   * Narrow with `'ranked' in result`. Testing `result.reason.kind` narrows
-   * `result.reason` but NOT `result` itself (TypeScript does not narrow an
-   * outer union on a nested discriminant), so it does not make `ranked`
-   * reachable — which is the intended shape: the only way to a promotable
-   * candidate is through the variant that has one.
+   * `--allow-unhinted-auto-pick` may promote `ranked[0]`. Reach it by testing
+   * `result.outcome === 'refused-unhinted-multi-backend'` — the only narrowing
+   * that makes `ranked` visible on a refusal.
    */
-  | { outcome: 'refused'; reason: UnhintedMultiBackendRefusal; ranked: RankedCandidate[] };
+  | { outcome: 'refused-unhinted-multi-backend'; reason: UnhintedMultiBackendRefusal; ranked: RankedCandidate[] };
 
 /**
  * Decides what (if anything) `run` should auto-select for a free-text
  * intent: search, apply async-lifecycle exclusion, infer a capability from
  * the intent, and rank. Never throws and never consults
  * `--allow-unhinted-auto-pick` — a refusal is a returned decision. The one
- * overridable refusal (`unhinted-multi-backend`) carries the full ranked list
- * so the CLI can promote `ranked[0]` itself; the non-overridable ones do not.
+ * overridable refusal (`refused-unhinted-multi-backend`) carries the full
+ * ranked list so the CLI can promote `ranked[0]` itself; the non-overridable
+ * ones do not.
  */
 export function selectForRun(candidates: readonly ToolCandidate[], intent: string): RunSelection {
   const matches = searchCandidates(candidates, intent);
@@ -549,7 +590,7 @@ export function selectForRun(candidates: readonly ToolCandidate[], intent: strin
 
   if (inference.kind === 'ambiguous') {
     return {
-      outcome: 'refused',
+      outcome: 'refused-ambiguous-capability',
       reason: {
         kind: 'ambiguous-capability',
         capabilities: inference.candidates.map((match) => match.capability),
@@ -574,7 +615,7 @@ export function selectForRun(candidates: readonly ToolCandidate[], intent: strin
   const backends = new Set(eligible.map((match) => match.candidate.backendId));
   if (backends.size > 1) {
     return {
-      outcome: 'refused',
+      outcome: 'refused-unhinted-multi-backend',
       reason: { kind: 'unhinted-multi-backend', backends: [...backends] },
       ranked,
     };
