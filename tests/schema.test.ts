@@ -8,28 +8,7 @@ import {
   compileSchema,
   validateArgs,
 } from '../src/engine/schema.js';
-
-/**
- * Runs `fn` with process.stderr.write mocked out and returns everything it
- * wrote, joined. Writes are collected into a local array rather than read off
- * the spy afterwards: vitest's `mockRestore` also resets the spy's call
- * history, so any assertion made on the spy after restoring would read an
- * empty history and pass vacuously. Mirrors tests/binding.test.ts's
- * `captureStderr`.
- */
-function captureStderr(fn: () => void): string {
-  const writes: string[] = [];
-  const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-    writes.push(String(chunk));
-    return true;
-  });
-  try {
-    fn();
-  } finally {
-    spy.mockRestore();
-  }
-  return writes.join('');
-}
+import { captureStderr } from './helpers.js';
 
 const nestedSchema = {
   type: 'object',
@@ -214,6 +193,28 @@ describe('SchemaValidatorCache', () => {
     }
   });
 
+  // AJV already dedupes compilation of well-formed schemas by object identity
+  // internally (see the first test above), so the cache's own non-redundant
+  // value is suppressing repeat compile attempts -- and repeat warnings --
+  // for a MALFORMED schema across retries of the same candidate. Without
+  // this test, deleting the cache as "AJV already does this" would silently
+  // reintroduce a stderr warning on every retry instead of once.
+  it('warns exactly once for a malformed schema looked up twice (e.g. across a retry)', () => {
+    const cache = new SchemaValidatorCache();
+    const malformed = { properties: 'not-an-object' };
+
+    let first: ReturnType<typeof cache.get> | undefined;
+    let second: ReturnType<typeof cache.get> | undefined;
+    const stderr = captureStderr(() => {
+      first = cache.get(malformed);
+      second = cache.get(malformed);
+    });
+
+    expect(second).toBe(first);
+    const warningCount = (stderr.match(/fezoctl:/g) ?? []).length;
+    expect(warningCount).toBe(1);
+  });
+
   it('caches the two boolean schema slots independently of object schemas', () => {
     const cache = new SchemaValidatorCache();
     const trueValidator1 = cache.get(true);
@@ -235,5 +236,41 @@ describe('PERMISSIVE_SCHEMA', () => {
   it('compiles and accepts an object', () => {
     const validate = compileSchema(PERMISSIVE_SCHEMA);
     expect(validateArgs(validate, { a: 1 })).toEqual({ valid: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Edge-case schemas and inputs a backend's real (well-formed) manifest can
+// legitimately produce, distinct from the malformed/permissive-fallback path
+// above.
+// ---------------------------------------------------------------------------
+
+describe('compileSchema / validateArgs — an empty {} schema', () => {
+  it('compiles cleanly (not via the malformed-schema fallback) and accepts any value, including non-objects', () => {
+    // `{}` is a well-formed JSON Schema -- the schema with no constraints at
+    // all -- distinct from PERMISSIVE_SCHEMA (`{type:'object'}`, which DOES
+    // reject a non-object) and distinct from a schema that fails to compile.
+    const stderr = captureStderr(() => {
+      const validate = compileSchema({});
+      expect(validateArgs(validate, { a: 1 })).toEqual({ valid: true });
+      expect(validateArgs(validate, [1, 2, 3])).toEqual({ valid: true });
+      expect(validateArgs(validate, 'a string')).toEqual({ valid: true });
+      expect(validateArgs(validate, null)).toEqual({ valid: true });
+    });
+    // No compile-failure warning: {} is well-formed, so the permissive-fallback
+    // path must not have been taken to reach this result.
+    expect(stderr).toBe('');
+  });
+});
+
+describe('compileSchema / validateArgs — a null argument against a real object schema', () => {
+  it('rejects null: `type: "object"` does not accept it, and the missing-required-property message is not what fires', () => {
+    const validate = compileSchema(nestedSchema);
+    const result = validateArgs(validate, null);
+    expect(result.valid).toBe(false);
+    if (result.valid) {
+      expect.unreachable('expected validation to fail for a null argument against an object schema');
+    }
+    expect(result.errorText).toBe('(root) must be object');
   });
 });

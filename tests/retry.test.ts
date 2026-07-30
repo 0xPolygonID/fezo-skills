@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ToolCandidate } from '../src/engine/catalog.js';
 import type { AttemptLog, RunOptions } from '../src/engine/retry.js';
 import { DEFAULT_MAX_ATTEMPTS, run } from '../src/engine/retry.js';
+import { captureStderrAsync as captureStderr } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Fixture helpers, matching the convention in binding.test.ts/call.test.ts.
@@ -57,30 +58,6 @@ function routedFetch(handlers: Record<string, Response[]>): typeof fetch {
     }
     throw new Error(`routedFetch: no handler registered for URL ${asString}`);
   }) as unknown as typeof fetch;
-}
-
-/**
- * Runs `fn` with process.stderr.write mocked out and returns everything it
- * wrote, joined. Async variant of the pattern in binding.test.ts/schema.test.ts
- * (`captureStderr`): `run` is async, so the write can happen after an
- * `await`, and the spy must still be in place when it does. Writes are
- * collected into a local array rather than read off the spy afterwards,
- * because vitest's `mockRestore` also resets the spy's call history, so any
- * assertion made on the spy after restoring would read an empty history and
- * pass vacuously.
- */
-async function captureStderr(fn: () => Promise<void>): Promise<string> {
-  const writes: string[] = [];
-  const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-    writes.push(String(chunk));
-    return true;
-  });
-  try {
-    await fn();
-  } finally {
-    spy.mockRestore();
-  }
-  return writes.join('');
 }
 
 const baseOptions: Pick<RunOptions, 'baseUrl' | 'apiKey' | 'args'> = {

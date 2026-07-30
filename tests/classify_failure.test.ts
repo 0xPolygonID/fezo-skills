@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { MechanicalFailure } from '../src/engine/retry.js';
-import { classifyFailure } from '../src/engine/retry.js';
+import { ABORT_CODES, RETRY_CODES, classifyFailure } from '../src/engine/retry.js';
 
 // ---------------------------------------------------------------------------
 // classifyFailure -- code-first, status-fallback retry classification.
@@ -196,5 +196,58 @@ describe('classifyFailure — the quota_exceeded / limit_exceeded / insufficient
     expect(classifyFailure(gatewayFailure('quota_exceeded', 402)).decision).toBe('retry');
     expect(classifyFailure(gatewayFailure('limit_exceeded', 402)).decision).toBe('abort');
     expect(classifyFailure(gatewayFailure('insufficient_balance', 402)).decision).toBe('abort');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Set-membership assertion.
+//
+// Every test above pins ONE code's behavior individually: "unauthorized
+// aborts", "quota_exceeded advances", and so on. None of them would catch a
+// FUTURE twelfth code landing in the wrong table -- a code added to
+// RETRY_CODES that should have gone in ABORT_CODES (or vice versa) produces a
+// self-consistent per-code test ("newCode advances" passes because the
+// classifier does, in fact, advance on it) with nothing to check that
+// against. This test pins the exact, exhaustive membership of both tables so
+// a future addition to either one is a visible, deliberate diff here, not a
+// change that slips in silently.
+// ---------------------------------------------------------------------------
+describe('classifyFailure — ABORT_CODES / RETRY_CODES set membership', () => {
+  const expectedAbortCodes = ['unauthorized', 'limit_exceeded', 'insufficient_balance'];
+  const expectedRetryCodes = [
+    'quota_exceeded',
+    'rate_limited',
+    'backend_unavailable',
+    'provider_disabled',
+    'backend_not_configured',
+    'backend_not_found',
+    'backend_error',
+    'tool_not_in_catalog',
+  ];
+
+  it('ABORT_CODES is exactly this list, no more and no fewer', () => {
+    expect(new Set(ABORT_CODES)).toEqual(new Set(expectedAbortCodes));
+    expect(ABORT_CODES.size).toBe(expectedAbortCodes.length);
+  });
+
+  it('RETRY_CODES is exactly this list, no more and no fewer', () => {
+    expect(new Set(RETRY_CODES)).toEqual(new Set(expectedRetryCodes));
+    expect(RETRY_CODES.size).toBe(expectedRetryCodes.length);
+  });
+
+  it('the two tables are disjoint: no code is classified both ways', () => {
+    const overlap = expectedAbortCodes.filter((code) => RETRY_CODES.has(code));
+    expect(overlap).toEqual([]);
+    const reverseOverlap = expectedRetryCodes.filter((code) => ABORT_CODES.has(code));
+    expect(reverseOverlap).toEqual([]);
+  });
+
+  it('every code in ABORT_CODES classifies as abort, and every code in RETRY_CODES classifies as retry', () => {
+    for (const code of ABORT_CODES) {
+      expect(classifyFailure(gatewayFailure(code, 400)).decision, code).toBe('abort');
+    }
+    for (const code of RETRY_CODES) {
+      expect(classifyFailure(gatewayFailure(code, 400)).decision, code).toBe('retry');
+    }
   });
 });

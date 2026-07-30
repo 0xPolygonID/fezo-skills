@@ -205,7 +205,13 @@ describe('skills/fezo/SKILL.md generated content', () => {
       .split('\n')
       .filter((line) => !line.trimStart().startsWith('#'))
       .join('\n');
-    expect(nonCommentLines).not.toMatch(/(?<![-`"\w])fezoctl (setup|search|call|run|schema|catalog|doctor)\b/);
+    // The lookbehind excludes a preceding hyphen or word character (so
+    // "non-fezoctl" or "myfezoctl" aren't false positives), but deliberately
+    // does NOT exclude a preceding backtick or quote: the regression this
+    // guards against was itself backticked prose (`` `fezoctl setup
+    // --key-stdin` ``), so excluding those characters would let that exact
+    // phrasing slip back in silently.
+    expect(nonCommentLines).not.toMatch(/(?<![-\w])fezoctl (setup|search|call|run|schema|catalog|doctor)\b/);
   });
 
   it('does not enumerate a fixed backend/method roster', () => {

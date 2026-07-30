@@ -20,48 +20,11 @@ import {
   KEYCHAIN_SERVICE_URL,
 } from '../src/engine/credentials.js';
 import type { KeychainCommandResult, KeychainRunner } from '../src/engine/credentials.js';
+import { captureStderr, captureStderrWithResult } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Test helpers.
 // ---------------------------------------------------------------------------
-
-/**
- * Runs `fn` with process.stderr.write mocked out and returns everything it
- * wrote, joined. Writes are collected into a local array rather than read off
- * the spy afterwards: vitest's `mockRestore` also resets the spy's call
- * history, so any assertion made on the spy after restoring would read an
- * empty history and pass vacuously. (Duplicated from tests/binding.test.ts;
- * that helper is not exported.)
- */
-function captureStderr(fn: () => void): string {
-  const writes: string[] = [];
-  const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-    writes.push(String(chunk));
-    return true;
-  });
-  try {
-    fn();
-  } finally {
-    spy.mockRestore();
-  }
-  return writes.join('');
-}
-
-/** Same as captureStderr, but for a function that returns a value. */
-function captureStderrWithResult<T>(fn: () => T): { stderr: string; result: T } {
-  const writes: string[] = [];
-  const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-    writes.push(String(chunk));
-    return true;
-  });
-  let result: T;
-  try {
-    result = fn();
-  } finally {
-    spy.mockRestore();
-  }
-  return { stderr: writes.join(''), result };
-}
 
 /** A KeychainRunner that records every call it receives and answers from a fixed script. */
 function recordingKeychainRunner(answer: KeychainCommandResult): {
@@ -96,8 +59,7 @@ const NOT_FOUND: KeychainCommandResult = { status: 44, stdout: '', stderr: 'secu
 
 describe('resolveCredentials — precedence', () => {
   it('canonical env var wins when every other source also has a value', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-credentials-'));
-    try {
+    withTmpDir((dir) => {
       const dotEnvPath = join(dir, '.env');
       writeDotEnvFile(dotEnvPath, { FEZO_API_KEY: 'sk-from-dotenv', FEZO_URL: 'https://dotenv.example.com' });
       const { runner } = recordingKeychainRunner({ status: 0, stdout: 'sk-from-keychain\n', stderr: '' });
@@ -110,9 +72,7 @@ describe('resolveCredentials — precedence', () => {
       });
 
       expect(resolution.apiKey).toEqual({ value: 'sk-from-canonical-env', masked: 'sk-f…', source: 'env' });
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   it('deprecated alias is used when the canonical var is absent, and its source is reported', () => {
@@ -137,7 +97,12 @@ describe('resolveCredentials — precedence', () => {
       warnedAliases: new Set(),
     });
     expect(resolution.apiKey).toEqual({ value: 'sk-from-keychain', masked: 'sk-f…', source: 'keychain' });
-    expect(calls.length).toBeGreaterThan(0);
+    // Pin the full read argv for both lookups (url resolved first, then
+    // apiKey) -- `calls.length > 0` alone would pass just as well for a wrong
+    // read subcommand, so long as SOMETHING got called.
+    expect(calls.length).toBe(2);
+    expect(calls[0]?.argv).toEqual(['find-generic-password', '-a', KEYCHAIN_ACCOUNT, '-s', KEYCHAIN_SERVICE_URL, '-w']);
+    expect(calls[1]?.argv).toEqual(['find-generic-password', '-a', KEYCHAIN_ACCOUNT, '-s', KEYCHAIN_SERVICE_API_KEY, '-w']);
   });
 
   it('.env is used only when env vars and Keychain all miss', () => {
@@ -427,7 +392,9 @@ describe('writeKeychainSecret', () => {
     expect(calls.length).toBe(1);
     const call = calls[0];
     expect(call).toBeDefined();
-    if (call === undefined) throw new Error('unreachable');
+    if (call === undefined) {
+      expect.unreachable('recordingKeychainRunner must have recorded a call');
+    }
 
     // The load-bearing assertion: no argv element contains any substring of
     // the secret. This is exactly the check that would catch a regression to
@@ -459,10 +426,14 @@ describe('writeKeychainSecret', () => {
 
     const call = calls[0];
     expect(call).toBeDefined();
-    if (call === undefined) throw new Error('unreachable');
+    if (call === undefined) {
+      expect.unreachable('recordingKeychainRunner must have recorded a call');
+    }
     const stdin = call.stdin;
     expect(stdin).toBeDefined();
-    if (stdin === undefined) throw new Error('unreachable');
+    if (stdin === undefined) {
+      expect.unreachable('writeKeychainSecret must send the secret on stdin');
+    }
 
     expect(stdin.split(secret).length - 1).toBe(2);
     expect(stdin).toBe(`${secret}\n${secret}\n`);
@@ -478,7 +449,9 @@ describe('writeKeychainSecret', () => {
     writeKeychainSecret(runner, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT, 'sk-anything');
     const call = calls[0];
     expect(call).toBeDefined();
-    if (call === undefined) throw new Error('unreachable');
+    if (call === undefined) {
+      expect.unreachable('recordingKeychainRunner must have recorded a call');
+    }
     expect(call.argv.at(-1)).toBe('-w');
   });
 
@@ -491,6 +464,23 @@ describe('writeKeychainSecret', () => {
 });
 
 describe('readKeychainSecret', () => {
+  // Pins the full read argv, matching how writeKeychainSecret's argv is
+  // pinned above. Without this, `calls.length > 0` (the previous assertion
+  // here) passes just as well for a wrong subcommand, a missing `-w`, or an
+  // account/service swap -- anything that still returns SOME argv.
+  it('runs exactly `find-generic-password -a <account> -s <service> -w`, in that order', () => {
+    const { runner, calls } = recordingKeychainRunner({ status: 0, stdout: 'sk-round-tripped\n', stderr: '' });
+    readKeychainSecret(runner, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT);
+
+    expect(calls.length).toBe(1);
+    const call = calls[0];
+    expect(call).toBeDefined();
+    if (call === undefined) {
+      expect.unreachable('recordingKeychainRunner must have recorded a call');
+    }
+    expect(call.argv).toEqual(['find-generic-password', '-a', KEYCHAIN_ACCOUNT, '-s', KEYCHAIN_SERVICE_API_KEY, '-w']);
+  });
+
   it('reads the value from stdout and trims a trailing newline', () => {
     const { runner } = recordingKeychainRunner({ status: 0, stdout: 'sk-round-tripped\n', stderr: '' });
     const result = readKeychainSecret(runner, KEYCHAIN_SERVICE_API_KEY, KEYCHAIN_ACCOUNT);
@@ -578,6 +568,19 @@ describe('parseDotEnv / readDotEnvFile', () => {
   it('ignores blank lines', () => {
     const text = ['', 'FEZO_API_KEY=sk-value', '', ''].join('\n');
     expect(parseDotEnv(text)).toEqual({ FEZO_API_KEY: 'sk-value' });
+  });
+
+  // The non-ENOENT branch: a missing file is the silent, ordinary case above,
+  // but any OTHER read failure (permissions, a directory in the way, ...) is
+  // announced on stderr rather than swallowed identically -- this is the one
+  // assertion that distinguishes the two.
+  it('warns on stderr for a non-ENOENT read failure (a directory in the file\'s place) and still resolves to {}', () => {
+    withTmpDir((dir) => {
+      const { stderr, result } = captureStderrWithResult(() => readDotEnvFile(dir));
+      expect(result).toEqual({});
+      expect(stderr).toContain('fezoctl:');
+      expect(stderr).toContain(dir);
+    });
   });
 });
 

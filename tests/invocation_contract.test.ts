@@ -20,6 +20,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..');
 const invocationShPath = join(repoRoot, 'build', 'invocation.sh');
+const bundlePath = join(repoRoot, 'build', 'bundle.mjs');
 
 // The harness script text is fixed and untainted by any test input — every
 // scenario-specific value (SKILL_DIR, SKILL_VERSION, FEZOCTL, PATH) is passed
@@ -96,12 +97,23 @@ describe('the tier-4 fake global fezoctl matches the real binary', () => {
   // format again, THIS test fails rather than the tier-4 tests quietly
   // certifying an impossible comparison.
   it("prints --version in exactly the format dist/fezoctl.mjs prints", () => {
-    const distBundlePath = join(repoRoot, 'dist', 'fezoctl.mjs');
     const pkg: unknown = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
     const pkgVersion = pkg !== null && typeof pkg === 'object' ? Reflect.get(pkg, 'version') : undefined;
     expect(typeof pkgVersion).toBe('string');
 
-    const realOutput = execFileSync('node', [distBundlePath, '--version'], { encoding: 'utf8' }).trim();
+    // Build a private scratch copy of the bundle rather than executing the
+    // committed `dist/fezoctl.mjs` directly. That shared file is rewritten
+    // in place (non-atomically) by tests/skill_contract.test.ts's
+    // `withCommittedDistPreserved` guard, and vitest runs test FILES
+    // concurrently by default — so executing the committed path here raced
+    // that guard's truncate-and-restore window (a flaky `SyntaxError` /
+    // `ENOENT`, not a wrong pass). The reproducibility tests elsewhere
+    // already guarantee a fresh build is byte-identical to the committed
+    // file, so a scratch build has exactly the same shape and is race-free.
+    const scratchDir = makeScratchDir('fake-global-shape-bundle-');
+    const scratchBundle = join(scratchDir, 'fezoctl.mjs');
+    execFileSync('node', [bundlePath, '--out', scratchBundle], { cwd: repoRoot, encoding: 'utf8' });
+    const realOutput = execFileSync('node', [scratchBundle, '--version'], { encoding: 'utf8' }).trim();
 
     const binDir = makeScratchDir('fake-global-shape-');
     writeFakeGlobalFezoctl(binDir, String(pkgVersion));

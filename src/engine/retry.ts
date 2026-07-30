@@ -64,7 +64,11 @@ import type { CallToolResult } from './client.js';
  * handled as its own `MechanicalFailure` variant below -- see the
  * `invalid-arguments` note there for why it skips the candidate instead.
  */
-const ABORT_CODES: ReadonlySet<string> = new Set(['unauthorized', 'limit_exceeded', 'insufficient_balance']);
+// Exported (read-only) so tests/classify_failure.test.ts can assert exact set
+// membership over both tables, not just per-code behavior -- see that file's
+// comment on why per-code assertions alone cannot catch a new code landing in
+// the wrong table.
+export const ABORT_CODES: ReadonlySet<string> = new Set(['unauthorized', 'limit_exceeded', 'insufficient_balance']);
 
 /**
  * Gateway codes that advance to the next compatible candidate: each one
@@ -111,7 +115,7 @@ const ABORT_CODES: ReadonlySet<string> = new Set(['unauthorized', 'limit_exceede
  *   exactly mirroring how an ordinary retryable failure on the last candidate
  *   in `run` also ends the run with `give_up`, not a special case.
  */
-const RETRY_CODES: ReadonlySet<string> = new Set([
+export const RETRY_CODES: ReadonlySet<string> = new Set([
   'quota_exceeded',
   'rate_limited',
   'backend_unavailable',

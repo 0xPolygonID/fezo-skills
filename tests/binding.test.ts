@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { BindingError, bindArgs } from '../src/engine/bindings.js';
 import type { ToolCandidate } from '../src/engine/catalog.js';
+import { captureStderr } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Fixture helper. Only the fields bindArgs actually reads vary per test; the
@@ -22,27 +23,6 @@ function candidate(overrides: Partial<ToolCandidate> & Pick<ToolCandidate, 'path
     billingModel: 'per_call',
     ...overrides,
   };
-}
-
-/**
- * Runs `fn` with process.stderr.write mocked out and returns everything it
- * wrote, joined. Writes are collected into a local array rather than read off
- * the spy afterwards: vitest's `mockRestore` also resets the spy's call
- * history, so any assertion made on the spy after restoring would read an
- * empty history and pass vacuously.
- */
-function captureStderr(fn: () => void): string {
-  const writes: string[] = [];
-  const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-    writes.push(String(chunk));
-    return true;
-  });
-  try {
-    fn();
-  } finally {
-    spy.mockRestore();
-  }
-  return writes.join('');
 }
 
 describe('bindArgs — path substitution', () => {
