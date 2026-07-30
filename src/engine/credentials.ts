@@ -438,6 +438,44 @@ export interface CredentialResolution {
   apiKey?: ResolvedValue;
 }
 
+// ---------------------------------------------------------------------------
+// Safe presentation of a `CredentialResolution` — the ONE object shape any
+// renderer (Task 8's `doctor`, and every `--json` path that touches
+// credentials) is allowed to print.
+//
+// This exists because `ResolvedValue` deliberately carries the raw secret in
+// `value` (client.ts and catalog.ts need it), so "which field do I print" is a
+// per-call-site judgement call every renderer would otherwise have to get
+// right on its own -- and a URL row and an API key row look identical to
+// copy-paste from, which is exactly how a renderer prints `apiKey.value`
+// instead of `apiKey.masked`. `credentialDisplay` removes the judgement call:
+// it is the only field selection a caller can reach for, `url` keeps its
+// (non-secret) `value`, and `apiKey` exposes `masked` only -- there is no
+// field on this type a renderer could print to leak the key.
+// ---------------------------------------------------------------------------
+
+export interface CredentialDisplay {
+  url?: { value: string; source: CredentialSource };
+  apiKey?: { masked: string; source: CredentialSource };
+}
+
+/**
+ * Renders a `CredentialResolution` for display: the URL's real value (it is
+ * not a secret) and the API key's `masked` form only. `doctor` and every
+ * `--json` path that shows credential state must render this, and nothing
+ * else derived from the underlying `ResolvedValue`s.
+ */
+export function credentialDisplay(resolution: CredentialResolution): CredentialDisplay {
+  return {
+    ...(resolution.url !== undefined
+      ? { url: { value: resolution.url.value, source: resolution.url.source } }
+      : {}),
+    ...(resolution.apiKey !== undefined
+      ? { apiKey: { masked: resolution.apiKey.masked, source: resolution.apiKey.source } }
+      : {}),
+  };
+}
+
 export interface ResolveCredentialsOptions {
   env?: NodeJS.ProcessEnv;
   /** Defaults to `defaultDotEnvPath(env)`. */
