@@ -74,3 +74,27 @@ export function parseCallError(status: number, bodyText: string): CallError {
 
   return { kind: 'backend', status, body: bodyText };
 }
+
+// ---------------------------------------------------------------------------
+// Task 6 (retry.ts) documentation note.
+//
+// Two facts about specific gateway codes are load-bearing for retry.ts's
+// classification and worth recording here, next to the detection this module
+// owns, even though retry.ts is what acts on them:
+//
+// 1. `rate_limited` is written by the gateway ONLY on the voucher-redeem path
+//    (zug/internal/gateway/vouchers.go:84, HTTP 429) -- not on any `/v1/*`
+//    tool call. fezoctl never hits that endpoint, so a `{kind:'gateway',
+//    code:'rate_limited'}` envelope is not normally observable in practice.
+//    A real upstream provider's rate limit instead arrives as a CODE-LESS
+//    backend 429 passthrough (`{kind:'backend', status:429}`), which is why
+//    retry.ts's HTTP-status fallback -- not this code -- is the load-bearing
+//    path for rate limiting.
+// 2. `limit_exceeded` (zug/internal/gateway/spendlimit.go's `TrippedLimit`,
+//    HTTP 402) can be scoped to the whole account, one API key, or one
+//    backend (`TrippedLimit.BackendID`), but the gateway exposes that scope
+//    only in the human-readable `Message()` string -- never as a structured
+//    field on the wire. retry.ts does not parse that message, so it aborts
+//    the whole run conservatively even when the limit is backend-scoped and a
+//    different candidate could, in principle, have safely advanced instead.
+// ---------------------------------------------------------------------------
