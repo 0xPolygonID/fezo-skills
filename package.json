@@ -1,0 +1,35 @@
+{
+  "name": "fezo-skills",
+  "version": "0.1.0",
+  "description": "Agent skill and CLI (fezoctl) for discovering and calling Fezo/Zug API gateway tools from the live catalog.",
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://github.com/0xPolygonID/fezo-skills",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0xPolygonID/fezo-skills.git"
+  },
+  "bin": {
+    "fezoctl": "dist/fezoctl.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.8.0",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "bundle": "node build/bundle.mjs",
+    "gen-skill": "node build/gen-skill.mjs",
+    "pack:check": "node build/pack-check.mjs"
+  },
+  "dependencies": {
+    "ajv": "8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "esbuild": "0.28.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}

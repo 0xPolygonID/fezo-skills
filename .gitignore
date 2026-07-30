@@ -1,0 +1,12 @@
+node_modules/
+coverage/
+*.log
+.DS_Store
+.env
+.env.*
+
+# The bundle is copied into the skill directory during pack/build only; the
+# committed source of truth is repo-root dist/fezoctl.mjs. Do NOT add dist/
+# here — dist/fezoctl.mjs is committed deliberately so Git-URL/HEAD installs
+# resolve the engine.
+skills/*/scripts/fezoctl.mjs

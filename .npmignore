@@ -1,0 +1,19 @@
+# Source and dev tooling — not needed by consumers of the published package;
+# the runtime artifact is the committed dist/fezoctl.mjs bundle.
+src/
+tests/
+build/
+.github/
+
+# Config and repo metadata.
+tsconfig.json
+vitest.config.ts
+.gitattributes
+.gitignore
+.npmignore
+
+# Local artifacts.
+node_modules/
+coverage/
+*.log
+.DS_Store
