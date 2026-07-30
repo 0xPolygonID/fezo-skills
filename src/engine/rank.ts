@@ -10,9 +10,11 @@
 //
 // `selectForRun` is the entry point later tasks (the `run` CLI command,
 // Task 8) build on. It never reads `--allow-unhinted-auto-pick` — that flag
-// is a CLI concern. Instead it always returns the full ranked candidate
-// list alongside its decision, so a caller that wants to override an
-// "unhinted-multi-backend" refusal can do so itself by taking `ranked[0]`.
+// is a CLI concern. Instead, the one refusal that flag can override
+// ("unhinted-multi-backend") returns the full ranked candidate list, so the
+// caller can override it itself by taking `ranked[0]`. The refusals that flag
+// cannot override carry no `ranked` field at all, so the type never offers a
+// caller a candidate it is not allowed to promote.
 
 import type { ToolCandidate } from './catalog.js';
 import type { Capability } from './preference.js';
@@ -44,9 +46,18 @@ export const STOP_WORDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Lower-cases and splits a query on whitespace and punctuation. ASCII
- * lower-casing only (no Unicode normalization) — matches the existing MCP
- * server's substring-matching behavior, which this module mirrors.
+ * Lower-cases a query and splits it into `[a-z0-9]+` runs.
+ *
+ * Everything outside `[a-z0-9]` after lower-casing is a separator, so it is
+ * not only whitespace and punctuation that splits: any non-ASCII character is
+ * treated as a separator too. `café` tokenizes to `['caf']` and `naïve` to
+ * `['na', 've']`. There is no Unicode normalization, case folding beyond
+ * `String.prototype.toLowerCase`, or accent stripping. That is a deliberate
+ * match for the existing MCP server's substring matching, which this module
+ * mirrors, and it is acceptable because every catalog identifier is
+ * `[a-zA-Z0-9_-]` by construction (see tool-name.ts) and the gateway
+ * manifests are English-only. If either stops being true, this function is
+ * where the fix belongs.
  */
 export function tokenize(query: string): string[] {
   return query
@@ -95,15 +106,41 @@ function searchableBlob(candidate: ToolCandidate): SearchableBlob {
 }
 
 /**
- * Best (lowest-numbered-tier) field a term was found in, as a weight for
- * term-score ranking: a hit in the tool/backend/method identifiers is a
- * stronger relevance signal than a hit only in free-text description or
- * backend info, even though both count equally for AND-matching inclusion.
+ * Per-field weights for the tier-4 term score. The governing spec names tier
+ * 4's inputs ("query term score in title/description/tool/backend info") but
+ * not their relative weights, so these three numbers are a local design
+ * choice, stated here explicitly rather than left implicit in the code:
+ *
+ *   identifiers (tool/backend/method) = 3
+ *   title                             = 2
+ *   description + backend info        = 1
+ *
+ * A term is scored once, at the weight of the strongest field it appears in.
+ * Rationale: a hit in an identifier is a much stronger relevance signal than
+ * a hit in free-text prose, even though both count equally for AND-matching
+ * inclusion.
+ *
+ * CONSEQUENCE, and the reason these weights are load-bearing policy rather
+ * than a detail: tier 4 is compared BEFORE tier 5, so any term-score
+ * difference beats capability preference outright. Two candidates that tie on
+ * term score are ordered by CAPABILITY_PREFERENCES; a candidate that scores
+ * even one point higher wins regardless of preference order. Changing these
+ * numbers therefore changes which provider `run` picks. `tests/preference.test.ts`
+ * pins both halves of that behavior ("term score outranks capability
+ * preference" and the per-field weights) so it cannot drift silently.
+ */
+const IDENTIFIER_TERM_WEIGHT = 3;
+const TITLE_TERM_WEIGHT = 2;
+const REST_TERM_WEIGHT = 1;
+
+/**
+ * Weight of the strongest field `term` was found in, or 0 if absent. See the
+ * comment on the weight constants above for why the ordering matters.
  */
 function fieldWeight(term: string, blob: SearchableBlob): number {
-  if (blob.identifiers.includes(term)) return 3;
-  if (blob.title.includes(term)) return 2;
-  if (blob.rest.includes(term)) return 1;
+  if (blob.identifiers.includes(term)) return IDENTIFIER_TERM_WEIGHT;
+  if (blob.title.includes(term)) return TITLE_TERM_WEIGHT;
+  if (blob.rest.includes(term)) return REST_TERM_WEIGHT;
   return 0;
 }
 
@@ -165,10 +202,16 @@ export function searchCandidates(candidates: readonly ToolCandidate[], query: st
 // Async-lifecycle exclusion.
 // ---------------------------------------------------------------------------
 
-// Suffix-anchored on `method` (not the full `${backendId}_${method}` tool
-// name): checking the method name alone means a backend id that happens to
-// contain one of these words (e.g. "firecrawl") can never cause a false
-// exclusion of an unrelated sync method.
+// Suffix-anchored on the *tool* name (`${backendId}_${method}`), not on the
+// bare method, because the spec's patterns are written as globs over the tool
+// name (`*_status`) and a bare method name defeats a method-anchored test:
+// `'status'.endsWith('_status')` is false, so a method named exactly `status`,
+// `get`, `progress`, `snapshot`, `dataset`, or `async` would escape the rule
+// entirely. Anchoring on the tool name is equally safe against the firecrawl
+// hazard that motivates the method-name-only `crawl` rule below: a backend id
+// is always followed by `_` in the tool name, so these suffixes can only ever
+// match at a backend/method or method-internal word boundary, never inside a
+// backend id like "firecrawl".
 const ASYNC_NAME_SUFFIXES = ['_async', '_status', '_progress', '_snapshot', '_get', '_dataset'] as const;
 
 const ASYNC_TEXT_PHRASES = [
@@ -187,19 +230,47 @@ const ASYNC_TEXT_PHRASES = [
 // is an id, poll for the real result later" rather than a real payload.
 const ASYNC_ID_PROPERTY_NAMES = new Set(['id', 'job_id', 'snapshot_id', 'request_id', 'task_id']);
 
-function hasAsyncNamePattern(method: string): boolean {
-  const lower = method.toLowerCase();
-  // Exact method-name equality ONLY — never a substring check against the
+function hasAsyncNamePattern(candidate: ToolCandidate): boolean {
+  // Exact METHOD-name equality ONLY — never a substring check against the
   // full tool name. `firecrawl` contains the substring "crawl", so a
   // substring test here would incorrectly exclude firecrawl_scrape,
   // firecrawl_search, and firecrawl_map, silently destroying both the scrape
-  // and web-search preference tiers while looking like it works.
-  if (lower === 'crawl') return true;
-  return ASYNC_NAME_SUFFIXES.some((suffix) => lower.endsWith(suffix));
+  // and web-search preference tiers while looking like it works. This one
+  // rule stays method-scoped for that reason; the suffixes below are
+  // tool-name-scoped (see ASYNC_NAME_SUFFIXES).
+  if (candidate.method.toLowerCase() === 'crawl') return true;
+
+  // Two spellings of the tool name are checked: `candidate.tool`, which is
+  // what a user actually types and which has had illegal characters
+  // sanitized to `_` (so a method literally named `job.status` is caught),
+  // and the raw `${backendId}_${method}` join, which `candidate.tool` may
+  // have truncated behind a hash suffix for long names (see
+  // methodToToolName). Either spelling matching is enough.
+  const names = [candidate.tool.toLowerCase(), `${candidate.backendId}_${candidate.method}`.toLowerCase()];
+  return ASYNC_NAME_SUFFIXES.some((suffix) => names.some((name) => name.endsWith(suffix)));
 }
 
+/**
+ * Async text-phrase detection over the method's **own** title and
+ * description, and deliberately NOT over `candidate.backendInfoText`.
+ *
+ * `backendInfoText` is backend-wide: it is the same title/summary/description
+ * string on every method a backend exposes. One async word anywhere in a
+ * backend's prose would therefore disqualify all of its methods, and the live
+ * gateway manifests contain exactly such words — firecrawl ("Crawl starts
+ * asynchronously and is polled by job id"), scraperapi ("run large/hard
+ * scrapes via the async jobs API"), brightdata ("the async Web Scraper API",
+ * "async trigger/poll/download flow"), apify, falai. Including it would leave
+ * `run` with no candidate at all for the `scrape` and `serp` capabilities:
+ * every deployed rung of both preference lists would be excluded, and
+ * `selectForRun` would answer `no-match` for `scrape url`.
+ *
+ * `backendInfoText` remains a **search** field (search rule 5); it is
+ * excluded from async detection only. This scoping is the governing spec's
+ * amended async rule, not a local judgement call.
+ */
 function hasAsyncTextPhrase(candidate: ToolCandidate): boolean {
-  const text = `${candidate.title ?? ''} ${candidate.description} ${candidate.backendInfoText}`.toLowerCase();
+  const text = `${candidate.title ?? ''} ${candidate.description}`.toLowerCase();
   return ASYNC_TEXT_PHRASES.some((phrase) => text.includes(phrase));
 }
 
@@ -234,7 +305,7 @@ function hasAsyncOutputShape(candidate: ToolCandidate): boolean {
  * `selectForRun`).
  */
 export function isAsyncLifecycleMethod(candidate: ToolCandidate): boolean {
-  return hasAsyncNamePattern(candidate.method) || hasAsyncTextPhrase(candidate) || hasAsyncOutputShape(candidate);
+  return hasAsyncNamePattern(candidate) || hasAsyncTextPhrase(candidate) || hasAsyncOutputShape(candidate);
 }
 
 const ASYNC_OVERRIDE_TERMS = new Set(['async', 'job', 'snapshot', 'status', 'crawl']);
@@ -269,19 +340,32 @@ function tierWeight(tier: RankTier): number {
 }
 
 /**
- * Classifies a search match into a rank tier. `exact-backend-method` and
- * `exact-method` are judged on whole-token equality against the *raw*
- * (un-stop-word-filtered) query tokens — a user typing "firecrawl scrape"
- * gets both identifiers as separate exact tokens even though neither word is
- * a stop word to begin with. A query that exactly equals a bare backend id
- * (e.g. "firecrawl") falls through to `term-score`: the spec defines no
- * dedicated "exact backend alone" tier, and a bare backend name is weak
- * signal about *which* of its methods to prefer.
+ * Classifies a search match into a rank tier.
+ *
+ * Two independent signals count as "the query named this identifier":
+ *
+ *   1. `match.exactMatch`, computed by `searchCandidates` from the whole raw
+ *      query string. This must be honored, not re-derived: `tokenize` splits
+ *      on `_`, so an intent exactly equal to a method named `scrape_url`
+ *      yields the tokens {scrape, url} and never the token `scrape_url`. A
+ *      token-membership test alone would drop that candidate to `term-score`
+ *      while promoting a competing backend whose method happens to be a bare
+ *      `scrape` to `exact-method` — letting a method-name shape coincidence
+ *      outrank capability preference across providers.
+ *   2. Whole-token equality against the *raw* (un-stop-word-filtered) query
+ *      tokens, so a user typing "firecrawl scrape" gets both identifiers as
+ *      separate exact tokens.
+ *
+ * A query that exactly equals a bare backend id (e.g. "firecrawl") still
+ * falls through to `term-score` unless a method token is also present: the
+ * spec defines no dedicated "exact backend alone" tier, and a bare backend
+ * name is weak signal about *which* of its methods to prefer.
  */
 function classifyTier(match: SearchMatch, rawTokens: ReadonlySet<string>): RankTier {
   if (match.exactMatch === 'tool') return 'exact-tool';
-  const hasBackendToken = rawTokens.has(match.candidate.backendId.toLowerCase());
-  const hasMethodToken = rawTokens.has(match.candidate.method.toLowerCase());
+  const hasBackendToken =
+    match.exactMatch === 'backend' || rawTokens.has(match.candidate.backendId.toLowerCase());
+  const hasMethodToken = match.exactMatch === 'method' || rawTokens.has(match.candidate.method.toLowerCase());
   if (hasBackendToken && hasMethodToken) return 'exact-backend-method';
   if (hasMethodToken) return 'exact-method';
   return 'term-score';
@@ -377,29 +461,71 @@ export function rankCandidates(
 // `run` auto-pick entry point.
 // ---------------------------------------------------------------------------
 
+/** Two or more capabilities matched the intent; not overridable. */
+export interface AmbiguousCapabilityRefusal {
+  kind: 'ambiguous-capability';
+  capabilities: Capability[];
+}
+
+/**
+ * The matched set spans multiple backends with no capability hint to pick
+ * between them; overridable with `--allow-unhinted-auto-pick`.
+ */
+export interface UnhintedMultiBackendRefusal {
+  kind: 'unhinted-multi-backend';
+  backends: string[];
+}
+
 /**
  * Why `run` refused to auto-pick a candidate. Both variants carry enough for
  * a caller to render a useful message and (for `unhinted-multi-backend`) to
  * decide whether to override via `--allow-unhinted-auto-pick` — that flag
  * check belongs to the CLI, not here; see the module doc comment.
  */
-export type RunRefusalReason =
-  | { kind: 'ambiguous-capability'; capabilities: Capability[] }
-  | { kind: 'unhinted-multi-backend'; backends: string[] };
+export type RunRefusalReason = AmbiguousCapabilityRefusal | UnhintedMultiBackendRefusal;
 
 export type RunSelection =
-  /** No candidate matched the query (after async exclusion). */
+  /** Nothing matched the query at all. */
   | { outcome: 'no-match' }
+  /**
+   * Candidates matched, but every one of them was removed by async-lifecycle
+   * exclusion. Distinct from `no-match` because the remedy is different and
+   * worth telling the user: name the tool exactly, or ask for async behavior
+   * explicitly ("async"/"job"/"snapshot"/"status"/"crawl"). `asyncExcluded`
+   * holds the matched-but-excluded candidates in catalog order so the caller
+   * can name them; they are deliberately NOT ranked and NOT promotable —
+   * `run` must not auto-call an async lifecycle method.
+   */
+  | { outcome: 'async-excluded'; asyncExcluded: ToolCandidate[] }
   | { outcome: 'selected'; chosen: RankedCandidate; ranked: RankedCandidate[] }
-  | { outcome: 'refused'; reason: RunRefusalReason; ranked: RankedCandidate[] };
+  /**
+   * Refused because two or more capabilities matched the intent. There is no
+   * `--allow-unhinted-auto-pick` override for this case, so this variant
+   * deliberately carries no `ranked` field: the type must not hand a caller a
+   * candidate it is not allowed to promote. `alternatives` is for display
+   * only.
+   */
+  | { outcome: 'refused'; reason: AmbiguousCapabilityRefusal; alternatives: RankedCandidate[] }
+  /**
+   * Refused because the matched set spans multiple backends and no capability
+   * hint applies. This is the ONE overridable refusal: a CLI that sees
+   * `--allow-unhinted-auto-pick` may promote `ranked[0]`.
+   *
+   * Narrow with `'ranked' in result`. Testing `result.reason.kind` narrows
+   * `result.reason` but NOT `result` itself (TypeScript does not narrow an
+   * outer union on a nested discriminant), so it does not make `ranked`
+   * reachable — which is the intended shape: the only way to a promotable
+   * candidate is through the variant that has one.
+   */
+  | { outcome: 'refused'; reason: UnhintedMultiBackendRefusal; ranked: RankedCandidate[] };
 
 /**
  * Decides what (if anything) `run` should auto-select for a free-text
  * intent: search, apply async-lifecycle exclusion, infer a capability from
  * the intent, and rank. Never throws and never consults
- * `--allow-unhinted-auto-pick` — a refusal is a returned decision, always
- * accompanied by the full ranked list, so the CLI can render it and, for the
- * unhinted-multi-backend case, override it itself by taking `ranked[0]`.
+ * `--allow-unhinted-auto-pick` — a refusal is a returned decision. The one
+ * overridable refusal (`unhinted-multi-backend`) carries the full ranked list
+ * so the CLI can promote `ranked[0]` itself; the non-overridable ones do not.
  */
 export function selectForRun(candidates: readonly ToolCandidate[], intent: string): RunSelection {
   const matches = searchCandidates(candidates, intent);
@@ -409,7 +535,15 @@ export function selectForRun(candidates: readonly ToolCandidate[], intent: strin
     (match) => asyncOverride || match.exactMatch === 'tool' || !isAsyncLifecycleMethod(match.candidate),
   );
 
-  if (eligible.length === 0) return { outcome: 'no-match' };
+  if (eligible.length === 0) {
+    // Separate the two ways of having nothing to run: nothing matched, versus
+    // everything that matched was an async lifecycle method. The second is
+    // recoverable by the user (name the tool exactly, or say "async"/"job"/
+    // "snapshot"/"status"/"crawl"), so it must not be reported as a bare
+    // no-match.
+    if (matches.length === 0) return { outcome: 'no-match' };
+    return { outcome: 'async-excluded', asyncExcluded: matches.map((match) => match.candidate) };
+  }
 
   const inference = inferCapability(intent);
 
@@ -420,7 +554,7 @@ export function selectForRun(candidates: readonly ToolCandidate[], intent: strin
         kind: 'ambiguous-capability',
         capabilities: inference.candidates.map((match) => match.capability),
       },
-      ranked: rankCandidates(eligible, intent),
+      alternatives: rankCandidates(eligible, intent),
     };
   }
 

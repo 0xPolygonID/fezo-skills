@@ -41,7 +41,21 @@ export const CAPABILITY_KEYWORDS = {
 /** The three capabilities `run` currently has preference policy for. */
 export type Capability = keyof typeof CAPABILITY_KEYWORDS;
 
-const CAPABILITY_LIST = Object.keys(CAPABILITY_KEYWORDS) as Capability[];
+/**
+ * The capabilities `inferCapability` checks, in the order it checks them.
+ *
+ * Written out rather than derived from `Object.keys(CAPABILITY_KEYWORDS)`
+ * because `Object.keys` returns `string[]` and narrowing it back to
+ * `Capability[]` would need a type assertion, which `src/` does not use. The
+ * ordering is load-bearing: it is the order capabilities appear in the
+ * `ambiguous-capability` report a refused `run` prints.
+ *
+ * Adding a capability to `CAPABILITY_KEYWORDS` without adding it here would
+ * make its keywords un-inferrable. `tests/preference.test.ts` guards against
+ * that by asserting every capability in `CAPABILITY_KEYWORDS` is reachable
+ * through `inferCapability`.
+ */
+const CAPABILITY_LIST: readonly Capability[] = ['scrape', 'serp', 'web-search'];
 
 /**
  * Per-capability backend preference order, used by rank.ts as tie-break tier
