@@ -22,9 +22,12 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { Readable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
+
+import { runCli } from '../src/cli.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..');
@@ -232,6 +235,25 @@ describe('skills/fezo/SKILL.md generated content', () => {
     expect(skillMd).not.toContain('for every subsequent command in this session');
   });
 
+  // Option 1 (re-paste the resolve block) has a prerequisite the same paragraph
+  // says does not survive a fresh shell: SKILL_DIR. Sourcing the block without
+  // it hits the `:?` guard and aborts, so the option is only usable if the
+  // model sets SKILL_DIR too. Anchored on the sentence that says so, not on the
+  // guard's message alone — that message also appears inside the invocation
+  // block, so asserting it by itself would pass vacuously.
+  it('names SKILL_DIR as a prerequisite of re-pasting the resolve block', () => {
+    expect(skillMdFlat).toContain('and set `SKILL_DIR` again in that same call, first');
+    expect(skillMdFlat).toContain('sourcing the block aborts with `SKILL_DIR must be set');
+    expect(skillMdFlat).toContain('With `SKILL_DIR` set, the block is idempotent and does no network I/O');
+  });
+
+  // The ladder is two sections below this sentence (`## Resolve fezoctl`), not
+  // in the block that immediately follows it.
+  it('points at the resolve section by name rather than at "the next block"', () => {
+    expect(skillMdFlat).toContain('resolve the engine with the ladder in the `## Resolve fezoctl` section below');
+    expect(skillMdFlat).not.toContain('resolve the engine with the ladder in the next block');
+  });
+
   // ---------------------------------------------------------------------------
   // C2: the credential-leak prohibitions. `allowed-tools` grants
   // `AskUserQuestion` (deliberately — the modal has a legitimate NON-secret use,
@@ -260,10 +282,87 @@ describe('skills/fezo/SKILL.md generated content', () => {
   it('gives the correct third move: the user runs setup --key-stdin themselves', () => {
     expect(skillMdFlat).toContain('stop and ask the user to run `setup --key-stdin` themselves, in their own terminal');
     expect(skillMd).toContain('it never reaches the conversation or an argv');
-    // The Claude Code mechanism, with a fully expanded command line (the user's
-    // own shell has no FEZOCTL_ARGV to expand).
-    expect(skillMd).toContain('typing `!` followed by the command');
-    expect(skillMd).toContain('! node /absolute/path/to/fezoctl.mjs setup --key-stdin --url https://gateway.example.com');
+  });
+
+  // -------------------------------------------------------------------------
+  // C2b: the mechanics of that third move must match what `setup --key-stdin`
+  // actually does. Two verified facts the previous wording got wrong:
+  //
+  //   1. `setup --key-stdin` prints NOTHING before reading — `cmdSetup` goes
+  //      straight to `readSecretFromStream(stdin)`, which drains the stream to
+  //      EOF. A user told to "paste the key at its prompt" gets a blank
+  //      terminal and no hint that Ctrl-D is what ends the read.
+  //   2. A Claude Code `!` command (and every agent Bash call) has
+  //      non-interactive stdin and no controlling terminal — verified: opening
+  //      `/dev/tty` there fails with ENXIO — so `setup --key-stdin` reads
+  //      immediate EOF, stores nothing and exits 2. The `!` form the file used
+  //      to *prefer* was therefore a guaranteed failure.
+  //
+  // Anchored on literal phrases, and paired with negative assertions on the
+  // exact pre-fix strings so neither wrong mechanism can come back.
+  // -------------------------------------------------------------------------
+
+  it('says setup --key-stdin prints no prompt, and gives a form that works in a real terminal', () => {
+    expect(skillMd).toContain('`setup --key-stdin` **prints no prompt of any kind**');
+    expect(skillMdFlat).toContain('Never tell the user to "paste the key at its prompt": there is no prompt');
+    // The verified, non-echoing one-liner: prompt from the shell, key read with
+    // `read -rs`, handed over through a builtin `printf` pipe so it is in
+    // neither an argv nor the history line.
+    expect(skillMd).toContain(
+      `printf 'Fezo API key: '; read -rs KEY; echo; printf '%s' "$KEY" | node /absolute/path/to/fezoctl.mjs setup --key-stdin --url https://gateway.example.com; unset KEY`,
+    );
+    expect(skillMdFlat).toContain('`printf` is a shell builtin in bash and zsh, so no separate process is spawned');
+    // ...and it must say WHY that pipe is not the second bullet's forbidden
+    // form, or the two paragraphs read as contradicting each other and the
+    // model falls back to "I must not suggest any pipe at all".
+    expect(skillMdFlat).toContain('This is not the forbidden form from the second bullet: the key never appears as a literal anywhere');
+    expect(skillMdFlat).toContain('The forbidden thing is a command in which YOU have written the key out');
+    // ...and the bare form documented with the EOF step it actually needs.
+    expect(skillMdFlat).toContain('nothing is printed, so type or paste the key, press Enter, then press Ctrl-D');
+    // The pre-fix promise of a prompt must be gone.
+    expect(skillMdFlat).not.toContain('they paste the key at its prompt');
+  });
+
+  it('rules out the `!` shortcut instead of prescribing it, and says why it cannot work', () => {
+    expect(skillMd).toContain('Do NOT hand the user a `! ...` command for this');
+    expect(skillMdFlat).toContain('A Claude Code `!` command runs with non-interactive stdin and no controlling terminal');
+    expect(skillMdFlat).toContain('reads end-of-file immediately, stores nothing, and exits 2');
+    expect(skillMdFlat).toContain('The user runs it in their own terminal, outside this session');
+    // The exact pre-fix instruction and its command line, both of which were
+    // verified to fail with exit 2, must not reappear.
+    expect(skillMd).not.toContain('typing `!` followed by the command');
+    expect(skillMd).not.toContain('! node /absolute/path/to/fezoctl.mjs setup --key-stdin --url https://gateway.example.com');
+  });
+
+  // The failure output SKILL.md quotes for that case is labelled "verified", so
+  // pin it to what the engine actually prints rather than to a transcript
+  // somebody pasted once. Stale-but-labelled-verified output is the exact defect
+  // this pass exists to fix, in the file a model reads.
+  it('the failure output it quotes for the `!` case is what setup --key-stdin actually prints on an empty stdin', async () => {
+    const quoted = skillMd.match(/The whole output, verified:\n\n```\n([\s\S]*?)\n```\n/);
+    expect(quoted?.[1], 'SKILL.md must quote the verified failure output in a fenced block').toBeTypeOf('string');
+
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-skillmd-nokey-'));
+    try {
+      const result = await runCli(['setup', '--key-stdin', '--url', 'https://gateway.example.com'], {
+        // An empty stream is exactly what a `!` command's non-interactive stdin
+        // delivers: readable, immediately at EOF.
+        stdin: Readable.from([]),
+        dotEnvPath: join(dir, '.env'),
+        env: {},
+      });
+      expect(result.exitCode).toBe(2);
+      expect(result.stdout.trimEnd()).toBe(quoted?.[1]);
+      expect(result.stderr).toBe('');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ranks setup --key-stdin above an exported FEZO_API_KEY, with the reason', () => {
+    expect(skillMdFlat).toContain('An exported `FEZO_API_KEY` is **not** a shortcut around that');
+    expect(skillMdFlat).toContain('invisible to this already-running session');
+    expect(skillMdFlat).toContain('takes effect immediately, which is why it is the option to offer first');
   });
 
   it('names what the modal MAY collect: the gateway URL and the storage choice, both non-secret', () => {
@@ -278,6 +377,17 @@ describe('skills/fezo/SKILL.md generated content', () => {
     expect(skillMd).toContain('`--url` is not optional in practice');
     expect(skillMd).toContain('(not configured — pass --url or set FEZO_URL)');
     expect(skillMdFlat).toContain('and exits non-zero');
+  });
+
+  // The `"${FEZOCTL_ARGV[@]}"` recipe above is required by the argv-array
+  // contract (see the test below), but it is NOT what the user types — their
+  // shell never ran the resolve block. The file has to say which form belongs
+  // to whom, or the model hands over a line that expands to nothing.
+  it('distinguishes the array form the model uses from the expanded form the user types', () => {
+    expect(skillMdFlat).toContain('That is the form YOU would use');
+    expect(skillMdFlat).toContain('It is **not** the form to show the user: their shell never ran the resolve block');
+    expect(skillMdFlat).toContain('would expand to `setup: command not found`');
+    expect(skillMdFlat).toContain('Expand it to the literal invocation step 0 resolved');
   });
 
   it('instructs setup through the resolved array, never a bare `fezoctl` command', () => {

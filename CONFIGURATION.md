@@ -208,6 +208,26 @@ printf '%s' "$YOUR_KEY" | fezoctl setup --key-stdin --url https://your-gateway.e
 printf '%s' "$YOUR_KEY" | fezoctl setup --key-stdin --storage keychain --url https://your-gateway.example.com
 ```
 
+**There is no prompt.** `setup --key-stdin` prints nothing before reading; it
+drains standard input to end-of-file and only then reports. So if you run it
+without a pipe, you get a blank line and no instructions: type or paste the key,
+press Enter, then press **Ctrl-D** to signal end-of-file. The key is echoed on
+screen in that form. To type it without echo, and without ever putting it in a
+command line or the history file:
+
+```bash
+printf 'Fezo API key: '; read -rs KEY; echo
+printf '%s' "$KEY" | fezoctl setup --key-stdin --url https://your-gateway.example.com
+unset KEY
+```
+
+`printf` is a builtin in both bash and zsh, so the key never becomes a separate
+process's argv. Note that this needs a real terminal: with stdin closed or
+redirected from `/dev/null` — an agent's shell, a CI step, a Claude Code `!`
+command — `setup --key-stdin` reads immediate end-of-file, stores nothing, and
+exits **2** with `api key: failed (no API key was provided; nothing was
+stored)`.
+
 `--url` is not optional in practice. `fezoctl` needs a gateway URL *and* an API
 key for every other command, so a `setup` that stores only the key reports the
 gap and exits **2**:
@@ -294,28 +314,48 @@ Two ways to rotate a `dotenv`-stored credential:
    ```
 
    `setup` writes the whole file, not a patch, so a re-run without `--url`
-   leaves you with a `.env` containing only `FEZO_API_KEY` and no gateway URL.
-   Verified — same run, `--url` omitted:
+   leaves you with a `.env` containing only `FEZO_API_KEY` and no gateway URL —
+   and `setup` says so and exits `2`, because the configuration it just wrote is
+   not usable. Verified — same run, `--url` omitted:
 
    ```
    $ rm ~/.config/fezo/.env
    $ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup --key-stdin
    setup — storage: dotenv
      api key: stored
+     configured url: (not configured — pass --url or set FEZO_URL)
      configured api key: sk-l… (source: dotenv)
+     this configuration is NOT usable yet: fezoctl needs BOTH a gateway URL and an API key.
+   $ echo $?
+   2
    $ cat ~/.config/fezo/.env
    FEZO_API_KEY=sk-live-rotated-key
    ```
 
-   The URL is gone. Run `fezoctl doctor` after either route to confirm what is
-   actually in effect.
+   The URL is gone, and the exit code is how you find that out without reading
+   the output. The new key *was* stored — this is a partial success reported as
+   incomplete, not a failed write (see ["`setup`'s exit
+   code"](#setups-exit-code)). Run `fezoctl doctor` after either route to
+   confirm what is actually in effect.
 
 ## `setup`'s exit code
 
-`setup` exits `2` (an operational failure) when a write **failed** — the
-`.env`-already-exists refusal above, a Keychain write that reported an error —
-or when the value it just wrote could not be read back **and** nothing
-higher-priority explains why. Otherwise it exits `0`.
+`setup` exits `2` (an operational failure) in three cases:
+
+1. **A write failed** — the `.env`-already-exists refusal above, or a Keychain
+   write that reported an error.
+2. **A value it just wrote could not be read back**, and nothing
+   higher-priority explains why.
+3. **The resulting configuration is still not usable** — after the write, a
+   gateway URL and an API key do not *both* resolve. This is the
+   `--url`-omitted case shown twice above: the key really was stored, but
+   `fezoctl` cannot call anything without a URL, so `setup` prints
+   `this configuration is NOT usable yet: …` and exits `2` rather than
+   reporting a success the next command would contradict. Supplying the URL
+   through an exported `FEZO_URL` instead of `--url` satisfies it, because
+   resolution reads the environment first.
+
+Otherwise it exits `0`.
 
 A write that succeeded but could not be verified *because a higher-priority
 source shadows it* is **not** a failure: it is reported as "stored, but NOT
@@ -336,6 +376,10 @@ $ echo $?
 0
 ```
 
-So a `0` exit from `setup` means "nothing failed", not "the stored value is now
-what `fezoctl` will use" — read the per-field lines, and use `doctor` to
-confirm which source actually wins.
+So a `0` exit from `setup` means "nothing failed **and** a URL and a key both
+resolve now" — it does *not* mean "the value I just stored is the one `fezoctl`
+will use", because a higher-priority source may be answering instead. Read the
+per-field lines, and use `doctor` to confirm which source actually wins.
+
+Under `--json`, the same three conditions are visible per field (each field's
+`ok`) plus the top-level `"usable"` flag for condition 3.
