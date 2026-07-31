@@ -444,6 +444,22 @@ function buildBundleTo(outPath: string): void {
   scratchFiles.push(outPath);
 }
 
+/**
+ * Installs a freshly built bundle as the gitignored pack/build-time copy at
+ * `skills/fezo/scripts/fezoctl.mjs`, mirroring `copyIntoSkill` in
+ * build/bundle.mjs — including its `mkdirSync`, which is the part that matters
+ * here. Git tracks files, not directories, and every file in that directory is
+ * gitignored, so a FRESH CLONE has no `skills/fezo/scripts/` at all: a bare
+ * `copyFileSync` into it fails with ENOENT. That failure is invisible on any
+ * machine where `pnpm bundle` has ever run and shows up only in CI, so the
+ * mkdir belongs in one helper rather than at each call site.
+ */
+function installSkillLocalCopy(from: string): void {
+  mkdirSync(dirname(skillScriptPath), { recursive: true });
+  copyFileSync(from, skillScriptPath);
+  chmodSync(skillScriptPath, 0o755);
+}
+
 describe('dist/fezoctl.mjs reproducibility', () => {
   it('two independent builds from source are byte-identical', () => {
     const scratchDir = mkdtempSync(join(tmpdir(), 'fezoctl-bundle-'));
@@ -578,8 +594,7 @@ describe('skills/fezo/scripts/fezoctl.mjs packaging', () => {
     try {
       const scratchBundle = join(scratchDir, 'fezoctl.mjs');
       execFileSync('node', [bundlePath, '--out', scratchBundle], { cwd: repoRoot, encoding: 'utf8' });
-      copyFileSync(scratchBundle, skillScriptPath);
-      chmodSync(skillScriptPath, 0o755);
+      installSkillLocalCopy(scratchBundle);
     } finally {
       rmSync(scratchDir, { recursive: true, force: true });
     }
@@ -636,8 +651,7 @@ describe('skills/fezo/scripts/fezoctl.mjs reports its own version', () => {
       // rebuild the committed dist/ in place.
       const scratchBundle = join(scratchDir, 'fezoctl.mjs');
       execFileSync('node', [bundlePath, '--out', scratchBundle], { cwd: repoRoot, encoding: 'utf8' });
-      copyFileSync(scratchBundle, skillScriptPath);
-      chmodSync(skillScriptPath, 0o755);
+      installSkillLocalCopy(scratchBundle);
     } finally {
       rmSync(scratchDir, { recursive: true, force: true });
     }
