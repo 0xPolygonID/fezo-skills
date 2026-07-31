@@ -14,9 +14,18 @@ jobs:
 
       # Must precede setup-node: its `cache: pnpm` shells out to
       # `pnpm store path --silent` to locate the store to cache.
+      #
+      # `standalone` installs @pnpm/exe, which bundles its own Node. pnpm 11
+      # itself requires Node >=22.13, but `node-version` below is deliberately
+      # 22.12 — the floor declared in package.json's `engines` — so CI proves
+      # the floor actually works. Without `standalone`, pnpm runs on the
+      # runner's Node and aborts before a single test runs. The bundled Node
+      # is used ONLY by pnpm; package scripts still resolve `node` from PATH,
+      # i.e. the 22.12 that setup-node installed.
       - uses: pnpm/action-setup@v6
         with:
           version: 11.8.0
+          standalone: true
 
       - uses: actions/setup-node@v7
         with:
@@ -25,6 +34,23 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # Guards the `standalone: true` above: @pnpm/exe's bundled Node must stay
+      # pnpm's private business. If it ever leaked into PATH, every step below
+      # would silently test a Node newer than the declared `engines` floor and
+      # this job would stop proving what it exists to prove.
+      - name: Package scripts run on the pinned Node, not pnpm's bundled one
+        run: |
+          set -euo pipefail
+          pinned="$(node -v)"
+          scripts="$(pnpm exec node -v)"
+          echo "pnpm:              $(pnpm -v)"
+          echo "node in PATH:      ${pinned}"
+          echo "node for scripts:  ${scripts}"
+          if [ "${scripts}" != "${pinned}" ]; then
+            echo "package scripts are running on ${scripts}, not the pinned ${pinned}" >&2
+            exit 1
+          fi
 
       - name: Typecheck
         run: pnpm typecheck
