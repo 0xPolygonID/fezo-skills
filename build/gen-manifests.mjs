@@ -11,6 +11,9 @@
 //   .agents/plugins/marketplace.json  cross-host `.agents` marketplace
 //   gemini-extension.json             Gemini CLI extension (env-var settings)
 //
+// …and the two root-scan ignore files, `.skillignore` and `.clawhubignore`,
+// which are one exclusion list read by two hosts.
+//
 // EVERY value here is DERIVED — from `package.json` (version, description,
 // homepage, repository, license) and from `build/gen-skill.mjs` (the skill's
 // name and description). Nothing is transcribed.
@@ -60,8 +63,25 @@ const pkg = readPackageJson();
  * rather than stored twice.
  */
 export const gitUrl = pkg.repositoryUrl.replace(/^git\+/, '');
-/** The browsable project URL, i.e. the clone URL without the `.git` suffix. */
-export const homepage = pkg.homepage;
+/**
+ * The browsable project URL: the clone URL without the `.git` suffix, DERIVED
+ * rather than read from `package.json`'s own `homepage`.
+ *
+ * It is what every manifest's `repository` field is set to, so reading the
+ * transcribed value would let the two drift: point `homepage` at a docs site or
+ * an org page — a routine thing to do — and every host's `repository` would
+ * silently name something that is not a repository, while the marketplaces'
+ * `source.url` still used the real clone URL. Deriving it makes that
+ * impossible; the assertion below makes a `homepage` that disagrees a build
+ * failure rather than a silent divergence.
+ */
+export const homepage = gitUrl.replace(/\.git$/, '');
+if (pkg.homepage !== homepage) {
+  throw new Error(
+    `package.json's homepage (${pkg.homepage}) is not repository.url without its git+ prefix and .git suffix (${homepage}); ` +
+      'the manifests set every `repository` field from the derived value, so reconcile the two.',
+  );
+}
 
 /**
  * Authorship is the GitHub organization, with no `email` field.
@@ -149,13 +169,24 @@ function codexPluginJson() {
     interface: {
       displayName: SKILL_NAME,
       shortDescription: 'Call external APIs discovered from a live gateway catalog.',
+      // The second sentence is a disclosure, not marketing copy: the skill's
+      // primary effect is outbound network traffic to third-party APIs, made by
+      // a bundled Node engine the skill shells out to, and billed to the user's
+      // gateway account. `capabilities` below has no vocabulary term for either
+      // shell execution or network egress, so this is where a Codex user
+      // reading the listing learns about them.
       longDescription:
-        'fezo adds a skill that discovers callable tools from a Fezo gateway at run time and invokes the best candidate for the task, retrying a different provider when one fails or returns unsuitable content. The tool roster is read from the gateway catalog on every invocation, so new backends are usable without updating this plugin.',
+        'fezo adds a skill that discovers callable tools from a Fezo gateway at run time and invokes the best candidate for the task, retrying a different provider when one fails or returns unsuitable content. It runs a bundled Node CLI through the shell on every invocation, which makes outbound HTTPS requests to your gateway and, through it, to third-party API backends — those calls are billed to your gateway account. The tool roster is read from the gateway catalog each time, so new backends are usable without updating this plugin.',
       developerName: AUTHOR.name,
       category: 'Developer Tools',
       // `Write` is listed because `fezoctl setup` persists credentials to
       // ~/.config/fezo/.env (or the macOS Keychain). Understating this would
       // misrepresent what the skill does on first run.
+      //
+      // These three are the terms this field is known to accept. Shell
+      // execution and network egress — the skill's largest effects — have no
+      // term here, so they are disclosed in `longDescription` above rather than
+      // guessed at with a value the host may reject.
       capabilities: ['Interactive', 'Read', 'Write'],
       websiteURL: homepage,
       // Capability-shaped prompts. NOT provider names — see KEYWORDS.
@@ -221,6 +252,15 @@ function agentsMarketplaceJson() {
  * which is the FIRST source in fezoctl's credential resolution chain
  * (env > Keychain > dotenv), so this lane needs no separate setup step.
  *
+ * No `contextFileName`, `mcpServers`, or `commands` — deliberately. Gemini CLI
+ * discovers agent skills bundled with an extension by convention, from
+ * `skills/<name>/SKILL.md` relative to the extension root, which is exactly
+ * where this repository's skill already lives. Declaring a context file would
+ * load a second copy of the instructions into every session unconditionally,
+ * which is the opposite of what a skill is for. (This is the one lane whose
+ * mechanism is a host convention rather than something the manifest states, so
+ * the manifest looking thin here is not an omission.)
+ *
  * These two names are the only ones resolution accepts, so they are the only
  * ones that may appear here: an extra entry would present a host-UI field that
  * silently has no effect.
@@ -247,6 +287,117 @@ function geminiExtensionJson() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Root-scan ignore files.
+//
+// Hermes and ClawHub scan the WHOLE repository when installing from a Git
+// source, not just `skills/`, so these two files decide what an installed skill
+// actually contains. They are generated for the same reason the manifests are:
+// they were two hand-maintained copies of one list, policed by a test that
+// could only report the drift after the fact.
+// ---------------------------------------------------------------------------
+
+/**
+ * The single exclusion list both files carry, as comment/paths groups.
+ *
+ * `skills/fezo/` is what must survive: SKILL.md plus the committed engine at
+ * `skills/fezo/scripts/fezoctl.mjs`. Nothing here may match either — a pattern
+ * that did would produce the same silent failure gitignoring the bundle did, a
+ * SKILL.md with no fezoctl behind it.
+ */
+const ROOT_SCAN_EXCLUSIONS = [
+  {
+    comment: [
+      'Local credentials. This is the one group here that is a security boundary',
+      'rather than noise reduction: `.env` is gitignored, so it is never in the',
+      'repo, but these scans read the WORKING DIRECTORY. A maintainer installing',
+      "or packaging from their own checkout would otherwise ship a live",
+      "FEZO_API_KEY into the installed skill and upload it into the scanner's",
+      'security review. `.npmignore` excludes it for the same reason, and',
+      '`build/pack-check.mjs` asserts it for the npm tarball.',
+    ],
+    paths: ['.env', '.env.*'],
+  },
+  {
+    comment: ['VCS, caches, and local scratch output.'],
+    paths: ['.git/', 'node_modules/', 'coverage/', '*.log', '.DS_Store'],
+  },
+  {
+    comment: [
+      'TypeScript source and its build tooling. `dist/fezoctl.mjs` is the build',
+      'output, not a runtime dependency of the installed skill: the skill directory',
+      'carries its own copy, and tier 3 (which reads dist/) only ever resolves in a',
+      'source checkout.',
+    ],
+    paths: [
+      'src/',
+      'tests/',
+      'build/',
+      'dist/',
+      'tsconfig.json',
+      'vitest.config.ts',
+      'package.json',
+      'pnpm-lock.yaml',
+      'pnpm-workspace.yaml',
+    ],
+  },
+  {
+    comment: [
+      'Repo automation and host-specific package metadata. Each host reads only its',
+      "own manifest; shipping the other hosts' manifests into a scan is noise.",
+    ],
+    paths: ['.github/', '.agents/', '.claude-plugin/', '.codex-plugin/', '.grok-plugin/', 'gemini-extension.json'],
+  },
+  {
+    comment: [
+      'Non-runtime docs and repo-only config. README.md and CODEX.md are install and',
+      'development guides for someone reading the repository, not instructions the',
+      'installed skill needs — SKILL.md carries the whole runtime flow, credential',
+      'setup included.',
+      '',
+      'Two deliberate keeps:',
+      '',
+      '  CONFIGURATION.md — the credential reference. SKILL.md does NOT link it, so',
+      '  this is not load-bearing for setup to work; it is kept because once',
+      '  README.md is excluded it is the only place in the payload that documents',
+      '  storage locations and resolution precedence.',
+      '',
+      '  LICENSE — the terms should travel with any copy of the code.',
+    ],
+    paths: ['README.md', 'CODEX.md', '.npmignore', '.gitignore', '.gitattributes'],
+  },
+];
+
+/**
+ * Renders one ignore file. The two differ only in which host reads them and
+ * which sibling they name, so everything else comes from the shared list above.
+ */
+function rootScanIgnore({ title, siblingNote }) {
+  const lines = [
+    `# ${title}`,
+    '#',
+    '# Hermes and ClawHub scan the WHOLE repository when installing from a Git',
+    '# source, not just `skills/`. Everything listed here is either dev tooling or',
+    '# host metadata that has no business in an installed skill — and, because these',
+    '# scans include a security review of what is being installed, keeping the',
+    '# surface to the actual runtime skill is what makes that review meaningful.',
+    '#',
+    '# The runtime skill is `skills/fezo/` and nothing else: SKILL.md plus the',
+    '# committed engine at `skills/fezo/scripts/fezoctl.mjs`. Do NOT exclude that',
+    '# bundle — it IS the engine (tier 2 of the invocation ladder), and without it an',
+    '# installed skill resolves no fezoctl at all.',
+    '#',
+    `# ${siblingNote}`,
+    '# GENERATED by build/gen-manifests.mjs from one shared list — do not hand-edit.',
+  ];
+  for (const group of ROOT_SCAN_EXCLUSIONS) {
+    lines.push('');
+    for (const line of group.comment) lines.push(line.length === 0 ? '#' : `# ${line}`);
+    lines.push(...group.paths);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
 /**
  * Every manifest this generator owns, as `relative path -> value`. Exported so
  * tests and CI enumerate the same list the writer uses, rather than a
@@ -270,12 +421,33 @@ export function render(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
+/**
+ * Every file this generator owns, as `relative path -> file text`: the JSON
+ * manifests plus the two root-scan ignore files. `--list`, the writer, CI's
+ * freshness gate, and the tests all enumerate this one map.
+ */
+export function generatedFiles() {
+  const files = {};
+  for (const [relPath, value] of Object.entries(manifests())) {
+    files[relPath] = render(value);
+  }
+  files['.skillignore'] = rootScanIgnore({
+    title: 'Hermes install-time scanner/package exclusions for repository-root scans.',
+    siblingNote: '`.clawhubignore` is the same list for ClawHub.',
+  });
+  files['.clawhubignore'] = rootScanIgnore({
+    title: 'ClawHub/OpenClaw packaging exclusions for repository-root scans.',
+    siblingNote: '`.skillignore` is the same list for Hermes.',
+  });
+  return files;
+}
+
 export function writeManifests(outRoot = repoRoot) {
   const written = [];
-  for (const [relPath, value] of Object.entries(manifests())) {
+  for (const [relPath, text] of Object.entries(generatedFiles())) {
     const target = join(outRoot, relPath);
     mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(target, render(value));
+    writeFileSync(target, text);
     written.push(target);
   }
   return written;
@@ -305,7 +477,7 @@ if (invokedDirectly) {
   try {
     const { outRoot, list } = parseArgs(process.argv.slice(2));
     if (list) {
-      process.stdout.write(`${Object.keys(manifests()).join('\n')}\n`);
+      process.stdout.write(`${Object.keys(generatedFiles()).join('\n')}\n`);
     } else {
       for (const target of writeManifests(outRoot)) {
         process.stdout.write(`wrote ${target}\n`);

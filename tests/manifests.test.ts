@@ -33,12 +33,17 @@ interface PackageJson {
 
 const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as PackageJson;
 
-/** The relative paths the generator owns, read from the generator itself via
- * `--list` so adding a host lane cannot leave these tests behind. */
-const manifestPaths: string[] = execFileSync('node', [genManifestsPath, '--list'], { encoding: 'utf8' })
+/** Every relative path the generator owns, read from the generator itself via
+ * `--list` so adding a host lane cannot leave these tests behind. Includes the
+ * two root-scan ignore files, which are generated from the same shared list. */
+const ownedPaths: string[] = execFileSync('node', [genManifestsPath, '--list'], { encoding: 'utf8' })
   .trim()
   .split('\n')
   .filter((line) => line.length > 0);
+
+/** The JSON subset — the host manifests. The ignore files are line-oriented
+ * text and are asserted separately, at the bottom of this file. */
+const manifestPaths: string[] = ownedPaths.filter((relPath) => relPath.endsWith('.json'));
 
 function readManifest(relPath: string): Record<string, unknown> {
   return JSON.parse(readFileSync(join(repoRoot, relPath), 'utf8')) as Record<string, unknown>;
@@ -72,7 +77,7 @@ function collectVersions(value: unknown, found: string[] = []): string[] {
 
 describe('per-host plugin manifests', () => {
   it('the generator owns the lanes this project documents', () => {
-    expect(manifestPaths).toEqual([
+    expect(ownedPaths).toEqual([
       '.claude-plugin/plugin.json',
       '.claude-plugin/marketplace.json',
       '.codex-plugin/plugin.json',
@@ -80,14 +85,43 @@ describe('per-host plugin manifests', () => {
       '.grok-plugin/marketplace.json',
       '.agents/plugins/marketplace.json',
       'gemini-extension.json',
+      '.skillignore',
+      '.clawhubignore',
     ]);
+  });
+
+  // The converse of the freshness gate. A lane that is renamed or dropped from
+  // `manifests()` leaves its old file committed and no longer enumerated, so
+  // nothing regenerates or diffs it — and the host that still reads it installs
+  // whatever version was current when the lane went away. Every candidate
+  // manifest in the tree must therefore be one the generator still owns.
+  it('no orphaned manifest is left in the tree', () => {
+    const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: repoRoot, encoding: 'utf8' })
+      .split('\0')
+      .filter((line) => line.length > 0);
+    const owned = new Set(ownedPaths);
+    // The shapes a host looks for: a `*-plugin/` or `.agents/plugins/` manifest,
+    // or a root `*-extension.json`. The ignore files are not matched here —
+    // `.gitignore` and `.npmignore` are git's and npm's own, not host-scan
+    // files, and a rename of the two generated ones fails the list above.
+    const candidate = (relPath: string): boolean =>
+      /(^|\/)[^/]*-plugin\/.+\.json$/.test(relPath) ||
+      /^\.agents\/plugins\/.+\.json$/.test(relPath) ||
+      /^[^/]*-extension\.json$/.test(relPath);
+    for (const relPath of tracked.filter(candidate)) {
+      expect(
+        owned.has(relPath),
+        `${relPath} looks like a host manifest but no longer appears in 'gen-manifests --list' — ` +
+          'delete it, or restore the lane that generates it.',
+      ).toBe(true);
+    }
   });
 
   // `git diff` reports nothing for an untracked path, so CI's freshness gate
   // would pass vacuously on a manifest that was generated but never committed.
   // Hosts read these files out of the repository, so untracked means absent.
-  it('every manifest is tracked by git', () => {
-    for (const relPath of manifestPaths) {
+  it('every generated file is tracked by git', () => {
+    for (const relPath of ownedPaths) {
       let tracked = true;
       try {
         execFileSync('git', ['ls-files', '--error-unmatch', '--', relPath], {
@@ -177,7 +211,7 @@ describe('per-host plugin manifests', () => {
     const scratchRoot = mkdtempSync(join(tmpdir(), 'fezo-manifests-'));
     try {
       execFileSync('node', [genManifestsPath, '--out', scratchRoot], { cwd: repoRoot, encoding: 'utf8' });
-      for (const relPath of manifestPaths) {
+      for (const relPath of ownedPaths) {
         const fresh = readFileSync(join(scratchRoot, relPath));
         const committed = readFileSync(join(repoRoot, relPath));
         expect(fresh.equals(committed), `${relPath} is stale — run 'pnpm gen-manifests'`).toBe(true);
@@ -193,7 +227,7 @@ describe('per-host plugin manifests', () => {
     try {
       execFileSync('node', [genManifestsPath, '--out', a], { cwd: repoRoot, encoding: 'utf8' });
       execFileSync('node', [genManifestsPath, '--out', b], { cwd: repoRoot, encoding: 'utf8' });
-      for (const relPath of manifestPaths) {
+      for (const relPath of ownedPaths) {
         expect(readFileSync(join(a, relPath)).equals(readFileSync(join(b, relPath))), relPath).toBe(true);
       }
     } finally {
@@ -209,7 +243,12 @@ describe('per-host plugin manifests', () => {
   it('no manifest names a specific backend provider', () => {
     const raw = manifestPaths.map((relPath) => readFileSync(join(repoRoot, relPath), 'utf8')).join('\n').toLowerCase();
     for (const provider of ['exa', 'serper', 'tavily', 'brave', 'apify', 'scrapecreators', 'openai', 'perplexity']) {
-      expect(raw, `manifests must not name the backend "${provider}"`).not.toContain(provider);
+      // Word boundaries, not `includes`: the shortest names here are ordinary
+      // English fragments. Substring-matching "exa" fails on "for example" and
+      // "the exact tool", and "brave" on "brave"; the invariant is that no
+      // provider is NAMED, so it has to be matched as a word.
+      const named = new RegExp(`\\b${provider}\\b`).test(raw);
+      expect(named, `manifests must not name the backend "${provider}"`).toBe(false);
     }
   });
 
@@ -244,6 +283,10 @@ describe('root-scan ignore files', () => {
       .filter((line) => line.length > 0 && !line.startsWith('#'));
   }
 
+  // Both files are rendered from one list in the generator, so this can no
+  // longer drift by a forgotten hand edit. It stays as a guard on the RENDERER:
+  // the two calls differ only in a title and a sibling note, and a bug that let
+  // the path list differ between them is exactly what it would look like.
   it('both exist and exclude the same paths', () => {
     const [skillignore, clawhubignore] = ignoreFiles.map(patterns) as [string[], string[]];
     expect(skillignore.length).toBeGreaterThan(0);
@@ -262,6 +305,18 @@ describe('root-scan ignore files', () => {
     }
   });
 
+  it('both exclude local credential files', () => {
+    // These scans read the working directory, not the committed tree, so a
+    // gitignored `.env` is in scope. `build/pack-check.mjs` asserts the same
+    // thing for the npm tarball; this is that guard for the Git-source lanes.
+    for (const relPath of ignoreFiles) {
+      const declared = patterns(relPath);
+      for (const expected of ['.env', '.env.*']) {
+        expect(declared, relPath).toContain(expected);
+      }
+    }
+  });
+
   it('both exclude every host manifest and the dev tooling', () => {
     for (const relPath of ignoreFiles) {
       const declared = patterns(relPath);
@@ -275,9 +330,27 @@ describe('root-scan ignore files', () => {
     }
   });
 
-  it('neither excludes CONFIGURATION.md — SKILL.md sends the user there for setup', () => {
+  // SKILL.md does NOT link CONFIGURATION.md — it carries the whole credential
+  // flow inline, so an installed skill is self-sufficient without it. The
+  // exclusion policy still keeps it: README.md is excluded, which leaves
+  // CONFIGURATION.md as the only credential reference in the payload.
+  it('neither excludes CONFIGURATION.md — the only credential reference left in the payload', () => {
     for (const relPath of ignoreFiles) {
       expect(patterns(relPath), relPath).not.toContain('CONFIGURATION.md');
+    }
+  });
+
+  // The stated policy is "non-runtime docs and repo-only config are excluded".
+  // CODEX.md is 300+ lines of install and troubleshooting prose with no runtime
+  // role; it was landing in every install and in the scanner's review surface.
+  it('both exclude the non-runtime docs and repo-only config', () => {
+    for (const relPath of ignoreFiles) {
+      const declared = patterns(relPath);
+      for (const expected of ['README.md', 'CODEX.md', '.npmignore', '.gitignore', '.gitattributes']) {
+        expect(declared, relPath).toContain(expected);
+      }
+      // LICENSE is a deliberate keep: the terms travel with the code.
+      expect(declared, relPath).not.toContain('LICENSE');
     }
   });
 });

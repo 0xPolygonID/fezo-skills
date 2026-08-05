@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { NO_MORE_CANDIDATES_REASON, candidatesToRun, resolvePackageVersion, runCli } from '../src/cli.js';
 import type { CliDeps } from '../src/cli.js';
-import { newAjv } from '../src/engine/ajv-instance.js';
+import { newSchemaCompiler } from '../src/engine/ajv-instance.js';
 import type { KeychainCommandResult, KeychainRunner } from '../src/engine/credentials.js';
 import type { RunSelection } from '../src/engine/rank.js';
 import type { ToolCandidate } from '../src/engine/catalog.js';
@@ -567,16 +567,16 @@ describe('call', () => {
   // ---------------------------------------------------------------------------
   it('--body-json: a body schema that fails to compile skips validation and the call proceeds with the body intact', async () => {
     // Pin the premise: `{type: 'bogus'}` must actually fail to compile under
-    // the very instance `cli.ts`'s `schemaCompiles` probe uses — `newAjv()`,
-    // not a hand-rolled copy of its options, so a change to that constructor
-    // cannot leave this guard asserting something the probe no longer does.
-    // Without it, a future Ajv version that stopped throwing on an
-    // unrecognized `type` would silently slide this test onto the
-    // compiles-and-accepts branch instead — same observable result, wrong
+    // the very compiler `cli.ts`'s `schemaCompiles` probe uses —
+    // `newSchemaCompiler()`, not a hand-rolled copy of its options, so a change
+    // to that construction cannot leave this guard asserting something the
+    // probe no longer does. Without it, a future Ajv version that stopped
+    // throwing on an unrecognized `type` would silently slide this test onto
+    // the compiles-and-accepts branch instead — same observable result, wrong
     // branch, and the permissive-fallback coverage this test exists for would
     // be lost without the suite ever going red.
-    const probeAjv = newAjv();
-    expect(() => probeAjv.compile({ type: 'bogus' })).toThrow();
+    const probeCompiler = newSchemaCompiler();
+    expect(() => probeCompiler.compile({ type: 'bogus' })).toThrow();
 
     const catalog: WireBackend[] = [
       {

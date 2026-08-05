@@ -22,7 +22,7 @@
   "interface": {
     "displayName": "fezo",
     "shortDescription": "Call external APIs discovered from a live gateway catalog.",
-    "longDescription": "fezo adds a skill that discovers callable tools from a Fezo gateway at run time and invokes the best candidate for the task, retrying a different provider when one fails or returns unsuitable content. The tool roster is read from the gateway catalog on every invocation, so new backends are usable without updating this plugin.",
+    "longDescription": "fezo adds a skill that discovers callable tools from a Fezo gateway at run time and invokes the best candidate for the task, retrying a different provider when one fails or returns unsuitable content. It runs a bundled Node CLI through the shell on every invocation, which makes outbound HTTPS requests to your gateway and, through it, to third-party API backends — those calls are billed to your gateway account. The tool roster is read from the gateway catalog each time, so new backends are usable without updating this plugin.",
     "developerName": "0xPolygonID",
     "category": "Developer Tools",
     "capabilities": [

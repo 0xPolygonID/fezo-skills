@@ -155,6 +155,32 @@ jobs:
             exit 1
           fi
 
+      # The converse of the gate above, which can only ever check files the
+      # generator still lists. Rename or drop a lane and the old file stays
+      # committed and unlisted: never regenerated, never diffed, and still found
+      # by the host that reads it — which then installs whatever version was
+      # current when the lane went away.
+      - name: No orphaned manifest — fail if a manifest in the tree is no longer generated
+        run: |
+          set -euo pipefail
+          owned="$(node build/gen-manifests.mjs --list)"
+          # Every tracked path shaped like a host manifest: a `*-plugin/` or
+          # `.agents/plugins/` JSON file, or a root `*-extension.json`.
+          candidates="$(git ls-files | grep -E '(^|/)[^/]*-plugin/.+\.json$|^\.agents/plugins/.+\.json$|^[^/]*-extension\.json$' || true)"
+          # Not named `status`: that identifier is read-only in some shells, so a
+          # local reproduction of this step would die on the assignment instead
+          # of reporting orphans.
+          orphans=0
+          while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+            if ! printf '%s\n' "${owned}" | grep -Fxq "${path}"; then
+              echo "${path} looks like a host manifest but is not in 'gen-manifests --list'." >&2
+              echo "Delete it, or restore the lane in build/gen-manifests.mjs that generates it." >&2
+              orphans=1
+            fi
+          done <<< "${candidates}"
+          exit "${orphans}"
+
       # ONE version number. The frontmatter `version` is the value baked in as
       # `SKILL_VERSION`, which pins tier 5 (`npx -y fezo-skills@$SKILL_VERSION`)
       # and drives tier 4's exact-match comparison — both PACKAGE facts. A

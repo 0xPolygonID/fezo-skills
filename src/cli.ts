@@ -36,7 +36,7 @@ import { dirname, join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
-import { newAjv } from './engine/ajv-instance.js';
+import { newSchemaCompiler } from './engine/ajv-instance.js';
 import type { ToolCandidate } from './engine/catalog.js';
 import { CatalogFetchError, fetchCatalog } from './engine/catalog.js';
 import { bindArgs } from './engine/bindings.js';
@@ -279,11 +279,11 @@ function unresolvedToolReport(tool: string): RunReport {
 // than relying on `compileSchema`'s own `{type:'object'}` fallback.
 // ---------------------------------------------------------------------------
 
-const probeAjv = newAjv();
+const probeCompiler = newSchemaCompiler();
 
 function schemaCompiles(schema: object | boolean): boolean {
   try {
-    probeAjv.compile(schema);
+    probeCompiler.compile(schema);
     return true;
   } catch {
     return false;

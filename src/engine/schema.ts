@@ -5,16 +5,15 @@
 // This module deliberately mirrors the reference MCP server's own AJV setup
 // rather than inventing new behavior: a permissive fallback on compile
 // failure, because a backend publishing a malformed schema must never make
-// its own tool uncallable. How the AJV instance itself is configured — and
-// why the choice of entry point is load-bearing — lives in
+// its own tool uncallable. How schemas reach an AJV instance at all — which
+// build reads which dialect, and why that routing is load-bearing — lives in
 // `ajv-instance.ts`. Task 8 decides
 // *where* validation runs (before `bindArgs`, alongside it, or not at all for
 // a given call path); this module only compiles schemas and reports results.
 
-import { Ajv2020 } from 'ajv/dist/2020.js';
 import type { ValidateFunction } from 'ajv';
 
-import { newAjv } from './ajv-instance.js';
+import { newSchemaCompiler } from './ajv-instance.js';
 
 // ---------------------------------------------------------------------------
 // Compilation.
@@ -28,7 +27,7 @@ import { newAjv } from './ajv-instance.js';
  */
 export const PERMISSIVE_SCHEMA: object = { type: 'object' };
 
-const ajv: Ajv2020 = newAjv();
+const ajv = newSchemaCompiler();
 
 /**
  * Emits a diagnostic to stderr, matching the convention every other engine
