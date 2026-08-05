@@ -1,7 +1,8 @@
 // Contract tests for the generated `skills/fezo/SKILL.md` and the two
 // artifacts its packaging story depends on: `dist/fezoctl.mjs` (the
 // committed, deterministic bundle) and `skills/fezo/scripts/fezoctl.mjs`
-// (the gitignored, pack/build-time copy of the same bundle).
+// (a committed, byte-identical copy of it that makes the skill directory
+// self-contained).
 //
 // Per this project's test-hygiene rule ("a test that merely re-reads a
 // generated file it also generated proves nothing"): frontmatter field
@@ -17,7 +18,7 @@
 // build/bundle.mjs`, which rewrites dist/fezoctl.mjs in place, so the suite DID
 // overwrite the committed artifact and the freshness assertion above was
 // non-vacuous only by accident of describe ordering. Both now go through
-// `withCommittedDistPreserved` or build to a scratch path — see that helper.
+// `withCommittedBundlesPreserved` or build to a scratch path — see that helper.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -69,15 +70,25 @@ function packageVersion(): string {
 // COMMITTED file. If any test in the suite rebuilt dist/ in place, that
 // assertion would silently become "a fresh build matches a fresh build" —
 // vacuous — depending only on which describe happened to run first.
+//
+// `skills/fezo/scripts/fezoctl.mjs` is committed too, and several tests below
+// overwrite it, so it gets the same treatment: the suite must leave BOTH
+// tracked artifacts byte-for-byte as it found them, or a passing local run
+// still dirties the working tree.
 // ---------------------------------------------------------------------------
-function withCommittedDistPreserved<T>(fn: () => T): T {
-  const original = readFileSync(distBundlePath);
-  const originalMode = statSync(distBundlePath).mode & 0o777;
+function withCommittedBundlesPreserved<T>(fn: () => T): T {
+  const snapshots = [distBundlePath, skillScriptPath].map((path) => ({
+    path,
+    bytes: readFileSync(path),
+    mode: statSync(path).mode & 0o777,
+  }));
   try {
     return fn();
   } finally {
-    writeFileSync(distBundlePath, original);
-    chmodSync(distBundlePath, originalMode);
+    for (const { path, bytes, mode } of snapshots) {
+      writeFileSync(path, bytes);
+      chmodSync(path, mode);
+    }
   }
 }
 
@@ -445,14 +456,19 @@ function buildBundleTo(outPath: string): void {
 }
 
 /**
- * Installs a freshly built bundle as the gitignored pack/build-time copy at
- * `skills/fezo/scripts/fezoctl.mjs`, mirroring `copyIntoSkill` in
- * build/bundle.mjs — including its `mkdirSync`, which is the part that matters
- * here. Git tracks files, not directories, and every file in that directory is
- * gitignored, so a FRESH CLONE has no `skills/fezo/scripts/` at all: a bare
- * `copyFileSync` into it fails with ENOENT. That failure is invisible on any
- * machine where `pnpm bundle` has ever run and shows up only in CI, so the
- * mkdir belongs in one helper rather than at each call site.
+ * Overwrites the committed skill-local copy at
+ * `skills/fezo/scripts/fezoctl.mjs` with a freshly built bundle, mirroring
+ * `copyIntoSkill` in build/bundle.mjs.
+ *
+ * The `mkdirSync` is retained deliberately even though the directory is now
+ * tracked and therefore present in a fresh clone: it mirrors production, and
+ * it keeps the helper working in a tree where the copy was removed by hand.
+ *
+ * Callers MUST wrap this in `withCommittedBundlesPreserved` — this writes to a
+ * tracked file, and although the build is deterministic (so the bytes should
+ * come back identical), relying on that to keep the working tree clean makes
+ * every determinism regression show up as a mysterious dirty file instead of
+ * as the reproducibility test failing.
  */
 function installSkillLocalCopy(from: string): void {
   mkdirSync(dirname(skillScriptPath), { recursive: true });
@@ -549,71 +565,105 @@ describe("dist/fezoctl.mjs entry-point footer handles main()'s promise", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The skill-local bundle copy: gitignored in the working tree, but must
-// exist in an actual npm-published tarball. Chains carry-forward #1 and #6.
+// The skill-local bundle copy: COMMITTED, and must also exist in an actual
+// npm-published tarball. Chains carry-forward #1 and #6.
+//
+// Committing it is what makes the skill directory self-contained for
+// installers that copy `skills/<name>/` and nothing else (`npx skills add`,
+// a plain `cp -R`, a `.skill` archive). Those land the skill somewhere like
+// `~/.agents/skills/fezo`, where tier 3 of the invocation ladder
+// (`$SKILL_DIR/../../dist/fezoctl.mjs`) cannot resolve — tier 2 is the only
+// rung left, and it reads exactly this file. If it is ever gitignored again,
+// every such install ships a SKILL.md with no engine behind it, so both
+// tracked-ness assertions below are load-bearing, not bookkeeping.
 // ---------------------------------------------------------------------------
 
+/** True when git ignores `path`. `git check-ignore` exits 1 (making
+ * `execFileSync` throw) when the path is NOT ignored, so the exit code is the
+ * whole answer. */
+function isGitIgnored(path: string): boolean {
+  try {
+    execFileSync('git', ['check-ignore', path], { cwd: repoRoot, encoding: 'utf8' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 describe('skills/fezo/scripts/fezoctl.mjs packaging', () => {
-  it('is gitignored (git check-ignore matches it)', () => {
-    // `execFileSync` throws on a non-zero exit; git check-ignore exits 1
-    // when a path is NOT ignored, so a throw here would itself be the
-    // failure signal. We still assert on stdout for a clear message.
-    const stdout = execFileSync('git', ['check-ignore', skillScriptPath], { cwd: repoRoot, encoding: 'utf8' });
-    expect(stdout.trim()).toBe(skillScriptPath);
+  it('is NOT gitignored — installers that copy the skill directory alone need it', () => {
+    expect(isGitIgnored(skillScriptPath)).toBe(false);
+  });
+
+  it('is actually tracked by git, not merely un-ignored', () => {
+    // Un-ignoring it is necessary but not sufficient: an un-ignored file that
+    // was never `git add`ed is still absent from a fresh clone and from every
+    // tarball a source installer downloads.
+    const stdout = execFileSync('git', ['ls-files', '--', skillScriptPath], { cwd: repoRoot, encoding: 'utf8' });
+    expect(stdout.trim()).not.toBe('');
   });
 
   it('dist/fezoctl.mjs is NOT gitignored (it is the deliberately committed artifact)', () => {
-    let ignored = false;
-    try {
-      execFileSync('git', ['check-ignore', distBundlePath], { cwd: repoRoot, encoding: 'utf8' });
-      ignored = true;
-    } catch {
-      ignored = false;
+    expect(isGitIgnored(distBundlePath)).toBe(false);
+  });
+
+  it('both committed bundles are marked linguist-generated -diff via .gitattributes', () => {
+    for (const path of [distBundlePath, skillScriptPath]) {
+      const stdout = execFileSync('git', ['check-attr', 'linguist-generated', 'diff', 'text', '--', path], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+      });
+      expect(stdout, path).toContain('linguist-generated: set');
+      expect(stdout, path).toContain('diff: unset');
+      // `-text` pins the blob byte-for-byte; EOL normalization would break the
+      // freshness gate's byte comparison for a non-obvious reason.
+      expect(stdout, path).toContain('text: unset');
     }
-    expect(ignored).toBe(false);
   });
 
-  it('dist/fezoctl.mjs is marked linguist-generated -diff via .gitattributes', () => {
-    const stdout = execFileSync('git', ['check-attr', 'linguist-generated', 'diff', '--', distBundlePath], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-    });
-    expect(stdout).toContain('linguist-generated: set');
-    expect(stdout).toContain('diff: unset');
+  it('the committed copy is byte-identical to the committed dist/fezoctl.mjs', () => {
+    // Reads only what is on disk — no build. This is the invariant that lets
+    // git store ONE blob for both paths, so committing the copy costs a tree
+    // entry rather than a second 300+ KB object per release.
+    const dist = readFileSync(distBundlePath);
+    const copy = readFileSync(skillScriptPath);
+    expect(copy.equals(dist)).toBe(true);
   });
 
-  it('is present in real npm pack output despite being gitignored (pack:check passes)', () => {
+  it('is present in real npm pack output (pack:check passes)', () => {
     // pack:check assumes the build already ran (see build/pack-check.mjs's own
-    // comment on why it packs with --ignore-scripts), so the gitignored
-    // skill-local copy must exist. Build to a SCRATCH path and copy explicitly
-    // into the skill directory rather than running the default `node
-    // build/bundle.mjs`, which would also rewrite the committed
-    // dist/fezoctl.mjs — see `withCommittedDistPreserved`'s comment for why no
-    // test may do that in place.
-    const scratchDir = mkdtempSync(join(tmpdir(), 'fezoctl-packcheck-'));
-    try {
-      const scratchBundle = join(scratchDir, 'fezoctl.mjs');
-      execFileSync('node', [bundlePath, '--out', scratchBundle], { cwd: repoRoot, encoding: 'utf8' });
-      installSkillLocalCopy(scratchBundle);
-    } finally {
-      rmSync(scratchDir, { recursive: true, force: true });
-    }
-    let stdout = '';
-    let stderr = '';
-    let failed = false;
-    try {
-      stdout = execFileSync('node', [join(repoRoot, 'build', 'pack-check.mjs')], { cwd: repoRoot, encoding: 'utf8' });
-    } catch (error) {
-      failed = true;
-      if (error !== null && typeof error === 'object') {
-        const stdoutProp = Reflect.get(error, 'stdout');
-        const stderrProp = Reflect.get(error, 'stderr');
-        if (typeof stdoutProp === 'string') stdout = stdoutProp;
-        if (typeof stderrProp === 'string') stderr = stderrProp;
+    // comment on why it packs with --ignore-scripts), so a freshly built
+    // skill-local copy must be in place. Build to a SCRATCH path and copy
+    // explicitly rather than running the default `node build/bundle.mjs`,
+    // which would also rewrite the committed dist/fezoctl.mjs — see
+    // `withCommittedBundlesPreserved`'s comment for why no test may do that in
+    // place.
+    withCommittedBundlesPreserved(() => {
+      const scratchDir = mkdtempSync(join(tmpdir(), 'fezoctl-packcheck-'));
+      try {
+        const scratchBundle = join(scratchDir, 'fezoctl.mjs');
+        execFileSync('node', [bundlePath, '--out', scratchBundle], { cwd: repoRoot, encoding: 'utf8' });
+        installSkillLocalCopy(scratchBundle);
+      } finally {
+        rmSync(scratchDir, { recursive: true, force: true });
       }
-    }
-    expect(failed, `pack:check failed; stdout=${stdout} stderr=${stderr}`).toBe(false);
-    expect(stdout).toContain('skills/fezo/scripts/fezoctl.mjs present');
+      let stdout = '';
+      let stderr = '';
+      let failed = false;
+      try {
+        stdout = execFileSync('node', [join(repoRoot, 'build', 'pack-check.mjs')], { cwd: repoRoot, encoding: 'utf8' });
+      } catch (error) {
+        failed = true;
+        if (error !== null && typeof error === 'object') {
+          const stdoutProp = Reflect.get(error, 'stdout');
+          const stderrProp = Reflect.get(error, 'stderr');
+          if (typeof stdoutProp === 'string') stdout = stdoutProp;
+          if (typeof stderrProp === 'string') stderr = stderrProp;
+        }
+      }
+      expect(failed, `pack:check failed; stdout=${stdout} stderr=${stderr}`).toBe(false);
+      expect(stdout).toContain('skills/fezo/scripts/fezoctl.mjs present');
+    });
   });
 });
 
@@ -621,10 +671,10 @@ describe('skill-local bundle copy is byte-identical to dist/fezoctl.mjs after a 
   it('matches after `node build/bundle.mjs` (the pack/build copy step)', () => {
     // The property under test is specifically that the DEFAULT invocation
     // performs the copy step, so this must run `node build/bundle.mjs` with no
-    // `--out` — which writes dist/fezoctl.mjs. The guard restores the committed
-    // bytes and mode afterwards so the suite leaves the tracked artifact
+    // `--out` — which writes both committed bundles. The guard restores their
+    // bytes and modes afterwards so the suite leaves the tracked artifacts
     // untouched regardless of describe ordering.
-    withCommittedDistPreserved(() => {
+    withCommittedBundlesPreserved(() => {
       execFileSync('node', [bundlePath], { cwd: repoRoot, encoding: 'utf8' });
       const dist = readFileSync(distBundlePath);
       const copy = readFileSync(skillScriptPath);
@@ -645,19 +695,21 @@ describe('skill-local bundle copy is byte-identical to dist/fezoctl.mjs after a 
 
 describe('skills/fezo/scripts/fezoctl.mjs reports its own version', () => {
   it("--version prints `fezoctl <package.json version>` from the skill-local copy", () => {
-    const scratchDir = mkdtempSync(join(tmpdir(), 'fezoctl-skillver-'));
-    try {
-      // Same scratch-build-then-copy discipline as the pack:check test: never
-      // rebuild the committed dist/ in place.
-      const scratchBundle = join(scratchDir, 'fezoctl.mjs');
-      execFileSync('node', [bundlePath, '--out', scratchBundle], { cwd: repoRoot, encoding: 'utf8' });
-      installSkillLocalCopy(scratchBundle);
-    } finally {
-      rmSync(scratchDir, { recursive: true, force: true });
-    }
+    withCommittedBundlesPreserved(() => {
+      const scratchDir = mkdtempSync(join(tmpdir(), 'fezoctl-skillver-'));
+      try {
+        // Same scratch-build-then-copy discipline as the pack:check test:
+        // never rebuild a committed bundle in place.
+        const scratchBundle = join(scratchDir, 'fezoctl.mjs');
+        execFileSync('node', [bundlePath, '--out', scratchBundle], { cwd: repoRoot, encoding: 'utf8' });
+        installSkillLocalCopy(scratchBundle);
+      } finally {
+        rmSync(scratchDir, { recursive: true, force: true });
+      }
 
-    const stdout = execFileSync('node', [skillScriptPath, '--version'], { encoding: 'utf8' });
-    expect(stdout.trim()).toBe(`fezoctl ${packageVersion()}`);
+      const stdout = execFileSync('node', [skillScriptPath, '--version'], { encoding: 'utf8' });
+      expect(stdout.trim()).toBe(`fezoctl ${packageVersion()}`);
+    });
   });
 
   it('the skill directory is self-sufficient: --version works with no package.json anywhere above it', () => {

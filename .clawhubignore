@@ -1,0 +1,49 @@
+# ClawHub/OpenClaw packaging exclusions for repository-root scans.
+#
+# Hermes and ClawHub scan the WHOLE repository when installing from a Git
+# source, not just `skills/`. Everything listed here is either dev tooling or
+# host metadata that has no business in an installed skill — and, because these
+# scans include a security review of what is being installed, keeping the
+# surface to the actual runtime skill is what makes that review meaningful.
+#
+# The runtime skill is `skills/fezo/` and nothing else: SKILL.md plus the
+# committed engine at `skills/fezo/scripts/fezoctl.mjs`. Do NOT exclude that
+# bundle — it IS the engine (tier 2 of the invocation ladder), and without it an
+# installed skill resolves no fezoctl at all.
+#
+# Mirrors `.skillignore`; keep the two in sync.
+
+# VCS, local envs, caches, and generated outputs
+.git/
+node_modules/
+coverage/
+*.log
+.DS_Store
+
+# TypeScript source and its build tooling. `dist/fezoctl.mjs` is the build
+# output, not a runtime dependency of the installed skill: the skill directory
+# carries its own copy, and tier 3 (which reads dist/) only ever resolves in a
+# source checkout.
+src/
+tests/
+build/
+dist/
+tsconfig.json
+vitest.config.ts
+package.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
+
+# Repo automation and host-specific package metadata. Each host reads only its
+# own manifest; shipping the other hosts' manifests into a scan is noise.
+.github/
+.agents/
+.claude-plugin/
+.codex-plugin/
+.grok-plugin/
+gemini-extension.json
+
+# Non-runtime docs. CONFIGURATION.md is deliberately NOT excluded: SKILL.md
+# points the user at it for the credential setup they must do before the skill
+# can make a single call.
+README.md

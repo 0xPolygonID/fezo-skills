@@ -1,7 +1,7 @@
 # Configuration
 
 This document covers everything about how `fezoctl` finds and stores your
-Fezo/Zug gateway URL and API key. For everything else (commands, HTTP
+Fezo gateway URL and API key. For everything else (commands, HTTP
 binding, retry behavior, the `--json` error contract), see
 [README.md](README.md).
 
@@ -53,55 +53,38 @@ boilerplate. Concretely:
   call the gateway; nothing else is allowed to read that field.
 - `fezoctl` never logs an `Authorization` header.
 
-## Canonical environment variables
+## Environment variables
 
 | Variable | Purpose |
 | --- | --- |
 | `FEZO_URL` | The gateway's base URL. |
 | `FEZO_API_KEY` | Your gateway API key. |
 
-## Deprecated aliases
-
-| Variable | Replaces | Behavior |
-| --- | --- | --- |
-| `ZUG_URL` | `FEZO_URL` | Accepted, with **one warning** printed to stderr per process the first time it's used. |
-| `ZUG_API_KEY` | `FEZO_API_KEY` | Same. |
-
-The gateway itself is not being renamed, so these aliases are a real,
-supported compatibility path — not a stub scheduled for deletion. Verified
-warning (each alias warns exactly once, even across multiple commands in the
-same process):
-
-```
-$ ZUG_URL=https://gateway.example.com ZUG_API_KEY=... fezoctl doctor
-fezoctl: ZUG_URL is deprecated; use FEZO_URL instead
-fezoctl: ZUG_API_KEY is deprecated; use FEZO_API_KEY instead
-doctor:
-  ...
-```
+These are the only two environment variables `fezoctl` reads for
+credentials — there are no aliases. Any other name is ignored silently, so if
+a credential is not taking effect, check the spelling of the variable before
+anything else; `fezoctl doctor` reports what actually resolved.
 
 ## Resolution order
 
 `FEZO_URL` and `FEZO_API_KEY` are each resolved independently through the
-same four sources, in this priority order, stopping at the first one with a
+same three sources, in this priority order, stopping at the first one with a
 non-empty value:
 
-1. The canonical environment variable (`FEZO_URL` / `FEZO_API_KEY`).
-2. The deprecated alias (`ZUG_URL` / `ZUG_API_KEY`), with the one-time warning
-   above.
-3. macOS Keychain (see below). This step is always **attempted**, never
+1. The environment variable (`FEZO_URL` / `FEZO_API_KEY`).
+2. macOS Keychain (see below). This step is always **attempted**, never
    conditionally skipped: `fezoctl`'s entry point always injects its
    `/usr/bin/security`-backed Keychain runner (`src/cli.ts`'s `main()`), so
-   every resolution that gets past the two env sources shells out to
+   every resolution that gets past the environment shells out to
    `security find-generic-password`. On a platform with no `/usr/bin/security`
    that lookup just fails, and resolution falls through to the `.env` file —
    the outcome is the same as skipping it, but the mechanism is a failed
    lookup, not an absent runner.
-4. The `.env` config file (see below).
+3. The `.env` config file (see below).
 
-`fezoctl doctor` reports which source won for each value (`env`,
-`deprecated-env`, `keychain`, or `dotenv`) — run it if you're not sure which
-credential is actually in effect. Each `ok` credential check also prints a
+`fezoctl doctor` reports which source won for each value (`env`, `keychain`,
+or `dotenv`) — run it if you're not sure which credential is actually in
+effect. Each `ok` credential check also prints a
 pretty-printed `details` block: the URL in full, the API key **masked**.
 Verified (against a local test gateway, hence the `localhost` URL; the
 `details` JSON's continuation lines are not re-indented, which is what the

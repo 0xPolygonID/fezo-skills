@@ -2,16 +2,19 @@
 // body binding carries one, an `HttpBodyMediaType.schema`) into a reusable
 // AJV validator and renders its errors for display.
 //
-// This module deliberately mirrors the reference MCP server
-// (zug/mcp-server/src/ajv.ts) rather than inventing new behavior: `strict:
-// false`, because backend schemas carry keys AJV's strict mode rejects, and a
-// permissive fallback on compile failure, because a backend publishing a
-// malformed schema must never make its own tool uncallable. Task 8 decides
+// This module deliberately mirrors the reference MCP server's own AJV setup
+// rather than inventing new behavior: a permissive fallback on compile
+// failure, because a backend publishing a malformed schema must never make
+// its own tool uncallable. How the AJV instance itself is configured — and
+// why the choice of entry point is load-bearing — lives in
+// `ajv-instance.ts`. Task 8 decides
 // *where* validation runs (before `bindArgs`, alongside it, or not at all for
 // a given call path); this module only compiles schemas and reports results.
 
-import { Ajv } from 'ajv';
+import { Ajv2020 } from 'ajv/dist/2020.js';
 import type { ValidateFunction } from 'ajv';
+
+import { newAjv } from './ajv-instance.js';
 
 // ---------------------------------------------------------------------------
 // Compilation.
@@ -25,7 +28,7 @@ import type { ValidateFunction } from 'ajv';
  */
 export const PERMISSIVE_SCHEMA: object = { type: 'object' };
 
-const ajv = new Ajv({ allErrors: true, strict: false });
+const ajv: Ajv2020 = newAjv();
 
 /**
  * Emits a diagnostic to stderr, matching the convention every other engine
@@ -51,8 +54,7 @@ function errorDetail(err: unknown): string {
  *
  * On compile failure, warns on stderr and returns a validator compiled from
  * `PERMISSIVE_SCHEMA` instead, so one backend's bad schema cannot make its own
- * tool uncallable — matching the Zug MCP server's behavior
- * (mcp-server/src/ajv.ts).
+ * tool uncallable — matching the reference MCP server's behavior.
  */
 export function compileSchema(schema: object | boolean): ValidateFunction {
   try {

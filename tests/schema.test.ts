@@ -1,4 +1,6 @@
-import { Ajv } from 'ajv';
+// The 2020-12 build, matching `src/engine/ajv-instance.ts` — spying on the
+// draft-07 `Ajv.prototype` would no longer intercept the instance under test.
+import { Ajv2020 } from 'ajv/dist/2020.js';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -172,7 +174,7 @@ describe('compileSchema — boolean media-type schemas', () => {
 
 describe('SchemaValidatorCache', () => {
   it('reuses a compiled validator across multiple validate calls without recompiling', () => {
-    const compileSpy = vi.spyOn(Ajv.prototype, 'compile');
+    const compileSpy = vi.spyOn(Ajv2020.prototype, 'compile');
     try {
       const cache = new SchemaValidatorCache();
       const schema = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] };
@@ -272,5 +274,83 @@ describe('compileSchema / validateArgs — a null argument against a real object
       expect.unreachable('expected validation to fail for a null argument against an object schema');
     }
     expect(result.errorText).toBe('(root) must be object');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Declared `$schema` dialects.
+//
+// Regression guard. Every method in the live gateway catalog declares
+// `"$schema": "https://json-schema.org/draft/2020-12/schema"`, and every
+// fixture above declares no `$schema` at all -- so the whole suite passed
+// while `compileSchema` was built on AJV's draft-07 entry point, where a
+// 2020-12 declaration throws `no schema with key or ref "..."` and every
+// catalog schema silently degraded to PERMISSIVE_SCHEMA. A fixture WITHOUT a
+// `$schema` key cannot catch that; these declare one on purpose.
+// ---------------------------------------------------------------------------
+
+const DIALECTS: ReadonlyArray<readonly [string, string]> = [
+  ['2020-12', 'https://json-schema.org/draft/2020-12/schema'],
+  ['draft-07', 'http://json-schema.org/draft-07/schema#'],
+];
+
+describe('compileSchema — schemas that declare a $schema dialect', () => {
+  for (const [label, dialect] of DIALECTS) {
+    it(`compiles a ${label} schema for real: no fallback warning, and constraints are enforced`, () => {
+      const schema = {
+        $schema: dialect,
+        type: 'object',
+        properties: { q: { type: 'string' }, count: { type: 'integer' } },
+        required: ['q'],
+      };
+
+      const stderr = captureStderr(() => {
+        const validate = compileSchema(schema);
+
+        // The load-bearing assertion: a missing required property is caught
+        // locally. Under PERMISSIVE_SCHEMA (`{type:'object'}`) this object is
+        // valid, so this is exactly what the degradation let through.
+        const missing = validateArgs(validate, { count: 2 });
+        expect(missing.valid).toBe(false);
+        if (missing.valid) expect.unreachable('expected the missing required property to be rejected');
+        expect(missing.errorText).toBe("(root) must have required property 'q'");
+
+        expect(validateArgs(validate, { q: 'zk rollups', count: 2 })).toEqual({ valid: true });
+        expect(validateArgs(validate, { q: 42 }).valid).toBe(false);
+      });
+
+      // The permissive fallback announces itself on stderr. Silence here is
+      // the proof that the real validator -- not the fallback -- ran above.
+      expect(stderr).toBe('');
+    });
+  }
+
+  it('validates identically across two independent caches, whichever compiles first', () => {
+    // `cli.ts` and `retry.ts` each construct their own SchemaValidatorCache
+    // over the shared AJV instance. A failed compile still registers the
+    // schema as a side effect, so a second compile of the SAME object used to
+    // succeed where the first threw: the first cache to touch a schema got
+    // PERMISSIVE_SCHEMA, the second got a real validator, and the same
+    // arguments then validated differently depending on which layer looked
+    // first. Both caches must agree.
+    const schema = {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      properties: { q: { type: 'string' } },
+      required: ['q'],
+    };
+
+    const stderr = captureStderr(() => {
+      const first = new SchemaValidatorCache();
+      const second = new SchemaValidatorCache();
+      const args = { count: 2 };
+
+      const viaFirst = validateArgs(first.get(schema), args);
+      const viaSecond = validateArgs(second.get(schema), args);
+
+      expect(viaFirst).toEqual(viaSecond);
+      expect(viaFirst.valid).toBe(false);
+    });
+    expect(stderr).toBe('');
   });
 });

@@ -52,10 +52,23 @@ function readPackageVersion() {
 
 export const SKILL_VERSION = readPackageVersion();
 
+/**
+ * The skill's `description` — the single string every host reads to decide
+ * when to trigger the skill.
+ *
+ * Exported because `build/gen-manifests.mjs` puts the same text into the
+ * per-host plugin manifests (`.claude-plugin/`, `.codex-plugin/`, …). A second
+ * hand-maintained copy over there would drift from this one exactly the way
+ * `SKILL_VERSION` once drifted from `package.json` — same failure, different
+ * field — so there is one definition and the manifests import it.
+ */
+export const SKILL_DESCRIPTION =
+  'Discover and call Fezo gateway tools from the live catalog. Use when a task needs external capabilities such as web search, news, scraping, market data, social data, product data, or another API-backed service; search the catalog, inspect the schema, call the best provider, and retry another provider when the first fails or returns unsuitable content.';
+
 const FRONTMATTER = `---
 name: ${SKILL_NAME}
 version: "${SKILL_VERSION}"
-description: Discover and call Fezo gateway tools from the live catalog. Use when a task needs external capabilities such as web search, news, scraping, market data, social data, product data, or another API-backed service; search the catalog, inspect the schema, call the best provider, and retry another provider when the first fails or returns unsuitable content.
+description: ${SKILL_DESCRIPTION}
 argument-hint: "<external capability or task>"
 allowed-tools: Bash, Read, AskUserQuestion
 user-invocable: true

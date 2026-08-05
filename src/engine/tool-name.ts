@@ -1,7 +1,7 @@
-// MCP-compatible tool-name algorithm. Ported verbatim from
-// zug/mcp-server/src/tool_name.ts and zug/mcp-server/src/const.ts so tool
-// names fezoctl derives here match the ones the existing MCP server would
-// derive from the same catalog.
+// MCP-compatible tool-name algorithm. Ported verbatim from the gateway's own
+// MCP server (its tool-name module and the constants that module reads) so
+// tool names fezoctl derives here match the ones that server would derive from
+// the same catalog.
 
 import { createHash } from 'node:crypto';
 

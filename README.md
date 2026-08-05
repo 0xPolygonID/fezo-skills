@@ -1,7 +1,7 @@
 # fezo-skills
 
 `fezo-skills` is an agent skill (`fezo`) backed by a small, dependency-free
-TypeScript CLI (`fezoctl`). The skill discovers and calls Fezo/Zug API gateway
+TypeScript CLI (`fezoctl`). The skill discovers and calls Fezo API gateway
 tools by reading the gateway's live catalog (`GET /v1/catalog`) at run time,
 instead of shipping a hand-maintained, per-backend method roster.
 
@@ -24,25 +24,150 @@ builds its candidate list from that response alone. See
 - Node.js >= 22.12 (pinned in `package.json`'s `engines`; `SKILL.md`'s
   `compatibility` field says "node >=22" — treat the `package.json` value as
   authoritative).
-- bash or zsh, and network access to your Fezo/Zug gateway.
+- bash or zsh, and network access to your Fezo gateway.
 - [pnpm](https://pnpm.io/) — only if you are developing this repository, not
   to use the CLI.
 
 ## Installation
 
-There is no published npm package yet — see
-["Known gaps"](#known-gaps) below. Until `fezo-skills` is published, install
-one of these ways:
+Each host has a first-class lane; `npx skills add` is the cross-host fallback
+that covers everything else.
 
-- **Use the skill from a checkout of this repository.** Point your agent at
-  `skills/fezo/SKILL.md` in a clone of this repo. The skill resolves
-  `fezoctl` itself (see the invocation ladder below); you do not need to
-  install anything separately.
+| Surface | Install |
+| --------- | --------- |
+| **Claude Code** (recommended) | `/plugin marketplace add 0xPolygonID/fezo-skills` |
+| **Grok** (xAI Build CLI) | `grok plugin marketplace add 0xPolygonID/fezo-skills`, then `grok plugin install fezo` |
+| **Gemini CLI** | `gemini extensions install https://github.com/0xPolygonID/fezo-skills` |
+| **Codex** | `npx skills add 0xPolygonID/fezo-skills -g -a codex` — step-by-step install and test guide in [`CODEX.md`](CODEX.md) |
+| **Cursor, Copilot, and 70+ other hosts** | `npx skills add 0xPolygonID/fezo-skills -g` |
+| **OpenClaw** | `openclaw skills install git:0xPolygonID/fezo-skills@main` |
+| **Hermes** | copy `skills/fezo/` into `~/.hermes/skills/` |
+| **claude.ai / Cowork** (web) | zip `skills/fezo/` and upload — see [caveats](#claude-cowork--claudeai) |
+
+Every lane installs the same skill directory and the same engine; they differ
+only in who discovers the manifest. The manifests are generated — see
+["Per-host manifests"](#per-host-manifests).
+
+Whichever lane you use, credentials are a separate one-time step: see
+["Credentials"](#credentials-once-per-machine) below.
+
+### Cross-host: `npx skills add`
+
+```bash
+npx skills add 0xPolygonID/fezo-skills -g
+```
+
+[`skills`](https://github.com/vercel-labs/skills) reads `skills/fezo/` out of
+this repository and installs it into every coding agent it detects on your
+machine — Claude Code, Codex, Cursor, OpenClaw, and others — with the
+canonical copy at `~/.agents/skills/fezo` and each agent's own skills
+directory symlinked to it. Drop `-g` to install into the current project
+instead, and add `-a claude-code` (repeatable) to target specific agents.
+
+This works because the skill directory is **self-contained**: it carries its
+own engine at `skills/fezo/scripts/fezoctl.mjs`, a committed copy of
+`dist/fezoctl.mjs`. Installers of this kind copy the skill directory and
+nothing else, so tier 3 of the [invocation ladder](#the-invocation-ladder)
+cannot resolve at the install target and tier 2 is what serves them.
+
+### Credentials: once per machine
+
+No install lane configures credentials. `skills add` and the plugin
+marketplaces copy files and run no install hooks, deliberately — so do this
+once, yourself, after installing by any route (see
+[`CONFIGURATION.md`](CONFIGURATION.md) for the full story):
+
+```bash
+printf '%s' "$YOUR_FEZO_API_KEY" | node ~/.agents/skills/fezo/scripts/fezoctl.mjs \
+  setup --key-stdin --url https://your-gateway.example.com
+node ~/.agents/skills/fezo/scripts/fezoctl.mjs doctor
+```
+
+Credentials live outside the skill directory (`~/.config/fezo/.env` at mode
+0600, the macOS Keychain, or the environment), so **every host on the machine
+shares one setup** — installing a second lane does not mean configuring again.
+
+Two exceptions worth knowing:
+
+- **Gemini CLI** takes `FEZO_URL` and `FEZO_API_KEY` as extension settings and
+  injects them as environment variables, which is the highest-priority source
+  in the resolution chain. That lane needs no `setup` run.
+- **claude.ai / Cowork** has no persistent home directory and no way to inject
+  environment variables — see the caveats below.
+
+Node.js >= 22.12 and network access to your gateway must be available to
+whatever agent runs the skill; `doctor` is the check for both, and it reports
+which source each credential resolved from.
+
+### Per-host manifests
+
+The plugin lanes in the table above are driven by manifests at the repository
+root, all **generated** by `pnpm gen-manifests`:
+
+| File | Lane |
+| ------ | ------ |
+| `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` | Claude Code |
+| `.codex-plugin/plugin.json` | Codex |
+| `.grok-plugin/plugin.json`, `.grok-plugin/marketplace.json` | Grok / xAI Build CLI |
+| `.agents/plugins/marketplace.json` | cross-host `.agents` marketplace |
+| `gemini-extension.json` | Gemini CLI |
+| `.skillignore`, `.clawhubignore` | Hermes / ClawHub root-scan exclusions |
+
+**Do not hand-edit the generated files.** Every value in them — version,
+description, URLs, license — is derived from `package.json` and
+`build/gen-skill.mjs`, so a manual edit is reverted by the next
+`pnpm gen-manifests` and fails CI's manifest-freshness gate in the meantime.
+They are generated precisely because seven copies of the version number is
+seven ways to publish a release that was never cut.
+
+`.claude-plugin/marketplace.json` earns its keep twice: Claude Code installs
+from it, and the `skills` CLI also discovers skills declared in it, so the two
+lanes share one file. The skill is deduplicated by name, so it is not
+double-listed.
+
+### Other ways
+
+There is no published npm package yet — see ["Known gaps"](#known-gaps).
+
+- **Copy or symlink the skill directory.** `cp -R skills/fezo
+  ~/.claude/skills/fezo` (or `~/.agents/skills/`, `~/.hermes/skills/`,
+  `~/.openclaw/skills/`, …). A symlink to a checkout works too, and keeps the
+  skill updated by `git pull`.
+- **Use the skill straight from a checkout.** Point your agent at
+  `skills/fezo/SKILL.md` in a clone. Tier 2 resolves the engine; tier 3 is the
+  same bundle one directory up.
 - **Run the committed bundle directly.** `dist/fezoctl.mjs` is a
   self-contained, deterministic build committed to this repository — clone it
   and run `node dist/fezoctl.mjs <command>`.
 - **Build from source.** `pnpm install && pnpm bundle` produces
-  `dist/fezoctl.mjs` from `src/cli.ts`.
+  `dist/fezoctl.mjs` from `src/cli.ts` and refreshes the skill-local copy.
+
+### Claude Cowork / claude.ai
+
+```bash
+cd skills && zip -r fezo.zip fezo
+```
+
+Upload via **Customize → Skills → + → Create skill → Upload a skill**, and
+enable *Code execution and file creation* under Capabilities. Tier 2 of the
+ladder resolves, because the engine rides inside the zip.
+
+Expect friction here, and verify before relying on it. Three things must hold
+in that container, and none is under your control:
+
+1. **Node.js >= 22.12** — the container's version is not documented.
+2. **Network egress to your gateway** — the sandbox restricts outbound
+   connections, so an arbitrary gateway host is normally unreachable unless it
+   has been allowlisted.
+3. **Credentials** — there is no way to inject `FEZO_API_KEY` into that
+   container, and `~/.config/fezo/.env` does not persist between sessions, so
+   `setup` has to be re-run each session. That means the key passes through the
+   conversation, which is exactly what `--key-stdin` exists to avoid
+   everywhere else.
+
+Run `doctor` first; it names which of the three failed. Until egress and a
+credential path are settled, treat this lane as unsupported rather than
+broken-in-an-interesting-way.
 
 ### The invocation ladder
 
@@ -52,12 +177,15 @@ command in that skill session is invoked through the result
 (`"${FEZOCTL_ARGV[@]}"`), never as a bare `fezoctl`:
 
 1. `$FEZOCTL`, if it names an executable file.
-2. `<skill dir>/scripts/fezoctl.mjs` — the bundle copied in at pack/build
-   time — invoked as `node <path>`, not relied on to be executable (a
+2. `<skill dir>/scripts/fezoctl.mjs` — the bundle committed inside the skill
+   directory — invoked as `node <path>`, not relied on to be executable (a
    `.skill` archive or plain file copy may not preserve the executable bit).
+   **This is the rung that serves installed skills**, wherever they came from:
+   `npx skills add`, a `cp -R`, an archive.
 3. `<skill dir>/../../dist/fezoctl.mjs` — this repo's own committed bundle,
    when the skill is used straight out of a checkout — also invoked as
-   `node <path>`.
+   `node <path>`. Only a checkout has this layout; an installed skill
+   directory does not, which is why tier 2 exists.
 4. A global `fezoctl` on `PATH`, but **only** if `fezoctl --version` matches
    `SKILL_VERSION` **exactly**. `fezoctl --version` prints `fezoctl <version>`
    (a prefixed string, not a bare version), so the ladder compares against
@@ -83,16 +211,19 @@ release number, asserted equal by CI (`tests/skill_contract.test.ts`).
 `$SKILL_VERSION` is derived from this single number and used for two things
 that are both facts about the *package*: the tier-5 `npx` pin above, and the
 tier-4 exact-match comparison against a global install's `--version` output.
-If you bump `package.json`'s `version`, you must re-run and commit **both**:
+The per-host plugin manifests carry that same number, which is why they are
+generated rather than hand-written. If you bump `package.json`'s `version`, you
+must re-run and commit **all three**:
 
 ```bash
-pnpm bundle      # rebuilds dist/fezoctl.mjs with the new version baked in
-pnpm gen-skill   # regenerates skills/fezo/SKILL.md with the new SKILL_VERSION
+pnpm bundle        # rebuilds both committed bundles with the new version baked in
+pnpm gen-skill     # regenerates skills/fezo/SKILL.md with the new SKILL_VERSION
+pnpm gen-manifests # regenerates every per-host plugin manifest
 ```
 
 Bumping the version changes `dist/fezoctl.mjs`'s bytes (the version is baked
 in via an esbuild `--define`, not read from `package.json` at run time in the
-bundled artifact), so CI's bundle-freshness gate will fail until both commands
+bundled artifact), so CI's freshness gates will fail until all three commands
 are re-run and the results committed.
 
 ## Quick start
@@ -227,9 +358,9 @@ refused all exit `2`.
 `fezoctl` reads the catalog's `http` block for each method and places your
 arguments accordingly — in the URL path, the query string, a request header,
 or the JSON body — **based on what the catalog says, not on what the HTTP
-verb implies.** This is a deliberate fix for a real bug in the existing Zug
-MCP server, which assumes GET means "all args in query" and POST means "all
-args in body." That assumption breaks down in practice: **a POST can
+verb implies.** This is a deliberate fix for a real bug in the gateway's
+existing MCP server, which assumes GET means "all args in query" and POST
+means "all args in body." That assumption breaks down in practice: **a POST can
 legitimately require query parameters.** For example, a backend's async
 scrape method may be a POST whose `http.query` binding carries an id the
 backend reads from `r.URL.Query()`, while the POST body is an entirely
@@ -569,9 +700,9 @@ $ node dist/fezoctl.mjs schema nope_tool --json
 ## Credentials
 
 See **[CONFIGURATION.md](CONFIGURATION.md)** for the full credential model:
-the four-source resolution order, the security reasoning behind
+the three-source resolution order, the security reasoning behind
 `setup --key-stdin`, macOS Keychain details, `.env` file location and
-permissions, the deprecated `ZUG_*` aliases, and **how to rotate a key** —
+permissions, and **how to rotate a key** —
 which differs between the two storage backends, because a second
 `setup --key-stdin` on the default `dotenv` storage is refused rather than
 overwriting the file.
@@ -659,6 +790,7 @@ pnpm typecheck    # or `pnpm build` — same command; tsc runs with noEmit
 pnpm test         # run the test suite
 pnpm bundle       # build dist/fezoctl.mjs and copy it into skills/fezo/scripts/
 pnpm gen-skill    # regenerate skills/fezo/SKILL.md from build/step0.md + build/invocation.sh
+pnpm gen-manifests # regenerate the per-host plugin manifests
 pnpm pack:check   # verify the artifact `npm pack` would actually publish
 ```
 
@@ -667,11 +799,15 @@ pnpm pack:check   # verify the artifact `npm pack` would actually publish
   that is what lets a Git-URL or HEAD install resolve the engine without a
   build step. CI fails if the committed file differs from a fresh
   `pnpm bundle`.
-- `skills/fezo/scripts/fezoctl.mjs` is the same bundle, copied in only at
-  pack/build time (`pnpm bundle`, or automatically via npm's `prepack`
-  lifecycle hook). It is gitignored on purpose; `.npmignore` is what keeps it
-  in the published npm tarball despite that (npm never falls back to
-  `.gitignore` once `.npmignore` exists) — see `pnpm pack:check`.
+- `skills/fezo/scripts/fezoctl.mjs` is the same bundle, written by
+  `pnpm bundle` (and automatically via npm's `prepack` lifecycle hook) and
+  **also committed**. It is what makes the skill directory self-contained for
+  installers that take `skills/fezo/` and nothing else. The two files are
+  byte-identical, so git stores one blob for both paths — committing the copy
+  costs a tree entry, not a second bundle per release. CI gates both for
+  freshness; `pnpm pack:check` separately proves the copy reaches the npm
+  tarball, which is `package.json`'s `files` allowlist and `.npmignore`'s
+  doing, not git's.
 - `skills/fezo/SKILL.md` is generated from `build/step0.md` and
   `build/invocation.sh` by `build/gen-skill.mjs`, not hand-written. If you
   need to change its wording, edit those sources and regenerate; do not hand

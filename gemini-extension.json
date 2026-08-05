@@ -1,0 +1,19 @@
+{
+  "name": "fezo-skills",
+  "version": "1.0.0",
+  "description": "Agent skill and CLI (fezoctl) for discovering and calling Fezo API gateway tools from the live catalog.",
+  "settings": [
+    {
+      "name": "Fezo Gateway URL",
+      "description": "Base URL of your Fezo API gateway (required).",
+      "envVar": "FEZO_URL",
+      "sensitive": false
+    },
+    {
+      "name": "Fezo API Key",
+      "description": "API key for your Fezo gateway (required).",
+      "envVar": "FEZO_API_KEY",
+      "sensitive": true
+    }
+  ]
+}

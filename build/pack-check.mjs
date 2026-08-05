@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 // Verifies the artifact `npm pack` would actually publish. This is the
-// carry-forward-#1 guard: `skills/fezo/scripts/fezoctl.mjs` is gitignored
-// (it is a derived, pack/build-time copy of `dist/fezoctl.mjs`) but MUST
-// still land in the npm tarball for tier-2a (`npm install`/`npx`) installs
-// to have a working engine. `.npmignore` is what makes that true — npm
-// consults `.npmignore` when present and does NOT fall back to `.gitignore`,
-// so deleting `.npmignore` as "redundant" would silently break this. This
-// script proves the current state actually behaves that way, rather than
-// trusting the comment.
+// carry-forward-#1 guard: `skills/fezo/scripts/fezoctl.mjs` (a derived copy
+// of `dist/fezoctl.mjs`) MUST land in the npm tarball for tier-2a (`npm
+// install`/`npx`) installs to have a working engine.
 //
-// Deliberately uses `npm pack`, not `pnpm pack`: the property under test is
-// specifically npm's ignore-file precedence (`.npmignore` over
-// `.gitignore`), and real end users installing via `npm install`/`npx`
-// exercise npm's packing rules, not pnpm's.
+// The file is now committed, so git tracks it — but that is not what puts it
+// in the tarball. `package.json`'s `files` allowlist is, and `.npmignore`
+// governs what is pruned from within it. This script proves the published
+// bytes are right rather than trusting either config to stay correct.
+//
+// Deliberately uses `npm pack`, not `pnpm pack`: real end users installing
+// via `npm install`/`npx` exercise npm's packing rules, not pnpm's — and
+// `.npmignore`'s precedence over `.gitignore` is an npm-specific behavior
+// that only npm's packer demonstrates.
 //
 // Usage: node build/pack-check.mjs   (also wired as `pnpm pack:check`)
 
@@ -68,8 +68,10 @@ function run() {
     execFileSync('tar', ['-xzf', tarballPath, '-C', extractRoot], { encoding: 'utf8' });
     const packageRoot = join(extractRoot, 'package');
 
-    // --- carry-forward #1: the gitignored skill-local bundle must be
-    // present in the tarball despite never being tracked by git. ---
+    // --- carry-forward #1: the skill-local bundle must be present in the
+    // tarball. It is committed (see `.gitignore`'s comment), so git tracks it
+    // too — but `files`/`.npmignore` are what put it in the TARBALL, and this
+    // asserts that separately from git's view of it. ---
     const skillScript = 'skills/fezo/scripts/fezoctl.mjs';
     if (!files.includes(skillScript)) {
       fail(`${skillScript} is missing from the npm pack file list: ${files.join(', ')}`);
@@ -79,7 +81,7 @@ function run() {
     // is only a LINK to `CONFIGURATION.md`, so shipping the first without the
     // second leaves an installed package whose entire credential story is a
     // dead relative link — and `CONFIGURATION.md` is the only place the
-    // threat model, the four-source resolution order, and the `.env` rotation
+    // threat model, the three-source resolution order, and the `.env` rotation
     // path are written down. npm force-includes `README` regardless of
     // `files`, but `CONFIGURATION.md` is there only because `package.json`'s
     // `files` names it; asserting the pair together is what makes removing it
@@ -109,7 +111,20 @@ function run() {
 
     // --- source/tooling never published (keeps the tarball to the runtime
     // artifact only; also a cheap proxy for ".npmignore still works"). ---
-    const devOnly = files.filter((f) => f.startsWith('src/') || f.startsWith('tests/') || f.startsWith('build/') || f.startsWith('.github/'));
+    // Per-host plugin manifests (`.claude-plugin/`, `.codex-plugin/`, …) are
+    // REPOSITORY metadata: each host reads them from a Git checkout of this
+    // repo, never from the npm tarball. Shipping them would put a second,
+    // silently-stale copy of the version number inside every `npm install`.
+    const hostManifestPrefixes = ['.claude-plugin/', '.codex-plugin/', '.grok-plugin/', '.agents/'];
+    const devOnly = files.filter(
+      (f) =>
+        f.startsWith('src/') ||
+        f.startsWith('tests/') ||
+        f.startsWith('build/') ||
+        f.startsWith('.github/') ||
+        f === 'gemini-extension.json' ||
+        hostManifestPrefixes.some((prefix) => f.startsWith(prefix)),
+    );
     if (devOnly.length > 0) {
       fail(`dev-only path(s) leaked into npm pack output: ${devOnly.join(', ')}`);
     }

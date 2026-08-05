@@ -9,10 +9,10 @@ import { ABORT_CODES, RETRY_CODES, classifyFailure } from '../src/engine/retry.j
 // Every case here mirrors one bullet of the governing spec's three lists
 // (abort / try-next-candidate / give-up), plus the precedence and
 // code-vs-status conflict cases the brief calls out by name. Real gateway
-// status/code PAIRINGS are used throughout (see zug/internal/gateway/proxy.go,
-// spendlimit.go, and brightdatabackend/handlers.go) rather than invented
-// combinations, so these tests double as a check that this module's tables
-// match the live gateway source.
+// status/code PAIRINGS are used throughout -- taken from the gateway's proxy
+// handler and spend-limit check, and from a backend's own error writer --
+// rather than invented combinations, so these tests double as a check that
+// this module's tables match what the gateway actually emits.
 // ---------------------------------------------------------------------------
 
 function gatewayFailure(code: string, status: number): MechanicalFailure {
@@ -167,7 +167,7 @@ describe('classifyFailure — give up', () => {
 describe('classifyFailure — code-first precedence (the central rule)', () => {
   it('a retryable code overrides a status (403) that a code-less classification would give up on', () => {
     // provider_disabled and backend_not_configured are both written with 403
-    // (zug/internal/gateway/proxy.go). A code-less 403 is not in the
+    // by the gateway's proxy handler. A code-less 403 is not in the
     // retryable-status set (only 402/429/500/502/503 are), so a classifier
     // that fell back to status here would give up. The code says retry, and
     // the code must win.
@@ -179,8 +179,8 @@ describe('classifyFailure — code-first precedence (the central rule)', () => {
   });
 
   it('an abort code overrides a status (402) that a code-less classification would retry', () => {
-    // limit_exceeded is written with 402 (zug/internal/gateway/spendlimit.go
-    // via proxy.go), and 402 IS in the retryable-status set — a code-less 402
+    // limit_exceeded is written with 402 by the gateway's spend-limit check,
+    // and 402 IS in the retryable-status set — a code-less 402
     // (e.g. quota_exceeded's own shape minus its code) advances. The code
     // says abort, and the code must win.
     const codeless402 = classifyFailure(backendFailure(402));

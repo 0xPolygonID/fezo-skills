@@ -13,7 +13,7 @@ import {
 
 // ---------------------------------------------------------------------------
 // Fixtures — small, hand-written catalog documents, not transcriptions of any
-// real gateway manifest. Shape follows zug/internal/gateway/catalog.go.
+// real gateway manifest. Shape follows the gateway's catalog document.
 // ---------------------------------------------------------------------------
 
 // `product_detail`'s http block is the full binding surface: query,
@@ -530,7 +530,7 @@ describe('methodToToolName', () => {
   });
 
   it('hashes the raw (unsanitized) name, not the sanitized one, when hash-capping', () => {
-    // MCP wire compatibility: zug/mcp-server/src/tool_name.ts truncates the
+    // MCP wire compatibility: the reference MCP server truncates the
     // *sanitized* string but hashes the *raw* one. The all-`a`/`b` case above
     // cannot see the difference (there, raw === sanitized), so this case
     // carries a character outside [a-zA-Z0-9_-] to pin the distinction.

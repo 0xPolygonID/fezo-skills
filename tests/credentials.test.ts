@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, sep } from 'node:path';
@@ -66,36 +66,21 @@ describe('resolveCredentials — precedence', () => {
       const { runner } = recordingKeychainRunner({ status: 0, stdout: 'sk-from-keychain\n', stderr: '' });
 
       const resolution = resolveCredentials({
-        env: { FEZO_API_KEY: 'sk-from-canonical-env', ZUG_API_KEY: 'sk-from-alias' },
+        env: { FEZO_API_KEY: 'sk-from-canonical-env' },
         dotEnvPath,
         keychain: runner,
-        warnedAliases: new Set(),
       });
 
       expect(resolution.apiKey).toEqual({ value: 'sk-from-canonical-env', masked: 'sk-f…', source: 'env' });
     });
   });
 
-  it('deprecated alias is used when the canonical var is absent, and its source is reported', () => {
-    const stderr = captureStderr(() => {
-      const resolution = resolveCredentials({
-        env: { ZUG_URL: 'https://alias.example.com' },
-        dotEnvPath: '/nonexistent/.env',
-        warnedAliases: new Set(),
-      });
-      expect(resolution.url).toEqual({ value: 'https://alias.example.com', masked: 'http…', source: 'deprecated-env' });
-    });
-    expect(stderr).toContain('ZUG_URL');
-    expect(stderr).toContain('FEZO_URL');
-  });
-
-  it('Keychain is used when neither the canonical nor the deprecated env var is set', () => {
+  it('Keychain is used when the env var is not set', () => {
     const { runner, calls } = recordingKeychainRunner({ status: 0, stdout: 'sk-from-keychain\n', stderr: '' });
     const resolution = resolveCredentials({
       env: {},
       dotEnvPath: '/nonexistent/.env',
       keychain: runner,
-      warnedAliases: new Set(),
     });
     expect(resolution.apiKey).toEqual({ value: 'sk-from-keychain', masked: 'sk-f…', source: 'keychain' });
     // Pin the full read argv for both lookups (url resolved first, then
@@ -116,7 +101,6 @@ describe('resolveCredentials — precedence', () => {
         env: {},
         dotEnvPath,
         keychain: runner,
-        warnedAliases: new Set(),
       });
       expect(resolution.apiKey).toEqual({ value: 'sk-from-dotenv', masked: 'sk-f…', source: 'dotenv' });
     });
@@ -130,7 +114,6 @@ describe('resolveCredentials — precedence', () => {
       const resolution = resolveCredentials({
         env: { FEZO_API_KEY: 'sk-from-env' },
         dotEnvPath,
-        warnedAliases: new Set(),
       });
       expect(resolution.apiKey).toEqual({ value: 'sk-from-env', masked: 'sk-f…', source: 'env' });
       expect(resolution.url).toEqual({ value: 'https://dotenv.example.com', masked: 'http…', source: 'dotenv' });
@@ -141,7 +124,6 @@ describe('resolveCredentials — precedence', () => {
     const resolution = resolveCredentials({
       env: {},
       dotEnvPath: '/nonexistent/.env',
-      warnedAliases: new Set(),
     });
     expect(Object.hasOwn(resolution, 'apiKey')).toBe(false);
     expect(Object.hasOwn(resolution, 'url')).toBe(false);
@@ -154,7 +136,6 @@ describe('resolveCredentials — precedence', () => {
       const resolution = resolveCredentials({
         env: { FEZO_API_KEY: '' },
         dotEnvPath,
-        warnedAliases: new Set(),
       });
       expect(resolution.apiKey).toEqual({ value: 'sk-from-dotenv', masked: 'sk-f…', source: 'dotenv' });
     });
@@ -162,65 +143,79 @@ describe('resolveCredentials — precedence', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Deprecated-alias warning: exactly once per process.
+// One accepted name per credential. `FEZO_URL`/`FEZO_API_KEY` are the only env
+// vars resolution consults; there is no alias chain behind them. This is
+// pinned as a contract rather than left implicit because the failure mode of
+// reintroducing an alias is silent: a second accepted name makes "which
+// variable is in effect" unanswerable from the environment alone, and a
+// half-configured shell would resolve a stale credential instead of reporting
+// nothing configured.
 // ---------------------------------------------------------------------------
 
-describe('resolveCredentials — deprecated alias warning', () => {
-  it('warns exactly once across multiple resolutions sharing one tracker, and names the canonical replacement', () => {
-    const warnedAliases = new Set<string>();
-    const env = { ZUG_API_KEY: 'sk-alias-secret' };
-
+describe('resolveCredentials — no env var aliases', () => {
+  it('a credential-shaped env var that is not the canonical name is not consulted', () => {
+    // Deliberately near-miss names: close enough that a resolver matching on a
+    // prefix, a list, or a fuzzy shape would pick them up, and none of them is
+    // a name resolution accepts.
     const stderr = captureStderr(() => {
-      resolveCredentials({ env, dotEnvPath: '/nonexistent/.env', warnedAliases });
-      resolveCredentials({ env, dotEnvPath: '/nonexistent/.env', warnedAliases });
-      resolveCredentials({ env, dotEnvPath: '/nonexistent/.env', warnedAliases });
+      const resolution = resolveCredentials({
+        env: {
+          FEZO_GATEWAY_URL: 'https://not-canonical.example.com',
+          FEZO_KEY: 'sk-not-canonical',
+          FEZO_APIKEY: 'sk-also-not-canonical',
+        },
+        dotEnvPath: '/nonexistent/.env',
+      });
+      expect(Object.hasOwn(resolution, 'url')).toBe(false);
+      expect(Object.hasOwn(resolution, 'apiKey')).toBe(false);
     });
-
-    const occurrences = stderr.split('ZUG_API_KEY').length - 1;
-    expect(occurrences).toBe(1);
-    expect(stderr).toContain('FEZO_API_KEY');
+    // Not merely unresolved -- silent. An env var this module does not accept
+    // is not its business to comment on, so nothing reaches stderr.
+    expect(stderr).toBe('');
   });
 
-  it('warns once for each distinct deprecated alias, independently', () => {
-    const warnedAliases = new Set<string>();
-    const env = { ZUG_URL: 'https://alias.example.com', ZUG_API_KEY: 'sk-alias-secret' };
-
-    const stderr = captureStderr(() => {
-      resolveCredentials({ env, dotEnvPath: '/nonexistent/.env', warnedAliases });
-      resolveCredentials({ env, dotEnvPath: '/nonexistent/.env', warnedAliases });
+  it('the canonical env var is still read when a near-miss name is set alongside it', () => {
+    const resolution = resolveCredentials({
+      env: { FEZO_API_KEY: 'sk-canonical', FEZO_KEY: 'sk-not-canonical' },
+      dotEnvPath: '/nonexistent/.env',
     });
-
-    expect(stderr.split('ZUG_URL').length - 1).toBe(1);
-    expect(stderr.split('ZUG_API_KEY').length - 1).toBe(1);
+    expect(resolution.apiKey).toEqual({ value: 'sk-canonical', masked: 'sk-c…', source: 'env' });
   });
 
-  it('a fresh tracker warns again, independent of a previous one', () => {
-    const env = { ZUG_API_KEY: 'sk-alias-secret' };
-    const first = captureStderr(() => {
-      resolveCredentials({ env, dotEnvPath: '/nonexistent/.env', warnedAliases: new Set() });
-    });
-    const second = captureStderr(() => {
-      resolveCredentials({ env, dotEnvPath: '/nonexistent/.env', warnedAliases: new Set() });
-    });
-    expect(first).toContain('ZUG_API_KEY');
-    expect(second).toContain('ZUG_API_KEY');
-  });
+  it('reports exactly three source strings across every resolvable path — no env-alias fourth', () => {
+    // `CredentialSource` is a union `doctor` renders verbatim, so an added
+    // member is a user-visible output change. Two resolutions are needed to
+    // observe all three: a single call resolves at most two values, so one
+    // call alone could never distinguish "three sources exist" from "the two
+    // this call happened to hit".
+    withTmpDir((dir) => {
+      const dotEnvPath = join(dir, '.env');
+      writeDotEnvFile(dotEnvPath, { FEZO_URL: 'https://dotenv.example.com' });
 
-  it('the default (no explicit tracker) warns exactly once for the lifetime of the process', async () => {
-    // Uses a fresh module instance (vi.resetModules + dynamic import) so this
-    // test's use of the real process-lifetime singleton cannot poison any
-    // other test in this file -- every other test injects its own Set.
-    vi.resetModules();
-    const mod = await import('../src/engine/credentials.js');
-    const env = { ZUG_API_KEY: 'sk-alias-secret' };
+      // Keychain misses, so the URL falls through to `.env` while the API key
+      // comes from the environment.
+      const { runner: missing } = recordingKeychainRunner(NOT_FOUND);
+      const a = resolveCredentials({
+        env: { FEZO_API_KEY: 'sk-from-env' },
+        dotEnvPath,
+        keychain: missing,
+      });
+      expect([a.url?.source, a.apiKey?.source]).toEqual(['dotenv', 'env']);
 
-    const stderr = captureStderr(() => {
-      mod.resolveCredentials({ env, dotEnvPath: '/nonexistent/.env' });
-      mod.resolveCredentials({ env, dotEnvPath: '/nonexistent/.env' });
-      mod.resolveCredentials({ env, dotEnvPath: '/nonexistent/.env' });
+      // Nothing in the environment and nothing in `.env`, so Keychain answers.
+      const { runner: hit } = recordingKeychainRunner({ status: 0, stdout: 'from-keychain\n', stderr: '' });
+      const b = resolveCredentials({
+        env: {},
+        dotEnvPath: '/nonexistent/.env',
+        keychain: hit,
+      });
+      expect([b.url?.source, b.apiKey?.source]).toEqual(['keychain', 'keychain']);
+
+      // The closed set: three strings, and no env-derived source other than
+      // `env` itself.
+      const observed = [a.url, a.apiKey, b.url, b.apiKey].map((v) => v?.source);
+      expect([...new Set(observed)].sort()).toEqual(['dotenv', 'env', 'keychain']);
     });
-
-    expect(stderr.split('ZUG_API_KEY').length - 1).toBe(1);
   });
 });
 
@@ -816,7 +811,7 @@ describe('storeCredentials — empty API key', () => {
       const stored = storeCredentials({ storage: 'dotenv', apiKey: '', dotEnvPath });
       expect(stored.apiKey.ok).toBe(false);
 
-      const resolution = resolveCredentials({ env: {}, dotEnvPath, warnedAliases: new Set() });
+      const resolution = resolveCredentials({ env: {}, dotEnvPath });
       expect(Object.hasOwn(resolution, 'apiKey')).toBe(false);
     });
   });
@@ -832,17 +827,22 @@ describe('storeCredentials — empty API key', () => {
 
 describe('no secret leakage', () => {
   it('resolveCredentials never writes the resolved secret to stderr', () => {
-    const secret = 'sk-should-never-appear-in-logs';
-    const { stderr } = captureStderrWithResult(() =>
-      resolveCredentials({
-        env: { ZUG_API_KEY: secret },
-        dotEnvPath: '/nonexistent/.env',
-        warnedAliases: new Set(),
-      }),
-    );
-    // The alias warning fires here, so this is a real check of a real line.
-    expect(stderr).toContain('ZUG_API_KEY');
-    expect(stderr).not.toContain(secret);
+    withTmpDir((dir) => {
+      const secret = 'sk-should-never-appear-in-logs';
+      // A directory where `.env` should be is the documented "announced, not
+      // swallowed" read failure (see `readDotEnvFile`), so resolution really
+      // does emit a stderr line here while holding a resolved secret. Without
+      // that, the assertion below would pass against empty output and prove
+      // nothing.
+      const { stderr } = captureStderrWithResult(() =>
+        resolveCredentials({
+          env: { FEZO_API_KEY: secret },
+          dotEnvPath: dir,
+        }),
+      );
+      expect(stderr).toContain('could not read');
+      expect(stderr).not.toContain(secret);
+    });
   });
 
   it('resolveCredentials carries the raw secret in apiKey.value and nowhere else', () => {
@@ -850,7 +850,6 @@ describe('no secret leakage', () => {
     const result = resolveCredentials({
       env: { FEZO_API_KEY: secret },
       dotEnvPath: '/nonexistent/.env',
-      warnedAliases: new Set(),
     });
 
     // The field set is closed: a future field carrying the secret in another
@@ -871,7 +870,7 @@ describe('no secret leakage', () => {
       const dotEnvPath = join(dir, '.env');
       writeDotEnvFile(dotEnvPath, { FEZO_API_KEY: secret });
 
-      const fromDotEnv = resolveCredentials({ env: {}, dotEnvPath, warnedAliases: new Set() });
+      const fromDotEnv = resolveCredentials({ env: {}, dotEnvPath });
       expect(fromDotEnv.apiKey?.masked).toBe('sk-m…');
       expect(fromDotEnv.apiKey?.masked).not.toContain(secret);
 
@@ -880,12 +879,11 @@ describe('no secret leakage', () => {
         env: {},
         dotEnvPath: '/nonexistent/.env',
         keychain: runner,
-        warnedAliases: new Set(),
       });
       expect(fromKeychain.apiKey?.masked).toBe('sk-m…');
       expect(fromKeychain.apiKey?.masked).not.toContain(secret);
 
-      const fromEnv = resolveCredentials({ env: { FEZO_API_KEY: secret }, dotEnvPath: '/nonexistent/.env', warnedAliases: new Set() });
+      const fromEnv = resolveCredentials({ env: { FEZO_API_KEY: secret }, dotEnvPath: '/nonexistent/.env' });
       expect(fromEnv.apiKey?.masked).not.toContain(secret);
       expect(maskSecret(secret).length).toBeLessThan(secret.length);
     });

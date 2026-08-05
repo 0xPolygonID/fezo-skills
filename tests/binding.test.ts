@@ -295,7 +295,7 @@ describe('bindArgs — header binding', () => {
 });
 
 describe('bindArgs — body-source rule', () => {
-  // Modeled on zug/internal/brightdatabackend/manifest.go's scrape_async:
+  // Modeled on a scraping backend's real async-scrape method:
   // POST, dataset_id (and friends) bound to query, and a request body that is
   // a wholly separate shape (an array of input records) input_schema does not
   // describe at all.

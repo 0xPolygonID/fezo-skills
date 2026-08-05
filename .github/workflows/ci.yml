@@ -85,11 +85,20 @@ jobs:
       - name: Build the bundle
         run: pnpm bundle
 
-      - name: Bundle freshness — fail if the committed dist/fezoctl.mjs differs from a fresh build
+      # BOTH committed bundles are gated. The skill-local copy is what
+      # installers that take the skill directory alone (`npx skills add`, a
+      # `cp -R`, a `.skill` archive) actually ship as the engine — a stale or
+      # missing copy is an install that resolves no fezoctl at all.
+      - name: Bundle freshness — fail if either committed bundle differs from a fresh build
         run: |
           set -euo pipefail
-          if ! git diff --exit-code -- dist/fezoctl.mjs; then
-            echo "dist/fezoctl.mjs is stale: commit the output of 'pnpm bundle'." >&2
+          test -f skills/fezo/scripts/fezoctl.mjs || {
+            echo "skills/fezo/scripts/fezoctl.mjs is missing: it is committed, not generated on demand." >&2
+            echo "Run 'pnpm bundle' and commit the result." >&2
+            exit 1
+          }
+          if ! git diff --exit-code -- dist/fezoctl.mjs skills/fezo/scripts/fezoctl.mjs; then
+            echo "A committed bundle is stale: commit the output of 'pnpm bundle'." >&2
             echo "NOTE: package.json's version is baked into the bundle at build time" >&2
             echo "(esbuild --define __FEZOCTL_VERSION__), so BUMPING THE VERSION ALONE" >&2
             echo "changes these bytes. If you just bumped package.json, this is expected:" >&2
@@ -108,6 +117,41 @@ jobs:
             echo "NOTE: SKILL.md's frontmatter version and baked-in SKILL_VERSION are" >&2
             echo "derived from package.json's version, so bumping the version alone" >&2
             echo "changes this file too." >&2
+            exit 1
+          fi
+
+      - name: Generate the per-host plugin manifests
+        run: pnpm gen-manifests
+
+      # Same contract as SKILL.md and the bundles: these files are generated,
+      # so a hand edit or a version bump without regeneration is a stale
+      # manifest — a host that installs the plugin and reports a release number
+      # that was never cut.
+      - name: Manifest freshness — fail if any committed manifest differs from a fresh generation
+        run: |
+          set -euo pipefail
+          paths="$(node build/gen-manifests.mjs --list)"
+          echo "generated manifests:"
+          echo "${paths}"
+          # `git diff` reports NOTHING for an untracked path, so the freshness
+          # check below would pass vacuously for a manifest that was generated
+          # but never committed — a new host lane that silently never ships.
+          # Assert tracked-ness first; only then is the diff meaningful.
+          while IFS= read -r path; do
+            git ls-files --error-unmatch "${path}" >/dev/null 2>&1 || {
+              echo "${path} is not tracked by git: 'git add' it." >&2
+              echo "Generated manifests must be committed — hosts read them from the repository." >&2
+              exit 1
+            }
+          done <<< "${paths}"
+          # Word-split is intended: --list emits one relative path per line and
+          # none of them contain whitespace.
+          # shellcheck disable=SC2086
+          if ! git diff --exit-code -- ${paths}; then
+            echo "A generated manifest is stale: run 'pnpm gen-manifests' and commit the result." >&2
+            echo "NOTE: every manifest's version, description, and URLs are derived from" >&2
+            echo "package.json and build/gen-skill.mjs — bumping the version alone changes" >&2
+            echo "all of them. Do not hand-edit these files." >&2
             exit 1
           fi
 

@@ -1,0 +1,30 @@
+{
+  "name": "fezo-skills",
+  "owner": {
+    "name": "0xPolygonID",
+    "url": "https://github.com/0xPolygonID"
+  },
+  "description": "Marketplace for the fezo plugin",
+  "plugins": [
+    {
+      "name": "fezo",
+      "description": "Discover and call Fezo gateway tools from the live catalog. Use when a task needs external capabilities such as web search, news, scraping, market data, social data, product data, or another API-backed service; search the catalog, inspect the schema, call the best provider, and retry another provider when the first fails or returns unsuitable content.",
+      "version": "1.0.0",
+      "category": "productivity",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/0xPolygonID/fezo-skills.git"
+      },
+      "homepage": "https://github.com/0xPolygonID/fezo-skills",
+      "keywords": [
+        "fezo",
+        "api-gateway",
+        "tool-catalog",
+        "dynamic-catalog",
+        "web-search",
+        "scraping",
+        "market-data"
+      ]
+    }
+  ]
+}

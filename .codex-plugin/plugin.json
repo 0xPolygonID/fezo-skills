@@ -1,0 +1,41 @@
+{
+  "name": "fezo",
+  "version": "1.0.0",
+  "description": "Discover and call Fezo gateway tools from the live catalog. Use when a task needs external capabilities such as web search, news, scraping, market data, social data, product data, or another API-backed service; search the catalog, inspect the schema, call the best provider, and retry another provider when the first fails or returns unsuitable content.",
+  "author": {
+    "name": "0xPolygonID",
+    "url": "https://github.com/0xPolygonID"
+  },
+  "homepage": "https://github.com/0xPolygonID/fezo-skills",
+  "repository": "https://github.com/0xPolygonID/fezo-skills",
+  "license": "MIT",
+  "keywords": [
+    "fezo",
+    "api-gateway",
+    "tool-catalog",
+    "dynamic-catalog",
+    "web-search",
+    "scraping",
+    "market-data"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "fezo",
+    "shortDescription": "Call external APIs discovered from a live gateway catalog.",
+    "longDescription": "fezo adds a skill that discovers callable tools from a Fezo gateway at run time and invokes the best candidate for the task, retrying a different provider when one fails or returns unsuitable content. The tool roster is read from the gateway catalog on every invocation, so new backends are usable without updating this plugin.",
+    "developerName": "0xPolygonID",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/0xPolygonID/fezo-skills",
+    "defaultPrompt": [
+      "search the web for recent news on a topic",
+      "scrape a page and summarize it",
+      "look up current market data for an asset"
+    ],
+    "brandColor": "#8247E5"
+  }
+}

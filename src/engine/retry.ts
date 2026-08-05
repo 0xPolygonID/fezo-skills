@@ -33,31 +33,27 @@ import { SchemaValidatorCache, validateArgs } from './schema.js';
  * help, because these describe the caller's account, not one provider:
  *
  * - `unauthorized` (HTTP 401): the gateway writes it when the caller's API key
- *   itself is bad (zug/internal/gateway/proxy.go and errors.go), and every
- *   candidate presents that same key, so for the GATEWAY-emitted 401 every
- *   candidate really would fail identically. That reasoning does NOT cover the
- *   whole code: all ten backend `unauthorized` sites mean "invalid call token"
- *   on the gateway->backend hop (e.g.
- *   zug/internal/brightdatabackend/handlers.go:68,
- *   zug/internal/exabackend/handlers.go:57), which is a per-backend deployment
- *   fault -- a different backend could well be provisioned correctly. Abort is
- *   kept anyway, for a reason that holds for both shapes: a 401 is never
- *   transient and never capability-shaped, it always means a credential is
- *   wrong somewhere, and no amount of trying other providers repairs that.
- *   Because the wire cannot tell the two apart, aborting surfaces the
- *   credential defect loudly instead of hiding one backend's misconfiguration
- *   behind a silent (and billed) fallback.
- * - `limit_exceeded`, `insufficient_balance`: both HTTP 402
- *   (zug/internal/gateway/spendlimit.go's `TrippedLimit`/`InsufficientBalance`,
- *   written by proxy.go's `Handle`). KNOWN LIMITATION, per the governing spec:
- *   `TrippedLimit` carries a `BackendID` and can be scoped to one backend, one
- *   API key, or the whole account, but the gateway exposes that scope only in
- *   the human-readable `Message()` string, never structured on the wire. This
- *   engine does not parse that message -- doing so would be brittle against a
- *   wording change and is explicitly out of scope -- so it aborts
- *   conservatively even when the limit is backend-scoped and a different
- *   candidate could have safely advanced. Revisit if the gateway ever returns
- *   the scope as a structured field.
+ *   itself is bad, and every candidate presents that same key, so for the
+ *   GATEWAY-emitted 401 every candidate really would fail identically. That
+ *   reasoning does NOT cover the whole code: every backend-emitted
+ *   `unauthorized` instead means "invalid call token" on the gateway->backend
+ *   hop, which is a per-backend deployment fault -- a different backend could
+ *   well be provisioned correctly. Abort is kept anyway, for a reason that
+ *   holds for both shapes: a 401 is never transient and never
+ *   capability-shaped, it always means a credential is wrong somewhere, and no
+ *   amount of trying other providers repairs that. Because the wire cannot
+ *   tell the two apart, aborting surfaces the credential defect loudly instead
+ *   of hiding one backend's misconfiguration behind a silent (and billed)
+ *   fallback.
+ * - `limit_exceeded`, `insufficient_balance`: both HTTP 402, written by the
+ *   gateway's spend-limit check. KNOWN LIMITATION, per the governing spec: a
+ *   tripped limit can be scoped to one backend, one API key, or the whole
+ *   account, but the gateway exposes that scope only in the human-readable
+ *   message string, never structured on the wire. This engine does not parse
+ *   that message -- doing so would be brittle against a wording change and is
+ *   explicitly out of scope -- so it aborts conservatively even when the limit
+ *   is backend-scoped and a different candidate could have safely advanced.
+ *   Revisit if the gateway ever returns the scope as a structured field.
  *
  * A per-candidate `BindingError` (bindings.ts) is deliberately NOT an abort and
  * NOT in this set: unlike the three codes above, which are account-scoped
@@ -77,28 +73,29 @@ export const ABORT_CODES: ReadonlySet<string> = new Set(['unauthorized', 'limit_
  * availability), not the caller's account or the caller's input.
  *
  * - `quota_exceeded`: a backend's OWN per-request budget, not the user's
- *   account balance -- see brightdatabackend/handlers.go's `overBudget`
- *   (HTTP 402, the same status `limit_exceeded`/`insufficient_balance` use).
+ *   account balance -- emitted by a backend's over-budget check (HTTP 402, the
+ *   same status `limit_exceeded`/`insufficient_balance` use).
  *   This is the crux case the spec calls out: a status-first classifier
  *   cannot tell this apart from an account-level 402 and would wrongly abort
  *   the whole run over one provider's exhausted quota.
  * - `rate_limited`: written by the GATEWAY ONLY on the voucher-redeem path
- *   (zug/internal/gateway/vouchers.go:84, HTTP 429), which is not a `/v1/*`
+ *   (HTTP 429), which is not a `/v1/*`
  *   tool call at all. fezoctl never hits that endpoint, so this code is not
  *   normally observable in practice. An upstream provider's real rate limit
  *   instead arrives as a CODE-LESS backend 429 passthrough (see
  *   `RETRYABLE_CODELESS_STATUSES` below), which is why the HTTP-status
  *   fallback -- not this code -- is the load-bearing path for rate limiting.
  *   The code is still classified here for completeness and in case a future
- *   backend cooperatively adopts it (as brightdata did for `quota_exceeded`).
+ *   backend cooperatively adopts it (as a scraping backend already has for
+ *   `quota_exceeded`).
  * - `backend_unavailable`, `provider_disabled`, `backend_not_configured`,
- *   `backend_not_found`, `backend_error`: gateway-written
- *   (zug/internal/gateway/proxy.go's `Handle`), each describing a fault with
+ *   `backend_not_found`, `backend_error`: written by the gateway's proxy
+ *   handler, each describing a fault with
  *   the addressed backend specifically -- unhealthy, disabled by the account,
  *   missing required settings, unregistered, or a gateway-side fault
  *   forwarding to it.
- * - `tool_not_in_catalog`: NOT a gateway wire code (it does not appear in
- *   zug/internal/gateway/errors.go) -- it is fezoctl's own client-side
+ * - `tool_not_in_catalog`: NOT a gateway wire code (it does not appear among
+ *   the gateway's error codes) -- it is fezoctl's own client-side
  *   condition for "this tool name is not present in the catalog we just
  *   fetched," raised before any `/v1/{backendId}{path}` call is attempted.
  *   It is classified through the same gateway-code-shaped path as the codes
@@ -205,24 +202,20 @@ export interface FailureClassification {
  *
  * That branch IS REACHABLE in production -- do not delete it and do not flip
  * its default. The BACKENDS, not just the gateway, write gateway-shaped
- * envelopes: each one has its own copy of the same
- * `{"error":{"code","message"}}` writer (e.g.
- * zug/internal/brightdatabackend/handlers.go:383), the gateway forwards those
- * bodies through `/v1/*` verbatim, and errors.ts therefore parses them as
+ * envelopes: each one carries its own copy of the same
+ * `{"error":{"code","message"}}` writer, the gateway forwards those bodies
+ * through `/v1/*` verbatim, and errors.ts therefore parses them as
  * `{kind:'gateway'}` envelopes carrying codes that appear in NO gateway-side
- * table: `bad_request` (400; 19 backend sites, e.g.
- * zug/internal/brightdatabackend/handlers.go:86,
- * zug/internal/exabackend/handlers.go:71), `not_found` (404, e.g.
- * zug/internal/apifybackend/handlers.go:148), `method_not_allowed` (405,
- * zug/internal/xrobackend/handlers.go:75), `request_too_large` (413,
- * zug/internal/newsapibackend/handlers.go:80), and `owner_data_forbidden`
- * (403, zug/internal/xrobackend/handlers.go:80). Giving up is the correct
+ * table. Observed across the backend fleet: `bad_request` (400, by far the
+ * most common -- roughly twenty distinct sites), `not_found` (404),
+ * `method_not_allowed` (405), `request_too_large` (413), and
+ * `owner_data_forbidden` (403). Giving up is the correct
  * outcome for every one of them -- each describes a request this caller built
  * wrong, an absent resource, or a forbidden one, none of which another
  * provider's identical call would fix -- so the behavior is right; it is
  * simply real, exercised behavior rather than a defensive default. (An earlier
  * revision of this comment called the branch unreachable on the strength of a
- * grep that covered only zug/internal/gateway/*.go and so missed every
+ * grep that covered only the gateway's own sources and so missed every
  * backend.)
  */
 export function classifyFailure(failure: MechanicalFailure): FailureClassification {
@@ -509,9 +502,8 @@ async function attemptCandidate(
     // rather than papered over because making spend visible is this module's
     // stated job. `callTool` awaits `fetchFn(...)` and THEN `await
     // response.text()` before it ever looks at the status (client.ts:113-114),
-    // while the gateway records the billing event BEFORE it copies the response
-    // body (zug/internal/gateway/proxy.go: `RecordUsage` at :288, then
-    // `io.Copy(w, resp.Body)` at :304). So a connection dropped *while reading
+    // while the gateway's proxy handler records the billing event BEFORE it
+    // copies the response body downstream. So a connection dropped *while reading
     // the body of an already-billed 2xx* rejects out of client.ts:114, arrives
     // here as an untyped rejection, is classified `transport`, and is logged
     // `billed: false` even though the user was charged. This module cannot

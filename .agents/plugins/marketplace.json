@@ -1,0 +1,20 @@
+{
+  "name": "fezo-skills",
+  "interface": {
+    "displayName": "fezo"
+  },
+  "plugins": [
+    {
+      "name": "fezo",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/0xPolygonID/fezo-skills.git"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

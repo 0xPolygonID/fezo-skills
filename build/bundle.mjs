@@ -22,9 +22,11 @@ export const repoRoot = join(here, '..');
 export const entryPoint = join(repoRoot, 'src', 'cli.ts');
 export const packageJsonPath = join(repoRoot, 'package.json');
 export const outfile = join(repoRoot, 'dist', 'fezoctl.mjs');
-// Bundle policy: this file is deliberately gitignored (`.gitignore`) and
-// copied in only at pack/build time — see `.npmignore`'s comment for why
-// npm still needs it even though git never tracks it.
+// Bundle policy: this file is COMMITTED, byte-identical to `dist/fezoctl.mjs`
+// above (git stores one blob for both paths). It is what makes the skill
+// directory self-contained for installers that copy `skills/<name>/` and
+// nothing else — see `.gitignore`'s comment. `pnpm bundle` rewrites it, and
+// CI's freshness gate fails if the committed bytes drift from a fresh build.
 export const skillScriptCopyTarget = join(repoRoot, 'skills', 'fezo', 'scripts', 'fezoctl.mjs');
 
 /**
@@ -115,10 +117,10 @@ export async function bundle({ outfile: outputPath = outfile } = {}) {
 
 /**
  * Copies the built bundle into `skills/fezo/scripts/fezoctl.mjs` (mode
- * 0755). This is the "only for pack/build" copy the bundle policy requires:
- * the source of truth stays `dist/fezoctl.mjs`; this is a derived, gitignored
- * artifact so a self-contained skill directory (copied or archived alone)
- * still carries a working engine.
+ * 0755). The source of truth stays `dist/fezoctl.mjs`; this is a derived —
+ * but COMMITTED — artifact, so a self-contained skill directory (copied,
+ * archived, or fetched by `npx skills add`, all of which take the skill
+ * directory alone) still carries a working engine.
  */
 export function copyIntoSkill({ from = outfile, to = skillScriptCopyTarget } = {}) {
   mkdirSync(dirname(to), { recursive: true });
@@ -145,8 +147,8 @@ function parseArgs(argv) {
 // Run when invoked directly (`node build/bundle.mjs [--out <path>]` /
 // `pnpm bundle`), not when imported by a test. `--out` lets tests build into
 // a scratch location (for determinism/freshness comparisons) without ever
-// touching the committed dist/fezoctl.mjs from a test run. Only the default
-// (no `--out`) invocation also performs the pack/build copy into
+// touching either committed bundle from a test run. Only the default (no
+// `--out`) invocation also refreshes the committed skill-local copy at
 // `skills/fezo/scripts/fezoctl.mjs` — this is what `prepack` runs.
 const invokedDirectly = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (invokedDirectly) {

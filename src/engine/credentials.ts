@@ -35,10 +35,9 @@
 //      header — it has no reason to; that header is client.ts's job.
 //
 // Resolution order (identical for both `FEZO_URL`/`FEZO_API_KEY`): canonical
-// env var, then its deprecated `ZUG_*` alias (warned exactly once per
-// process — see `resolveCredentials`), then macOS Keychain, then `.env`.
-// The gateway is not being renamed, so the aliases are a real supported path,
-// not a legacy stub to delete later.
+// env var, then macOS Keychain, then `.env`. There is exactly one accepted
+// name per credential — no aliases — so "which variable is actually in
+// effect" has a single answer at every call site.
 
 import { spawnSync } from 'node:child_process';
 import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
@@ -469,7 +468,7 @@ export function writeDotEnvFile(path: string, values: Readonly<Record<string, st
 // Resolution.
 // ---------------------------------------------------------------------------
 
-export type CredentialSource = 'env' | 'deprecated-env' | 'keychain' | 'dotenv';
+export type CredentialSource = 'env' | 'keychain' | 'dotenv';
 
 export interface ResolvedValue {
   /**
@@ -540,19 +539,7 @@ export interface ResolveCredentialsOptions {
   dotEnvPath?: string;
   /** Omit to skip the Keychain step entirely (non-macOS, or a caller that has none to inject). */
   keychain?: KeychainRunner;
-  /**
-   * Tracks which deprecated alias names have already been warned about, so
-   * the warning fires exactly once — not once per lookup, which a naive
-   * per-call implementation would do. Defaults to a module-level singleton
-   * that persists for the process's lifetime, so a caller that never passes
-   * this gets "exactly once per process" for free; tests pass their own
-   * `new Set()` to isolate cases from one another.
-   */
-  warnedAliases?: Set<string>;
 }
-
-/** Shared for the lifetime of the process when a caller does not inject its own tracker. */
-const PROCESS_ALIAS_WARNINGS = new Set<string>();
 
 /** The one place a `ResolvedValue` is built, so `masked` can never be forgotten at a call site. */
 function resolved(value: string, source: CredentialSource): ResolvedValue {
@@ -561,39 +548,28 @@ function resolved(value: string, source: CredentialSource): ResolvedValue {
 
 interface ResolveOneOptions {
   canonicalName: 'FEZO_URL' | 'FEZO_API_KEY';
-  deprecatedName: 'ZUG_URL' | 'ZUG_API_KEY';
   keychainService: string;
   env: NodeJS.ProcessEnv;
   dotEnv: Record<string, string>;
   keychain: KeychainRunner | undefined;
-  warnedAliases: Set<string>;
 }
 
 /**
- * Resolves one credential (URL or API key) through the four sources in
+ * Resolves one credential (URL or API key) through the three sources in
  * priority order, short-circuiting at the first one that has a non-empty
- * value: canonical env var, deprecated alias (env var empty/absent is
- * checked with `||`-style truthiness, matching catalog.ts's convention that
- * an empty string means "omitted", not "set to nothing"), Keychain, `.env`.
+ * value: canonical env var (empty/absent is checked with `||`-style
+ * truthiness, matching catalog.ts's convention that an empty string means
+ * "omitted", not "set to nothing"), Keychain, `.env`.
  *
- * Keychain is only consulted when `keychain` is supplied AND neither env
- * source had a value — this both matches the specified priority order and
- * avoids spawning `security` on every resolution when an env var already
+ * Keychain is only consulted when `keychain` is supplied AND the env var had
+ * no value — this both matches the specified priority order and avoids
+ * spawning `security` on every resolution when the environment already
  * answered the question.
  */
 function resolveOne(options: ResolveOneOptions): ResolvedValue | undefined {
   const canonical = options.env[options.canonicalName];
   if (canonical !== undefined && canonical.length > 0) {
     return resolved(canonical, 'env');
-  }
-
-  const deprecated = options.env[options.deprecatedName];
-  if (deprecated !== undefined && deprecated.length > 0) {
-    if (!options.warnedAliases.has(options.deprecatedName)) {
-      options.warnedAliases.add(options.deprecatedName);
-      warn(`${options.deprecatedName} is deprecated; use ${options.canonicalName} instead`);
-    }
-    return resolved(deprecated, 'deprecated-env');
   }
 
   if (options.keychain) {
@@ -613,7 +589,7 @@ function resolveOne(options: ResolveOneOptions): ResolvedValue | undefined {
 
 /**
  * Resolves `FEZO_URL` and `FEZO_API_KEY` independently, each through the
- * same four-source chain, and reports where each came from (`doctor`, a
+ * same three-source chain, and reports where each came from (`doctor`, a
  * later task, renders this as the credential source).
  *
  * A missing credential is not an error here — it is an ordinary outcome,
@@ -624,26 +600,21 @@ function resolveOne(options: ResolveOneOptions): ResolvedValue | undefined {
 export function resolveCredentials(options: ResolveCredentialsOptions = {}): CredentialResolution {
   const env = options.env ?? process.env;
   const dotEnvPath = options.dotEnvPath ?? defaultDotEnvPath(env);
-  const warnedAliases = options.warnedAliases ?? PROCESS_ALIAS_WARNINGS;
   const dotEnv = readDotEnvFile(dotEnvPath);
 
   const url = resolveOne({
     canonicalName: 'FEZO_URL',
-    deprecatedName: 'ZUG_URL',
     keychainService: KEYCHAIN_SERVICE_URL,
     env,
     dotEnv,
     keychain: options.keychain,
-    warnedAliases,
   });
   const apiKey = resolveOne({
     canonicalName: 'FEZO_API_KEY',
-    deprecatedName: 'ZUG_API_KEY',
     keychainService: KEYCHAIN_SERVICE_API_KEY,
     env,
     dotEnv,
     keychain: options.keychain,
-    warnedAliases,
   });
 
   return {

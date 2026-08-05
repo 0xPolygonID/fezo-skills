@@ -1,0 +1,21 @@
+{
+  "name": "fezo",
+  "version": "1.0.0",
+  "description": "Discover and call Fezo gateway tools from the live catalog. Use when a task needs external capabilities such as web search, news, scraping, market data, social data, product data, or another API-backed service; search the catalog, inspect the schema, call the best provider, and retry another provider when the first fails or returns unsuitable content.",
+  "author": {
+    "name": "0xPolygonID",
+    "url": "https://github.com/0xPolygonID"
+  },
+  "homepage": "https://github.com/0xPolygonID/fezo-skills",
+  "repository": "https://github.com/0xPolygonID/fezo-skills",
+  "license": "MIT",
+  "keywords": [
+    "fezo",
+    "api-gateway",
+    "tool-catalog",
+    "dynamic-catalog",
+    "web-search",
+    "scraping",
+    "market-data"
+  ]
+}

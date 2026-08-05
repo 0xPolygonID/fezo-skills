@@ -83,8 +83,8 @@ their shell has no `FEZOCTL_ARGV` — see the credentials section below.
 ### Credentials: never handle the API key yourself
 
 Credentials (gateway URL and API key) live outside this repository. They are
-resolved from four sources, in this order: the environment (`FEZO_URL` /
-`FEZO_API_KEY`), deprecated environment aliases, the macOS Keychain, and
+resolved from three sources, in this order: the environment (`FEZO_URL` /
+`FEZO_API_KEY` — the only two names accepted), the macOS Keychain, and
 finally `~/.config/fezo/.env` (or `$XDG_CONFIG_HOME/fezo/.env` if that
 variable is set). Check what is already configured before concluding that
 anything is missing:

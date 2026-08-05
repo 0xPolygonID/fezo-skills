@@ -4,16 +4,14 @@
 // in catalog.ts) instead of assuming GET means "all args in query" or POST
 // means "all args in body."
 //
-// The case that makes the flat-body assumption actively wrong:
-// zug/internal/brightdatabackend/manifest.go's `scrape_async` method is a
-// POST whose `http.query` carries `dataset_id` (and friends), while its
-// request body is a *separate* array of input records that `input_schema`
-// does not even describe. zug/internal/brightdatabackend/handlers.go's
-// `startAsync` reads `dataset_id` from `r.URL.Query()` and 400s
-// "dataset_id is required" if it is absent -- so a client that puts every
-// arg in the POST body can never call this method. See
-// zug/docs/backend-authoring.md ("The `http` binding") for the governing
-// contract this module implements.
+// The case that makes the flat-body assumption actively wrong: a scraping
+// backend's async-scrape method is a POST whose `http.query` carries
+// `dataset_id` (and friends), while its request body is a *separate* array of
+// input records that `input_schema` does not even describe. That backend reads
+// `dataset_id` from the URL query and 400s "dataset_id is required" if it is
+// absent -- so a client that puts every arg in the POST body can never call
+// this method. The gateway's backend-authoring contract ("The `http` binding")
+// is what governs this module's behavior.
 //
 // Argument-schema validation (AJV, Task 5) is a deliberate seam this module
 // leaves open: `bindArgs` takes already-parsed `--args-json`/`--body-json`
@@ -125,12 +123,12 @@ function warn(message: string): void {
 
 /**
  * "Missing" for a *sendable* value (query parameter, header): `undefined` or
- * `null` only. Matching the reference MCP client's GET query construction
- * (`zug/mcp-server/src/zug_gateway_client.ts`, which filters exactly those two
- * and does send `''`), an explicitly empty string is a *present* value: `?q=`
- * is a legal, sometimes meaningful request, and refusing to send it would make
- * an intentionally empty parameter unexpressible. A legitimately falsy value
- * (`0`, `false`) is likewise present, not missing.
+ * `null` only. Matching the reference MCP client's GET query construction,
+ * which filters exactly those two and does send `''`, an explicitly empty
+ * string is a *present* value: `?q=` is a legal, sometimes meaningful request,
+ * and refusing to send it would make an intentionally empty parameter
+ * unexpressible. A legitimately falsy value (`0`, `false`) is likewise
+ * present, not missing.
  */
 function isMissingValue(value: unknown): boolean {
   return value === undefined || value === null;
@@ -170,11 +168,10 @@ const DISALLOWED_HEADER_PREFIX = 'x-zug-';
 
 /**
  * True for `Authorization` or any `X-Zug-*` header name, case-insensitively.
- * The gateway strips inbound `X-Zug-*` headers on its own
- * (zug/internal/gateway/manifest.go's passthrough-header validation), but
- * `bindArgs` refuses locally rather than rely on that: a header a tool call
- * never sends cannot be a live attack surface regardless of what the gateway
- * would have done with it.
+ * The gateway strips inbound `X-Zug-*` headers on its own, in its
+ * passthrough-header validation, but `bindArgs` refuses locally rather than
+ * rely on that: a header a tool call never sends cannot be a live attack
+ * surface regardless of what the gateway would have done with it.
  */
 function isDisallowedHeaderName(name: string): boolean {
   const lower = name.toLowerCase();
@@ -193,8 +190,7 @@ function isDisallowedHeaderName(name: string): boolean {
  *
  * Path substitution is driven by the literal `{placeholder}` segments in
  * `candidate.path` -- not by `candidate.bindings.path_params` -- matching
- * the reference MCP client
- * (`zug/mcp-server/src/zug_gateway_client.ts`'s `call`), which the task brief
+ * the reference MCP client's own `call`, which the task brief
  * calls out as already correct: the path template is the one place a
  * missing substitution is directly observable (a literal `{id}` reaching the
  * gateway), so it is the authoritative source. A value is split on `/` and

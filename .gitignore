@@ -5,8 +5,15 @@ coverage/
 .env
 .env.*
 
-# The bundle is copied into the skill directory during pack/build only; the
-# committed source of truth is repo-root dist/fezoctl.mjs. Do NOT add dist/
-# here — dist/fezoctl.mjs is committed deliberately so Git-URL/HEAD installs
-# resolve the engine.
-skills/*/scripts/fezoctl.mjs
+# Do NOT ignore dist/fezoctl.mjs or skills/*/scripts/fezoctl.mjs. BOTH copies
+# of the bundle are committed deliberately.
+#
+# The skill-local copy is what makes the skill directory self-contained, and a
+# self-contained skill directory is what installers like `npx skills add` need:
+# they copy `skills/<name>/` recursively out of the repo tree and nothing else,
+# so tier 3 of the invocation ladder (`$SKILL_DIR/../../dist/fezoctl.mjs`)
+# cannot resolve at the install target and tier 2 is the only rung left. Ignore
+# the copy and every such install ships a SKILL.md with no engine.
+#
+# The two files are byte-identical, so git stores ONE blob for both paths.
+# Committing the copy costs a tree entry, not a second bundle.

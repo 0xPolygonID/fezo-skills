@@ -19,8 +19,8 @@ import { methodToToolName } from '../src/engine/tool-name.js';
 // transcriptions of any real catalog or gateway manifest.
 // ---------------------------------------------------------------------------
 
-// Real `backendInfoText` values, copied from the deployed gateway manifests
-// (zug/internal/*backend/manifest.go). They are quoted verbatim because their
+// Real `backendInfoText` values, copied from the deployed gateway's own
+// backend manifests. They are quoted verbatim because their
 // exact wording is the hazard under test: each contains an async word, and
 // `backendInfoText` is backend-WIDE (identical on every method a backend
 // exposes). If async text detection read this field, one word here would
@@ -38,7 +38,7 @@ const FALAI_INFO =
   'Run Fal AI models for image, video, audio, and other generative tasks — synchronously, or submitted to the Fal job queue and polled for results.';
 
 // falai's `queue.result` and its synchronous neighbour `run`, verbatim from
-// zug/internal/falaibackend/manifest.go. `queue.result` is the only live
+// that backend's deployed manifest. `queue.result` is the only live
 // method whose async nature is carried by nothing but the phrase "request id"
 // in its own description — no async name suffix, no `poll`, and an output
 // schema that is the real model result rather than an id. `run` is its
@@ -326,8 +326,8 @@ describe('isAsyncLifecycleMethod', () => {
   });
 
   it('excludes falai_queue_result, whose ONLY async signal is the phrase "request id"', () => {
-    // Real title/description/output schema from
-    // zug/internal/falaibackend/manifest.go. This method downloads the result
+    // Real title/description/output schema from that backend's deployed
+    // manifest. This method downloads the result
     // of a completed queued job, so `run` must never auto-call it — a 2xx is
     // billed. Every other detector misses it on purpose:
     //   - name: tool is `falai_queue_result`; no ASYNC_NAME_SUFFIXES match and

@@ -1,11 +1,11 @@
-// Catalog discovery: fetches GET /v1/catalog from a live Fezo/Zug gateway and
+// Catalog discovery: fetches GET /v1/catalog from a live Fezo gateway and
 // normalizes its methods into ToolCandidate values that the rest of the
 // engine (search/ranking, HTTP binding, schema validation, calling) builds
 // on top of.
 //
-// This module deliberately does not transcribe gateway Go manifests (see
-// zug/internal/gateway/catalog.go and manifest.go) into fixtures or a static
-// roster. It only mirrors the *wire shape* those files document, and parses
+// This module deliberately does not transcribe the gateway's own catalog and
+// manifest definitions into fixtures or a static
+// roster. It only mirrors the *wire shape* they document, and parses
 // it defensively: the catalog document comes from the network and must be
 // treated as untrusted, so every field read here is optional-checked rather
 // than asserted.
@@ -32,14 +32,14 @@ export interface HttpBodyMediaType {
   schema?: object | boolean;
 }
 
-/** Mirrors the manifest's `Body` (zug/internal/gateway/manifest.go). */
+/** Mirrors the gateway manifest's `Body`. */
 export interface HttpBody {
   description?: string;
   content?: Record<string, HttpBodyMediaType>;
 }
 
 /**
- * Mirrors the manifest's `HTTPBinding` (zug/internal/gateway/manifest.go)
+ * Mirrors the gateway manifest's `HTTPBinding`
  * field-for-field, including its snake_case wire names: `method`, `query`,
  * `path_params`, `header`, `request_body`, `response_body`. This type is
  * catalog-derived data, not behavior — Task 4's `bindings.ts` owns the logic

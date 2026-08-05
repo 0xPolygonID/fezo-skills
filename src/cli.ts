@@ -31,12 +31,12 @@
 // log and what was billed). The English message goes to stderr either way, and
 // the exit code is the same with and without `--json`.
 
-import { Ajv } from 'ajv';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
+import { newAjv } from './engine/ajv-instance.js';
 import type { ToolCandidate } from './engine/catalog.js';
 import { CatalogFetchError, fetchCatalog } from './engine/catalog.js';
 import { bindArgs } from './engine/bindings.js';
@@ -279,7 +279,7 @@ function unresolvedToolReport(tool: string): RunReport {
 // than relying on `compileSchema`'s own `{type:'object'}` fallback.
 // ---------------------------------------------------------------------------
 
-const probeAjv = new Ajv({ allErrors: true, strict: false });
+const probeAjv = newAjv();
 
 function schemaCompiles(schema: object | boolean): boolean {
   try {
@@ -319,7 +319,7 @@ const EXIT_OK = 0;
 const EXIT_USAGE = 1;
 const EXIT_OPERATIONAL = 2;
 
-const HELP_TEXT = `fezoctl — discover and call Fezo/Zug gateway tools from the live catalog
+const HELP_TEXT = `fezoctl — discover and call Fezo gateway tools from the live catalog
 
 Usage:
   fezoctl search "<query>" [--schema] [--json]
@@ -334,8 +334,7 @@ Usage:
   fezoctl --help
 
 Credentials are never accepted as a command-line argument: setup --key-stdin
-reads the API key from stdin. Otherwise, set FEZO_URL and FEZO_API_KEY (the
-deprecated ZUG_URL/ZUG_API_KEY aliases are also accepted, with one warning).
+reads the API key from stdin. Otherwise, set FEZO_URL and FEZO_API_KEY.
 
 With --json, stdout is always a JSON document — never empty. A failure that
 never reached the gateway is {"error":{"kind":"...","message":"..."}}, where
