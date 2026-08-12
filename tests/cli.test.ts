@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { NO_MORE_CANDIDATES_REASON, candidatesToRun, resolvePackageVersion, runCli } from '../src/cli.js';
 import type { CliDeps } from '../src/cli.js';
 import { newSchemaCompiler } from '../src/engine/ajv-instance.js';
+import { DEFAULT_GATEWAY_URL } from '../src/engine/credentials.js';
 import type { KeychainCommandResult, KeychainRunner } from '../src/engine/credentials.js';
 import type { RunSelection } from '../src/engine/rank.js';
 import type { ToolCandidate } from '../src/engine/catalog.js';
@@ -1888,14 +1889,30 @@ describe('doctor', () => {
     expect(prefCheck?.details?.missingEntryMethods).not.toContain('exa_search');
   });
 
-  it('reports missing credentials as a hard failure and skips the connectivity checks', async () => {
+  it('reports a missing API key as a hard failure and skips the connectivity checks', async () => {
     const result = await runCli(['doctor', '--json'], { env: {}, dotEnvPath: '/nonexistent/.env' });
     expect(result.exitCode).toBe(2);
-    const parsed = JSON.parse(result.stdout) as { checks: { name: string; status: string }[] };
+    const parsed = JSON.parse(result.stdout) as {
+      checks: { name: string; status: string; message: string; details?: { url?: { value: string; source: string } } }[];
+    };
     const byName = new Map(parsed.checks.map((c) => [c.name, c]));
-    expect(byName.get('gateway-url')?.status).toBe('fail');
+    // The URL cannot fail -- it always resolves -- so the key is the only
+    // credential that can stop `doctor` here. The check still has to SAY that
+    // nobody configured a gateway, which is what its message and source carry.
+    const gatewayUrl = byName.get('gateway-url');
+    expect(gatewayUrl?.status).toBe('ok');
+    expect(gatewayUrl?.message).toBe('FEZO_URL is not configured; using the built-in default gateway');
+    expect(gatewayUrl?.details?.url).toEqual({ value: DEFAULT_GATEWAY_URL, source: 'default' });
     expect(byName.get('api-key')?.status).toBe('fail');
     expect(byName.get('gateway-connectivity')?.status).toBe('skipped');
+  });
+
+  it('names the source when a gateway URL WAS configured, so the default is distinguishable', async () => {
+    const result = await runCli(['doctor', '--json'], { env: { FEZO_URL: 'https://gw.example.com' }, dotEnvPath: '/nonexistent/.env' });
+    const parsed = JSON.parse(result.stdout) as { checks: { name: string; status: string; message: string }[] };
+    const gatewayUrl = parsed.checks.find((c) => c.name === 'gateway-url');
+    expect(gatewayUrl?.status).toBe('ok');
+    expect(gatewayUrl?.message).toBe('FEZO_URL resolved from env');
   });
 
   it('reports an auth failure distinctly from a connectivity failure', async () => {
@@ -2115,10 +2132,13 @@ describe('setup', () => {
   // command failed with `credentials-not-configured`. That exact command, with no
   // `--url`, was the recipe `build/step0.md` gave the model.
   //
-  // Both halves are asserted here: the state is now unmistakable in the output,
-  // and the exit code no longer claims more than is true.
+  // Since the gateway URL grew a built-in default, the *outcome* of that recipe
+  // is no longer broken -- the next command works -- but the reason the fix
+  // existed still holds and is what these two assert: the URL in effect is
+  // always stated, WITH its source, so "you are on the built-in gateway" can
+  // never be mistaken for "you configured this one".
   // ---------------------------------------------------------------------------
-  it('without --url (and with no FEZO_URL), setup says the config is unusable and exits non-zero', async () => {
+  it('without --url (and with no FEZO_URL), setup falls back to the default gateway and exits 0', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-setup-nourl-'));
     try {
       const dotEnvPath = join(dir, '.env');
@@ -2128,29 +2148,27 @@ describe('setup', () => {
         env: {},
       });
 
-      // The key really was stored -- this is a partial success reported as
-      // incomplete, not a write failure.
       expect(result.stdout).toContain('api key: stored');
       expect(readFileSync(dotEnvPath, 'utf8')).toContain(`FEZO_API_KEY=${SECRET}`);
 
-      // ...and the missing URL is stated explicitly, not left to be inferred
-      // from an absent line.
-      expect(result.stdout).toContain('configured url: (not configured — pass --url or set FEZO_URL)');
-      expect(result.stdout).toContain('this configuration is NOT usable yet');
-      expect(result.exitCode).toBe(2);
+      // The URL in effect is named, and so is the fact that nobody chose it.
+      expect(result.stdout).toContain(`configured url: ${DEFAULT_GATEWAY_URL} (source: default)`);
+      expect(result.stdout).not.toContain('NOT usable');
+      expect(result.exitCode).toBe(0);
       expect(result.stdout).not.toContain(SECRET);
       expect(result.stderr).not.toContain(SECRET);
 
-      // The end-to-end claim: exactly the state that makes the next command fail.
-      const next = await runCli(['catalog'], { dotEnvPath, env: {} });
-      expect(next.exitCode).toBe(2);
-      expect(next.stderr).toContain('gateway URL and/or API key are not configured');
+      // The end-to-end claim, inverted from what it used to be: this really is
+      // a complete configuration, so the next command gets as far as the
+      // gateway rather than refusing on credentials.
+      const next = await runCli(['catalog'], { dotEnvPath, env: {}, fetchFn: multiRouteFetch([]) });
+      expect(next.exitCode).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('--json reports the same incompleteness as `usable: false`, with no second document on stdout', async () => {
+  it('--json reports the default-sourced URL and `usable: true`, with no second document on stdout', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-setup-nourl-json-'));
     try {
       const dotEnvPath = join(dir, '.env');
@@ -2159,18 +2177,40 @@ describe('setup', () => {
         dotEnvPath,
         env: {},
       });
-      expect(result.exitCode).toBe(2);
+      expect(result.exitCode).toBe(0);
       // Still ONE JSON document (JSON.parse would throw on two concatenated).
       const parsed = JSON.parse(result.stdout) as {
         usable: boolean;
         result: { apiKey: { ok: boolean } };
-        configured: { url?: unknown; apiKey?: { masked: string } };
+        configured: { url?: { value: string; source: string }; apiKey?: { masked: string } };
       };
-      expect(parsed.result.apiKey.ok).toBe(true); // the write itself succeeded
-      expect(parsed.usable).toBe(false);
-      expect(parsed.configured.url).toBeUndefined();
+      expect(parsed.result.apiKey.ok).toBe(true);
+      expect(parsed.usable).toBe(true);
+      // A machine reader can tell a defaulted URL from a chosen one without
+      // parsing prose -- `source` is the field that carries it.
+      expect(parsed.configured.url).toEqual({ value: DEFAULT_GATEWAY_URL, source: 'default' });
       expect(parsed.configured.apiKey?.masked).toBe('sk-c…');
       expect(result.stdout).not.toContain(SECRET);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The condition `usable` actually tracks now: the API key. An empty stdin
+  // (the `!`-command case build/step0.md warns about) stores nothing.
+  it('reports an unusable configuration, and exits non-zero, when no API key was supplied', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-setup-nokey-'));
+    try {
+      const dotEnvPath = join(dir, '.env');
+      const result = await runCli(['setup', '--key-stdin'], {
+        stdin: Readable.from([Buffer.from('')]),
+        dotEnvPath,
+        env: {},
+      });
+      expect(result.exitCode).toBe(2);
+      expect(result.stdout).toContain('api key: failed (no API key was provided; nothing was stored)');
+      expect(result.stdout).toContain('configured api key: (not configured)');
+      expect(result.stdout).toContain('this configuration is NOT usable yet: fezoctl needs an API key.');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -78,10 +78,13 @@ once, yourself, after installing by any route (see
 [`CONFIGURATION.md`](CONFIGURATION.md) for the full story):
 
 ```bash
-printf '%s' "$YOUR_FEZO_API_KEY" | node ~/.agents/skills/fezo/scripts/fezoctl.mjs \
-  setup --key-stdin --url https://your-gateway.example.com
+printf '%s' "$YOUR_FEZO_API_KEY" | node ~/.agents/skills/fezo/scripts/fezoctl.mjs setup --key-stdin
 node ~/.agents/skills/fezo/scripts/fezoctl.mjs doctor
 ```
+
+Only the API key is required. The gateway URL defaults to
+`https://zug-gateway.internal-iden3-dev.com`; add
+`--url https://your-gateway.example.com` if you are on a different one.
 
 Credentials live outside the skill directory (`~/.config/fezo/.env` at mode
 0600, the macOS Keychain, or the environment), so **every host on the machine
@@ -232,8 +235,10 @@ are re-run and the results committed.
 # From a checkout of this repository:
 node dist/fezoctl.mjs --help
 
-# Configure credentials once (see CONFIGURATION.md for the full story):
-printf '%s' "$YOUR_FEZO_API_KEY" | node dist/fezoctl.mjs setup --key-stdin --url https://your-gateway.example.com
+# Configure the API key once — the gateway URL defaults to
+# https://zug-gateway.internal-iden3-dev.com, so --url is only for a different
+# gateway (see CONFIGURATION.md for the full story):
+printf '%s' "$YOUR_FEZO_API_KEY" | node dist/fezoctl.mjs setup --key-stdin
 
 # Confirm everything is wired up:
 node dist/fezoctl.mjs doctor
@@ -353,7 +358,7 @@ source — run it yourself if this ever looks stale.)
 | `providers [--intent <intent>]` | Surface the declared, per-intent provider ranking, grouped by capability — every group by default, or exactly one with `--intent`. See ["Provider recommendations"](#provider-recommendations). |
 | `list-providers` | One row per live catalog backend, with its declared standing across every intent it appears in. See ["Provider recommendations"](#provider-recommendations). |
 | `catalog` | List every backend and method the gateway currently reports. |
-| `setup --key-stdin` | Store the gateway URL and API key without ever putting the key in argv or a transcript. Pass `--url` (or have `FEZO_URL` set): `fezoctl` needs both values, so a `setup` that leaves the URL unconfigured prints `configured url: (not configured — pass --url or set FEZO_URL)` and exits 2 rather than reporting a success that no other command can use. |
+| `setup --key-stdin` | Store the gateway URL and API key without ever putting the key in argv or a transcript. `--url` is optional — omit it and the gateway stays at the built-in default (`configured url: … (source: default)`), which is a complete configuration. A `setup` that stores no API key is not: it prints `this configuration is NOT usable yet: fezoctl needs an API key.` and exits 2 rather than reporting a success no other command can use. |
 | `doctor` | Diagnose configuration and connectivity — the first thing to run when something is wrong. See ["`doctor`"](#doctor). |
 
 ### Exit codes
@@ -1067,8 +1072,15 @@ $ node dist/fezoctl.mjs call falai_generate --args-json '{"prompt":"a cat"}' --j
 
 ## Credentials
 
+Only the **API key** has to be configured. The gateway URL falls back to a
+built-in default, `https://zug-gateway.internal-iden3-dev.com`, as the last
+rung of its resolution chain — `FEZO_URL`, a Keychain item, and `~/.config/fezo/.env`
+all outrank it, and `doctor`/`setup` report a defaulted URL as `source: default`
+so a gateway nobody chose never looks like one somebody did. The API key has no
+default and must not grow one.
+
 See **[CONFIGURATION.md](CONFIGURATION.md)** for the full credential model:
-the three-source resolution order, the security reasoning behind
+the resolution order, the security reasoning behind
 `setup --key-stdin`, macOS Keychain details, `.env` file location and
 permissions, and **how to rotate a key** —
 which differs between the two storage backends, because a second
@@ -1083,8 +1095,8 @@ can see exactly how far configuration and connectivity got:
 
 | Check | Meaning |
 | --- | --- |
-| `gateway-url` | Whether `FEZO_URL` resolved from any source, and which one. |
-| `api-key` | Whether `FEZO_API_KEY` resolved from any source, and which one. |
+| `gateway-url` | Which source `FEZO_URL` resolved from. Never fails: with none configured it reports `FEZO_URL is not configured; using the built-in default gateway` and `source: default`, which is a working state — see ["Credentials"](#credentials). |
+| `api-key` | Whether `FEZO_API_KEY` resolved from any source, and which one. The only credential whose absence is a hard failure. |
 | `gateway-connectivity` | Whether the gateway responded at all to a catalog fetch. |
 | `auth` | Whether the gateway accepted the API key (distinguished from connectivity by a 401/403 status specifically). |
 | `catalog-readable` | Whether the response body actually parsed as a catalog document. |

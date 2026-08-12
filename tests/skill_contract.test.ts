@@ -383,12 +383,22 @@ describe('skills/fezo/SKILL.md generated content', () => {
     expect(skillMdFlat).toContain('Neither is a secret; the API key is the only value that is');
   });
 
-  // C1: the recipe the model follows must produce a USABLE configuration.
-  it('the setup recipe passes --url, and says what happens without it', () => {
+  // C1: the recipe the model follows must produce a USABLE configuration. With
+  // a built-in gateway URL, `--url` is no longer what decides that -- the key
+  // is -- so what the recipe has to say is which of the two is load-bearing.
+  it('the setup recipe shows --url, and says what is and is not optional', () => {
     expect(skillMd).toContain('"${FEZOCTL_ARGV[@]}" setup --key-stdin --url <gateway url>');
-    expect(skillMd).toContain('`--url` is not optional in practice');
-    expect(skillMd).toContain('(not configured — pass --url or set FEZO_URL)');
-    expect(skillMdFlat).toContain('and exits non-zero');
+    expect(skillMd).toContain('`--url` is optional');
+    expect(skillMdFlat).toContain('What is NOT optional is the key');
+    expect(skillMdFlat).toContain('exits non-zero');
+  });
+
+  // The skill must not send the model hunting for a gateway URL that already
+  // resolves: "not configured" for the URL is a normal, working state.
+  it('states the built-in default gateway URL and that only the API key can be missing', () => {
+    expect(skillMd).toContain('https://zug-gateway.internal-iden3-dev.com');
+    expect(skillMdFlat).toContain('the only credential that can be missing is the API key');
+    expect(skillMdFlat).toContain('never ask the user for one just because');
   });
 
   // The `"${FEZOCTL_ARGV[@]}"` recipe above is required by the argv-array

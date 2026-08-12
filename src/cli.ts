@@ -539,13 +539,18 @@ function credentialResolutionFor(deps: CliDeps) {
   });
 }
 
+/**
+ * The gateway URL is not checked here, and cannot be: it always resolves
+ * (`DEFAULT_GATEWAY_URL` is the last rung of its chain), so the API key is the
+ * only credential whose absence can stop a command.
+ */
 function requireCredentials(deps: CliDeps, emit: Emit): ResolvedGateway | undefined {
   const resolution = credentialResolutionFor(deps);
-  if (resolution.url === undefined || resolution.apiKey === undefined) {
+  if (resolution.apiKey === undefined) {
     emitFailure(
       emit,
       'credentials-not-configured',
-      'gateway URL and/or API key are not configured; run `fezoctl setup --key-stdin` or set FEZO_URL/FEZO_API_KEY',
+      'the API key is not configured; run `fezoctl setup --key-stdin` or set FEZO_API_KEY',
     );
     return undefined;
   }
@@ -1087,6 +1092,12 @@ async function cmdListProviders(flags: Flags, deps: CliDeps, emit: Emit, exclude
  *     still slip through for any developer with the env var exported.
  *   - anything else (nothing resolved, or a mismatching value from the source
  *     just written) -> a hard verification failure.
+ *
+ * `source: 'default'` is deliberately NOT treated as shadowing: the built-in
+ * gateway URL is the LAST rung of resolution, so seeing it back means the
+ * write did not land, not that something outranked it. Reporting it as a
+ * shadow would print "default takes priority over dotenv", which is backwards,
+ * and would turn a real failed write into a cheerful `ok: true`.
  */
 function verifyStoredField(
   outcome: FieldStoreOutcome,
@@ -1095,6 +1106,14 @@ function verifyStoredField(
   expectedValue: string,
 ): FieldStoreOutcome {
   if (!outcome.ok) return outcome;
+  if (resolved !== undefined && resolved.source === 'default') {
+    return {
+      ok: false,
+      reason: 'verification-failed',
+      message:
+        'the write reported success but the value read back is the built-in default, which is the last source consulted — nothing was actually persisted',
+    };
+  }
   if (resolved !== undefined && resolved.source !== expectedSource) {
     return {
       ok: true,
@@ -1177,19 +1196,20 @@ async function cmdSetup(flags: Flags, deps: CliDeps, emit: Emit): Promise<number
 
   // Three conditions, not two: the API key stored, the URL (if one was being
   // stored) stored, AND the resulting configuration is actually usable — i.e.
-  // BOTH a URL and a key now resolve.
+  // a key now resolves.
   //
-  // That third condition is why `setup --key-stdin` with no `--url` no longer
-  // exits 0. It used to: `ok` ignored the URL entirely, so a run that stored
-  // the key and left the gateway URL unset printed "api key: stored" and exited
-  // 0, and the next command failed with `credentials-not-configured`. A `setup`
-  // that cannot be followed by a working `catalog` must not report success —
-  // and the exit code is the only part of that report a script or an agent
-  // reliably reads. The output still says exactly what DID get stored (see
-  // `renderSetup`), so nothing is lost by the non-zero exit: this is a partial
-  // success reported as incomplete, not a write failure. A user who supplies
-  // `FEZO_URL` by environment variable instead of `--url` already has it
-  // resolving at this point (resolution reads the env first), so they exit 0.
+  // That third condition is why a `setup` whose write silently failed cannot
+  // exit 0: `ok` used to ignore resolution entirely, so a run that reported a
+  // successful write printed "api key: stored" and exited 0 while the next
+  // command failed with `credentials-not-configured`. A `setup` that cannot be
+  // followed by a working `catalog` must not report success — and the exit code
+  // is the only part of that report a script or an agent reliably reads.
+  //
+  // Omitting `--url` is NOT such a case, and has not been since the gateway URL
+  // grew a built-in default (credentials.ts's `DEFAULT_GATEWAY_URL`): the
+  // resulting configuration really is usable, so it really does exit 0. The
+  // `configured url:` line names the source, so a user who meant to point at
+  // their own gateway can still see that they are on the default one.
   const ok =
     result.apiKey.ok && (result.url === undefined || result.url.ok) && setupProducedUsableConfig(display);
   return ok ? EXIT_OK : EXIT_OPERATIONAL;
@@ -1201,10 +1221,19 @@ async function cmdDoctor(flags: Flags, deps: CliDeps, emit: Emit): Promise<numbe
   const resolution = credentialResolutionFor(deps);
   const display = credentialDisplay(resolution);
 
+  // Always `ok` — the URL cannot fail to resolve. The two messages exist
+  // because "resolved from default" would otherwise read as a configuration
+  // the user made: nobody set this one, and someone on a different gateway
+  // needs to notice that before wondering why the catalog looks unfamiliar.
   checks.push(
-    resolution.url !== undefined
-      ? { name: 'gateway-url', status: 'ok', message: `FEZO_URL resolved from ${resolution.url.source}`, details: { url: display.url } }
-      : { name: 'gateway-url', status: 'fail', message: 'FEZO_URL is not configured (env, Keychain, or .env)' },
+    resolution.url.source === 'default'
+      ? {
+          name: 'gateway-url',
+          status: 'ok',
+          message: 'FEZO_URL is not configured; using the built-in default gateway',
+          details: { url: display.url },
+        }
+      : { name: 'gateway-url', status: 'ok', message: `FEZO_URL resolved from ${resolution.url.source}`, details: { url: display.url } },
   );
   checks.push(
     resolution.apiKey !== undefined
@@ -1213,7 +1242,7 @@ async function cmdDoctor(flags: Flags, deps: CliDeps, emit: Emit): Promise<numbe
   );
 
   let candidates: ToolCandidate[] | undefined;
-  if (resolution.url !== undefined && resolution.apiKey !== undefined) {
+  if (resolution.apiKey !== undefined) {
     try {
       candidates = await fetchCatalog({
         baseUrl: resolution.url.value,

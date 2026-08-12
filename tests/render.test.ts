@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ToolCandidate } from '../src/engine/catalog.js';
-import { credentialDisplay } from '../src/engine/credentials.js';
+import { credentialDisplay, DEFAULT_GATEWAY_URL } from '../src/engine/credentials.js';
 import type { CredentialResolution, StoreCredentialsResult } from '../src/engine/credentials.js';
 import type { RankedCandidate, RunSelection } from '../src/engine/rank.js';
 import type { AttemptLog, RunReport } from '../src/engine/retry.js';
@@ -538,7 +538,10 @@ describe('renderSetup', () => {
         message: 'the write reported success but could not be verified: resolution now answers from "env"',
       },
     };
-    const display = credentialDisplay({ apiKey: { value: 'sk-env-value', masked: 'sk-e…', source: 'env' } });
+    const display = credentialDisplay({
+      url: { value: 'https://gw.example.com', masked: 'http…', source: 'env' },
+      apiKey: { value: 'sk-env-value', masked: 'sk-e…', source: 'env' },
+    });
 
     const text = renderSetup({ result, display }, false);
     expect(text).toContain('NOT verified');
@@ -557,7 +560,8 @@ describe('renderSetup', () => {
       storage: 'keychain',
       apiKey: { ok: false, reason: 'verification-failed', message: 'the value could not be read back' },
     };
-    const text = renderSetup({ result, display: credentialDisplay({}) }, false);
+    const display = credentialDisplay({ url: { value: DEFAULT_GATEWAY_URL, masked: 'http…', source: 'default' } });
+    const text = renderSetup({ result, display }, false);
     expect(text).toContain('failed (the value could not be read back)');
   });
 });
@@ -582,10 +586,17 @@ describe('credentialDisplay', () => {
     expect(Object.keys(display.apiKey ?? {}).sort()).toEqual(['masked', 'source']);
   });
 
-  it('omits url/apiKey entirely (not present-but-undefined) when the resolution has none', () => {
-    const display = credentialDisplay({});
-    expect(Object.hasOwn(display, 'url')).toBe(false);
+  it('omits apiKey entirely (not present-but-undefined) when the resolution has none', () => {
+    const display = credentialDisplay({ url: { value: DEFAULT_GATEWAY_URL, masked: 'http…', source: 'default' } });
     expect(Object.hasOwn(display, 'apiKey')).toBe(false);
+  });
+
+  // The URL has no such case: it always resolves, so a display always carries
+  // one. What varies is the source, and that is what a reader has to be able to
+  // see — a default gateway nobody chose must not look like a configured one.
+  it('always carries a url, and reports the built-in default as source "default"', () => {
+    const display = credentialDisplay({ url: { value: DEFAULT_GATEWAY_URL, masked: 'http…', source: 'default' } });
+    expect(display.url).toEqual({ value: DEFAULT_GATEWAY_URL, source: 'default' });
   });
 
   it('keeps the URL value as-is, since a gateway URL is not a secret', () => {

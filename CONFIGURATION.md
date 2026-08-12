@@ -57,13 +57,31 @@ boilerplate. Concretely:
 
 | Variable | Purpose |
 | --- | --- |
-| `FEZO_URL` | The gateway's base URL. |
-| `FEZO_API_KEY` | Your gateway API key. |
+| `FEZO_URL` | The gateway's base URL. Optional — defaults to `https://zug-gateway.internal-iden3-dev.com`. |
+| `FEZO_API_KEY` | Your gateway API key. Required; there is no default. |
 
 These are the only two environment variables `fezoctl` reads for
 credentials — there are no aliases. Any other name is ignored silently, so if
 a credential is not taking effect, check the spelling of the variable before
 anything else; `fezoctl doctor` reports what actually resolved.
+
+### The default gateway URL
+
+`fezoctl` ships with a built-in gateway URL
+(`https://zug-gateway.internal-iden3-dev.com`, `credentials.ts`'s
+`DEFAULT_GATEWAY_URL`). It is the **last** source consulted for the URL, below
+all three below — so configuring `FEZO_URL`, a Keychain item, or a `.env` entry
+always wins, and pointing `fezoctl` at a different gateway needs no code
+change. `doctor` and `setup` report a defaulted URL as `source: default`,
+which is how you tell "nobody configured this" from "this is what I chose".
+
+**The API key has no default and must not grow one.** A default key would
+either be a live credential committed to the repository or a placeholder that
+turns "you configured nothing" into a 401 from the gateway. A default URL has
+neither property: it is not a secret, and a wrong gateway fails loudly at the
+first catalog fetch. So the only credential `setup` genuinely has to supply is
+the key — `setup --key-stdin` with no `--url` now produces a complete, usable
+configuration and exits `0`.
 
 ## `FEZO_EXCLUDED_BACKENDS` (not a credential)
 
@@ -115,7 +133,8 @@ unaffected, only what `fezoctl` will actually call.
 
 `FEZO_URL` and `FEZO_API_KEY` are each resolved independently through the
 same three sources, in this priority order, stopping at the first one with a
-non-empty value:
+non-empty value (`FEZO_URL` then has a fourth rung the key does not — the
+built-in default described above):
 
 1. The environment variable (`FEZO_URL` / `FEZO_API_KEY`).
 2. macOS Keychain (see below). This step is always **attempted**, never
@@ -127,10 +146,13 @@ non-empty value:
    the outcome is the same as skipping it, but the mechanism is a failed
    lookup, not an absent runner.
 3. The `.env` config file (see below).
+4. **`FEZO_URL` only:** the built-in `DEFAULT_GATEWAY_URL`. An unconfigured
+   API key simply does not resolve, and every command then fails with
+   `the API key is not configured`.
 
 `fezoctl doctor` reports which source won for each value (`env`, `keychain`,
-or `dotenv`) — run it if you're not sure which credential is actually in
-effect. Each `ok` credential check also prints a
+`dotenv`, or — for the URL — `default`) — run it if you're not sure which
+credential is actually in effect. Each `ok` credential check also prints a
 pretty-printed `details` block: the URL in full, the API key **masked**.
 Verified (against a local test gateway, hence the `localhost` URL; the
 `details` JSON's continuation lines are not re-indented, which is what the
@@ -257,27 +279,29 @@ command — `setup --key-stdin` reads immediate end-of-file, stores nothing, and
 exits **2** with `api key: failed (no API key was provided; nothing was
 stored)`.
 
-`--url` is not optional in practice. `fezoctl` needs a gateway URL *and* an API
-key for every other command, so a `setup` that stores only the key reports the
-gap and exits **2**:
+`--url` **is** optional: omitting it stores only the key and leaves the gateway
+at the built-in default, which is a complete configuration. `setup` says so
+explicitly and exits **0**:
 
 ```
 setup — storage: dotenv
   api key: stored
-  configured url: (not configured — pass --url or set FEZO_URL)
+  configured url: https://zug-gateway.internal-iden3-dev.com (source: default)
   configured api key: sk-l… (source: dotenv)
-  this configuration is NOT usable yet: fezoctl needs BOTH a gateway URL and an API key.
 ```
 
-The key really was stored (that line is not a lie); the non-zero exit reports
-that the *configuration* is incomplete, which is what the pre-fix `setup` hid by
-exiting 0 while the next command failed with `credentials-not-configured`.
-Supplying the URL through an exported `FEZO_URL` instead of `--url` also
-satisfies it — resolution reads the environment first. Under `--json` the same
-state is the top-level `"usable": false`.
+`(source: default)` is the part to read: it distinguishes a gateway nobody
+chose from one you configured. Pass `--url` only to point somewhere else.
 
-With a URL, `setup` prints a confirmation with the masked key and the resolved
-source — never the raw key:
+What `setup` still refuses to call a success is a run that stores **no key** —
+the one credential with no default. That prints `this configuration is NOT
+usable yet: fezoctl needs an API key.` and exits **2**, which under `--json` is
+the top-level `"usable": false`. The distinction matters because the exit code
+is the only part of the report a script or an agent reliably reads: a `setup`
+that cannot be followed by a working `catalog` must not exit 0.
+
+With an explicit `--url`, `setup` prints a confirmation with the masked key and
+the resolved source — never the raw key:
 
 ```
 setup — storage: dotenv
@@ -335,7 +359,8 @@ Two ways to rotate a `dotenv`-stored credential:
    rotation. This preserves the file's existing `0600` mode and leaves
    `FEZO_URL` alone — it is the smaller, safer of the two.
 
-2. **Remove the file and re-run `setup`** — but **pass `--url` again**:
+2. **Remove the file and re-run `setup`** — and **pass `--url` again if you are
+   not on the default gateway**:
 
    ```bash
    rm ~/.config/fezo/.env
@@ -343,29 +368,30 @@ Two ways to rotate a `dotenv`-stored credential:
    ```
 
    `setup` writes the whole file, not a patch, so a re-run without `--url`
-   leaves you with a `.env` containing only `FEZO_API_KEY` and no gateway URL —
-   and `setup` says so and exits `2`, because the configuration it just wrote is
-   not usable. Verified — same run, `--url` omitted:
+   leaves you with a `.env` containing only `FEZO_API_KEY` — **your custom
+   gateway URL is gone**, and resolution silently falls back to the built-in
+   default. Since that default is a working configuration, `setup` exits `0`
+   here: the only thing that tells you the URL changed is the `configured url:`
+   line and its source. Verified — same run, `--url` omitted:
 
    ```
    $ rm ~/.config/fezo/.env
    $ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup --key-stdin
    setup — storage: dotenv
      api key: stored
-     configured url: (not configured — pass --url or set FEZO_URL)
+     configured url: https://zug-gateway.internal-iden3-dev.com (source: default)
      configured api key: sk-l… (source: dotenv)
-     this configuration is NOT usable yet: fezoctl needs BOTH a gateway URL and an API key.
    $ echo $?
-   2
+   0
    $ cat ~/.config/fezo/.env
    FEZO_API_KEY=sk-live-rotated-key
    ```
 
-   The URL is gone, and the exit code is how you find that out without reading
-   the output. The new key *was* stored — this is a partial success reported as
-   incomplete, not a failed write (see ["`setup`'s exit
-   code"](#setups-exit-code)). Run `fezoctl doctor` after either route to
-   confirm what is actually in effect.
+   This is the one place the default costs you something: rotating this way used
+   to fail loudly when it dropped your URL, and now it succeeds against a
+   different gateway. **Read the `configured url:` line, or prefer route 1**,
+   which never touches the URL at all. Run `fezoctl doctor` after either route
+   to confirm what is actually in effect.
 
 ## `setup`'s exit code
 
@@ -375,14 +401,11 @@ Two ways to rotate a `dotenv`-stored credential:
    write that reported an error.
 2. **A value it just wrote could not be read back**, and nothing
    higher-priority explains why.
-3. **The resulting configuration is still not usable** — after the write, a
-   gateway URL and an API key do not *both* resolve. This is the
-   `--url`-omitted case shown twice above: the key really was stored, but
-   `fezoctl` cannot call anything without a URL, so `setup` prints
-   `this configuration is NOT usable yet: …` and exits `2` rather than
-   reporting a success the next command would contradict. Supplying the URL
-   through an exported `FEZO_URL` instead of `--url` satisfies it, because
-   resolution reads the environment first.
+3. **The resulting configuration is still not usable** — after the write, no
+   API key resolves. `setup` prints `this configuration is NOT usable yet:
+   fezoctl needs an API key.` and exits `2` rather than reporting a success the
+   next command would contradict. The gateway URL cannot put you here: it
+   always resolves, defaulting if nothing configured one.
 
 Otherwise it exits `0`.
 

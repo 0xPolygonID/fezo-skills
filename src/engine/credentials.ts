@@ -38,6 +38,10 @@
 // env var, then macOS Keychain, then `.env`. There is exactly one accepted
 // name per credential — no aliases — so "which variable is actually in
 // effect" has a single answer at every call site.
+//
+// The gateway URL has one further, lowest-priority source the API key does
+// not: `DEFAULT_GATEWAY_URL`, a built-in fallback. See that constant for why
+// the asymmetry is deliberate.
 
 import { spawnSync } from 'node:child_process';
 import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
@@ -468,7 +472,29 @@ export function writeDotEnvFile(path: string, values: Readonly<Record<string, st
 // Resolution.
 // ---------------------------------------------------------------------------
 
-export type CredentialSource = 'env' | 'keychain' | 'dotenv';
+/**
+ * The gateway `fezoctl` talks to when nothing else names one — the last rung
+ * of the URL's resolution chain, below env, Keychain, and `.env`.
+ *
+ * The API key has no equivalent and must not grow one: a default key would
+ * either be a real credential committed to this repository, or a placeholder
+ * that turns "you have not configured anything" into a 401 from the gateway.
+ * A default URL has neither property — it is not a secret, and pointing at the
+ * wrong gateway fails loudly at the first catalog fetch rather than quietly.
+ *
+ * Anyone on another gateway overrides it the same way they would override any
+ * other source: `FEZO_URL`, a Keychain item, or `~/.config/fezo/.env`. All
+ * three win, because this is the LAST source consulted, not the first.
+ */
+export const DEFAULT_GATEWAY_URL = 'https://zug-gateway.internal-iden3-dev.com';
+
+/**
+ * Where a resolved credential came from. `'default'` is reachable for the
+ * gateway URL only (`DEFAULT_GATEWAY_URL`) and means the user configured
+ * nothing — which is why `doctor` and `setup` word it differently from the
+ * three sources that represent an actual choice.
+ */
+export type CredentialSource = 'env' | 'keychain' | 'dotenv' | 'default';
 
 export interface ResolvedValue {
   /**
@@ -491,7 +517,13 @@ export interface ResolvedValue {
 }
 
 export interface CredentialResolution {
-  url?: ResolvedValue;
+  /**
+   * Never absent: `DEFAULT_GATEWAY_URL` backstops the three configurable
+   * sources, so "which gateway would this command talk to" always has an
+   * answer. Read `source` to tell a configured URL from the built-in one —
+   * `'default'` means the user chose nothing.
+   */
+  url: ResolvedValue;
   apiKey?: ResolvedValue;
 }
 
@@ -512,7 +544,7 @@ export interface CredentialResolution {
 // ---------------------------------------------------------------------------
 
 export interface CredentialDisplay {
-  url?: { value: string; source: CredentialSource };
+  url: { value: string; source: CredentialSource };
   apiKey?: { masked: string; source: CredentialSource };
 }
 
@@ -524,9 +556,7 @@ export interface CredentialDisplay {
  */
 export function credentialDisplay(resolution: CredentialResolution): CredentialDisplay {
   return {
-    ...(resolution.url !== undefined
-      ? { url: { value: resolution.url.value, source: resolution.url.source } }
-      : {}),
+    url: { value: resolution.url.value, source: resolution.url.source },
     ...(resolution.apiKey !== undefined
       ? { apiKey: { masked: resolution.apiKey.masked, source: resolution.apiKey.source } }
       : {}),
@@ -589,13 +619,19 @@ function resolveOne(options: ResolveOneOptions): ResolvedValue | undefined {
 
 /**
  * Resolves `FEZO_URL` and `FEZO_API_KEY` independently, each through the
- * same three-source chain, and reports where each came from (`doctor`, a
- * later task, renders this as the credential source).
+ * same three-source chain, and reports where each came from (`doctor` renders
+ * this as the credential source).
  *
- * A missing credential is not an error here — it is an ordinary outcome,
- * reported by the corresponding field being absent from the result — so
- * callers can decide how to render "not configured" (a later task's job, not
- * this function's).
+ * The URL then has a fourth rung the key does not: an unconfigured URL falls
+ * back to `DEFAULT_GATEWAY_URL` with `source: 'default'` rather than coming
+ * back absent, which is why `CredentialResolution.url` is not optional. The
+ * fallback is applied HERE, at the single resolution point, rather than at
+ * each call site — a default a caller has to remember to apply is a default
+ * some caller will forget, and the ones that forgot would report "not
+ * configured" for a gateway the next command happily calls.
+ *
+ * A missing API key is still an ordinary outcome, reported by `apiKey` being
+ * absent, so callers decide how to render "not configured".
  */
 export function resolveCredentials(options: ResolveCredentialsOptions = {}): CredentialResolution {
   const env = options.env ?? process.env;
@@ -618,7 +654,7 @@ export function resolveCredentials(options: ResolveCredentialsOptions = {}): Cre
   });
 
   return {
-    ...(url !== undefined ? { url } : {}),
+    url: url ?? resolved(DEFAULT_GATEWAY_URL, 'default'),
     ...(apiKey !== undefined ? { apiKey } : {}),
   };
 }

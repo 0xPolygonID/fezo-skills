@@ -8575,9 +8575,10 @@ function writeDotEnvFile(path, values) {
   }
   return { ok: true };
 }
+var DEFAULT_GATEWAY_URL = "https://zug-gateway.internal-iden3-dev.com";
 function credentialDisplay(resolution) {
   return {
-    ...resolution.url !== void 0 ? { url: { value: resolution.url.value, source: resolution.url.source } } : {},
+    url: { value: resolution.url.value, source: resolution.url.source },
     ...resolution.apiKey !== void 0 ? { apiKey: { masked: resolution.apiKey.masked, source: resolution.apiKey.source } } : {}
   };
 }
@@ -8620,7 +8621,7 @@ function resolveCredentials(options = {}) {
     keychain: options.keychain
   });
   return {
-    ...url !== void 0 ? { url } : {},
+    url: url ?? resolved(DEFAULT_GATEWAY_URL, "default"),
     ...apiKey !== void 0 ? { apiKey } : {}
   };
 }
@@ -10561,9 +10562,8 @@ function describeStoreOutcome(outcome) {
   return "stored";
 }
 function setupProducedUsableConfig(display) {
-  return display.url !== void 0 && display.apiKey !== void 0;
+  return display.apiKey !== void 0;
 }
-var NO_URL_CONFIGURED_TEXT = "(not configured \u2014 pass --url or set FEZO_URL)";
 function renderSetup(input, json) {
   const usable = setupProducedUsableConfig(input.display);
   if (json) {
@@ -10574,13 +10574,11 @@ function renderSetup(input, json) {
   if (input.result.url !== void 0) {
     lines.push(`  url: ${describeStoreOutcome(input.result.url)}`);
   }
-  lines.push(
-    input.display.url !== void 0 ? `  configured url: ${input.display.url.value} (source: ${input.display.url.source})` : `  configured url: ${NO_URL_CONFIGURED_TEXT}`
-  );
+  lines.push(`  configured url: ${input.display.url.value} (source: ${input.display.url.source})`);
   if (input.display.apiKey !== void 0) lines.push(`  configured api key: ${input.display.apiKey.masked} (source: ${input.display.apiKey.source})`);
   else lines.push("  configured api key: (not configured)");
   if (!usable) {
-    lines.push("  this configuration is NOT usable yet: fezoctl needs BOTH a gateway URL and an API key.");
+    lines.push("  this configuration is NOT usable yet: fezoctl needs an API key.");
   }
   return lines.join("\n");
 }
@@ -10853,11 +10851,11 @@ function credentialResolutionFor(deps) {
 }
 function requireCredentials(deps, emit) {
   const resolution = credentialResolutionFor(deps);
-  if (resolution.url === void 0 || resolution.apiKey === void 0) {
+  if (resolution.apiKey === void 0) {
     emitFailure(
       emit,
       "credentials-not-configured",
-      "gateway URL and/or API key are not configured; run `fezoctl setup --key-stdin` or set FEZO_URL/FEZO_API_KEY"
+      "the API key is not configured; run `fezoctl setup --key-stdin` or set FEZO_API_KEY"
     );
     return void 0;
   }
@@ -11177,6 +11175,13 @@ async function cmdListProviders(flags, deps, emit, excluded) {
 }
 function verifyStoredField(outcome, expectedSource, resolved2, expectedValue) {
   if (!outcome.ok) return outcome;
+  if (resolved2 !== void 0 && resolved2.source === "default") {
+    return {
+      ok: false,
+      reason: "verification-failed",
+      message: "the write reported success but the value read back is the built-in default, which is the last source consulted \u2014 nothing was actually persisted"
+    };
+  }
   if (resolved2 !== void 0 && resolved2.source !== expectedSource) {
     return {
       ok: true,
@@ -11227,13 +11232,18 @@ async function cmdDoctor(flags, deps, emit) {
   const resolution = credentialResolutionFor(deps);
   const display = credentialDisplay(resolution);
   checks.push(
-    resolution.url !== void 0 ? { name: "gateway-url", status: "ok", message: `FEZO_URL resolved from ${resolution.url.source}`, details: { url: display.url } } : { name: "gateway-url", status: "fail", message: "FEZO_URL is not configured (env, Keychain, or .env)" }
+    resolution.url.source === "default" ? {
+      name: "gateway-url",
+      status: "ok",
+      message: "FEZO_URL is not configured; using the built-in default gateway",
+      details: { url: display.url }
+    } : { name: "gateway-url", status: "ok", message: `FEZO_URL resolved from ${resolution.url.source}`, details: { url: display.url } }
   );
   checks.push(
     resolution.apiKey !== void 0 ? { name: "api-key", status: "ok", message: `FEZO_API_KEY resolved from ${resolution.apiKey.source}`, details: { apiKey: display.apiKey } } : { name: "api-key", status: "fail", message: "FEZO_API_KEY is not configured (env, Keychain, or .env)" }
   );
   let candidates;
-  if (resolution.url !== void 0 && resolution.apiKey !== void 0) {
+  if (resolution.apiKey !== void 0) {
     try {
       candidates = await fetchCatalog({
         baseUrl: resolution.url.value,

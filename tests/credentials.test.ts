@@ -5,6 +5,7 @@ import { isAbsolute, join, sep } from 'node:path';
 import { Readable } from 'node:stream';
 
 import {
+  DEFAULT_GATEWAY_URL,
   defaultDotEnvPath,
   maskSecret,
   normalizeCredentialValue,
@@ -120,13 +121,12 @@ describe('resolveCredentials — precedence', () => {
     });
   });
 
-  it('a value absent from every source is omitted from the result entirely, not present-but-undefined', () => {
+  it('an API key absent from every source is omitted from the result entirely, not present-but-undefined', () => {
     const resolution = resolveCredentials({
       env: {},
       dotEnvPath: '/nonexistent/.env',
     });
     expect(Object.hasOwn(resolution, 'apiKey')).toBe(false);
-    expect(Object.hasOwn(resolution, 'url')).toBe(false);
   });
 
   it('an empty-string env var is treated as absent, not as an empty credential', () => {
@@ -138,6 +138,69 @@ describe('resolveCredentials — precedence', () => {
         dotEnvPath,
       });
       expect(resolution.apiKey).toEqual({ value: 'sk-from-dotenv', masked: 'sk-f…', source: 'dotenv' });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The gateway URL's built-in default. It is the LAST rung of the URL's chain,
+// which is the whole of its contract: it must answer when nothing else does,
+// and must never win over something the user actually configured. Both halves
+// are pinned here, because a default that silently outranked a real `.env`
+// would point every call at the wrong gateway with no diagnostic anywhere —
+// `doctor` would report a URL and the catalog would simply be someone else's.
+//
+// The API key deliberately has no counterpart: a default key would either be a
+// live credential in this repository or a placeholder that turns "unconfigured"
+// into a 401.
+// ---------------------------------------------------------------------------
+
+describe('resolveCredentials — the default gateway URL', () => {
+  it('answers with DEFAULT_GATEWAY_URL, tagged source "default", when no source configures one', () => {
+    const resolution = resolveCredentials({ env: {}, dotEnvPath: '/nonexistent/.env' });
+    expect(resolution.url).toEqual({
+      value: DEFAULT_GATEWAY_URL,
+      masked: maskSecret(DEFAULT_GATEWAY_URL),
+      source: 'default',
+    });
+  });
+
+  it('is the specific gateway this build ships', () => {
+    // Pinned as a literal, not derived: the value is the point of the default,
+    // and a typo in it is a wrong gateway rather than a test failure everywhere
+    // else. Changing it is a deliberate act that should update this line too.
+    expect(DEFAULT_GATEWAY_URL).toBe('https://zug-gateway.internal-iden3-dev.com');
+  });
+
+  it('loses to every configured source: env, Keychain, and .env each win', () => {
+    withTmpDir((dir) => {
+      const dotEnvPath = join(dir, '.env');
+      writeDotEnvFile(dotEnvPath, { FEZO_URL: 'https://dotenv.example.com' });
+
+      const fromEnv = resolveCredentials({ env: { FEZO_URL: 'https://env.example.com' }, dotEnvPath });
+      expect(fromEnv.url.value).toBe('https://env.example.com');
+      expect(fromEnv.url.source).toBe('env');
+
+      const { runner } = recordingKeychainRunner({ status: 0, stdout: 'https://keychain.example.com\n', stderr: '' });
+      const fromKeychain = resolveCredentials({ env: {}, dotEnvPath, keychain: runner });
+      expect(fromKeychain.url.value).toBe('https://keychain.example.com');
+      expect(fromKeychain.url.source).toBe('keychain');
+
+      const fromDotEnv = resolveCredentials({ env: {}, dotEnvPath });
+      expect(fromDotEnv.url.value).toBe('https://dotenv.example.com');
+      expect(fromDotEnv.url.source).toBe('dotenv');
+    });
+  });
+
+  it('an empty FEZO_URL falls through to the default rather than resolving to an empty URL', () => {
+    // Same rule the API key already follows (`''` means "omitted", not "set to
+    // nothing") -- an empty base URL would otherwise produce a request to a
+    // relative path and a confusing transport error instead of a working call.
+    const resolution = resolveCredentials({ env: { FEZO_URL: '' }, dotEnvPath: '/nonexistent/.env' });
+    expect(resolution.url).toEqual({
+      value: DEFAULT_GATEWAY_URL,
+      masked: maskSecret(DEFAULT_GATEWAY_URL),
+      source: 'default',
     });
   });
 });
@@ -166,7 +229,14 @@ describe('resolveCredentials — no env var aliases', () => {
         },
         dotEnvPath: '/nonexistent/.env',
       });
-      expect(Object.hasOwn(resolution, 'url')).toBe(false);
+      // The URL falls back to the built-in default -- which is itself the proof
+      // that `FEZO_GATEWAY_URL` was not consulted: had it been, `source` would
+      // read `env` and the value would be the near-miss one.
+      expect(resolution.url).toEqual({
+        value: DEFAULT_GATEWAY_URL,
+        masked: maskSecret(DEFAULT_GATEWAY_URL),
+        source: 'default',
+      });
       expect(Object.hasOwn(resolution, 'apiKey')).toBe(false);
     });
     // Not merely unresolved -- silent. An env var this module does not accept
@@ -182,12 +252,12 @@ describe('resolveCredentials — no env var aliases', () => {
     expect(resolution.apiKey).toEqual({ value: 'sk-canonical', masked: 'sk-c…', source: 'env' });
   });
 
-  it('reports exactly three source strings across every resolvable path — no env-alias fourth', () => {
+  it('reports exactly four source strings across every resolvable path — no env-alias fifth', () => {
     // `CredentialSource` is a union `doctor` renders verbatim, so an added
-    // member is a user-visible output change. Two resolutions are needed to
-    // observe all three: a single call resolves at most two values, so one
-    // call alone could never distinguish "three sources exist" from "the two
-    // this call happened to hit".
+    // member is a user-visible output change. Several resolutions are needed to
+    // observe all four: a single call resolves at most two values, so one
+    // call alone could never distinguish "four sources exist" from "the two
+    // this call happened to hit". `default` is reachable for the URL only.
     withTmpDir((dir) => {
       const dotEnvPath = join(dir, '.env');
       writeDotEnvFile(dotEnvPath, { FEZO_URL: 'https://dotenv.example.com' });
@@ -211,10 +281,15 @@ describe('resolveCredentials — no env var aliases', () => {
       });
       expect([b.url?.source, b.apiKey?.source]).toEqual(['keychain', 'keychain']);
 
-      // The closed set: three strings, and no env-derived source other than
+      // Nothing anywhere: the URL falls to the built-in default (the API key
+      // has no such rung and stays absent).
+      const c = resolveCredentials({ env: {}, dotEnvPath: '/nonexistent/.env' });
+      expect(c.url.source).toBe('default');
+
+      // The closed set: four strings, and no env-derived source other than
       // `env` itself.
-      const observed = [a.url, a.apiKey, b.url, b.apiKey].map((v) => v?.source);
-      expect([...new Set(observed)].sort()).toEqual(['dotenv', 'env', 'keychain']);
+      const observed = [a.url, a.apiKey, b.url, b.apiKey, c.url].map((v) => v?.source);
+      expect([...new Set(observed)].sort()).toEqual(['default', 'dotenv', 'env', 'keychain']);
     });
   });
 });

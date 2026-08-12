@@ -86,8 +86,18 @@ Credentials (gateway URL and API key) live outside this repository. They are
 resolved from three sources, in this order: the environment (`FEZO_URL` /
 `FEZO_API_KEY` — the only two names accepted), the macOS Keychain, and
 finally `~/.config/fezo/.env` (or `$XDG_CONFIG_HOME/fezo/.env` if that
-variable is set). Check what is already configured before concluding that
-anything is missing:
+variable is set).
+
+**The gateway URL has a fourth, last-resort source the API key does not: a
+built-in default.** When none of the three above names one, `fezoctl` uses
+`https://zug-gateway.internal-iden3-dev.com` and reports the source as
+`default`. So the only credential that can be missing is the API key — never
+assume a URL needs configuring, and never ask the user for one just because
+`doctor` says "not configured; using the built-in default". A user on a
+different gateway sets `FEZO_URL` (or stores one via `setup --url`), and any of
+the three real sources outranks the default.
+
+Check what is already configured before concluding that anything is missing:
 
 ```bash
 "${FEZOCTL_ARGV[@]}" doctor
@@ -150,10 +160,14 @@ stores nothing, and exits 2. The whole output, verified:
 setup — storage: dotenv
   api key: failed (no API key was provided; nothing was stored)
   url: failed (no API key was provided; nothing was stored)
-  configured url: (not configured — pass --url or set FEZO_URL)
+  configured url: https://zug-gateway.internal-iden3-dev.com (source: default)
   configured api key: (not configured)
-  this configuration is NOT usable yet: fezoctl needs BOTH a gateway URL and an API key.
+  this configuration is NOT usable yet: fezoctl needs an API key.
 ```
+
+Read that `configured url:` line carefully before reporting it: `source:
+default` is the built-in fallback, not something the failed write stored. The
+only thing that went wrong here is the API key.
 
 Every Bash tool call you make yourself has exactly the same stdin, so there is
 no variant of this you can run for them either. The user runs it in their own
@@ -171,7 +185,10 @@ takes effect immediately, which is why it is the option to offer first.
 
 What you MAY collect through `AskUserQuestion`: the **gateway URL** and the
 **storage choice** (`dotenv` or `keychain`). Neither is a secret; the API key
-is the only value that is.
+is the only value that is. Ask about the URL only when there is a reason to
+believe the user is on a gateway other than the built-in default — a `doctor`
+run that reaches the default gateway and gets an unexpected catalog, or the
+user saying so. Otherwise omit `--url` and let the default stand.
 
 In this file's own notation, the command is:
 
@@ -186,11 +203,12 @@ would expand to `setup: command not found`. Expand it to the literal
 invocation step 0 resolved, as in the one-liner above, before handing anything
 over.
 
-`--url` is not optional in practice. A `setup` that stores only the key leaves
-the configuration unusable, and says so: it prints
-`configured url: (not configured — pass --url or set FEZO_URL)` and exits
-non-zero, and every other command then fails with `gateway URL and/or API key
-are not configured`. Either pass `--url`, or have `FEZO_URL` already exported.
+`--url` is optional: dropping it stores only the key and leaves the gateway at
+the built-in default, which is a complete, working configuration — `setup`
+exits 0 and prints `configured url: https://zug-gateway.internal-iden3-dev.com
+(source: default)`. Pass `--url` only to point at a different gateway. What is
+NOT optional is the key: a `setup` that stores no key exits non-zero, and every
+other command then fails with `the API key is not configured`.
 
 ## Resolve fezoctl
 
