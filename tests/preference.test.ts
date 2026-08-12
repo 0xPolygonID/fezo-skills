@@ -67,6 +67,7 @@ function makeCandidate(
     inputSchema: {},
     userSettings: [],
     backendInfoText: '',
+    backendCategories: [],
     billingModel: 'dynamic',
   };
   return { ...base, ...overrides };
@@ -469,32 +470,49 @@ describe('inferCapability', () => {
   });
 
   it('resolves multiple matches via an exact-phrase winner over a single-token match', () => {
-    // "google search" (serp, multi-word) beats a coincidental "scrape" hit? No —
-    // use an intent where scrape matches by bare token and serp matches by phrase.
+    // `scrape` matches by bare token, `web-search` by the multi-word phrase
+    // "google search", so the phrase wins.
     const result = inferCapability('scrape the google search results page');
     expect(result.kind).toBe('matched');
     if (result.kind === 'matched') {
-      expect(result.capability).toBe('serp');
+      expect(result.capability).toBe('web-search');
     }
   });
 
   it('is ambiguous when multiple capabilities match with no exact-phrase winner', () => {
+    // Both hits are bare single tokens ("serp" -> web-search, "scrape" ->
+    // scrape), so neither wins the phrase tie-break.
     const result = inferCapability('serp scrape');
     expect(result.kind).toBe('ambiguous');
     if (result.kind === 'ambiguous') {
       const capabilities = result.candidates.map((c) => c.capability).sort();
-      expect(capabilities).toEqual(['scrape', 'serp']);
+      expect(capabilities).toEqual(['scrape', 'web-search']);
     }
   });
 
   it('is ambiguous when two capabilities each win on an exact phrase', () => {
-    // "google search" (serp) and "search web" (web-search) are both
-    // multi-word phrase hits, so neither uniquely wins the phrase tie-break.
-    const result = inferCapability('google search web');
+    // "fetch page" (scrape) and "web search" (web-search) are both multi-word
+    // phrase hits, so neither uniquely wins the phrase tie-break.
+    const result = inferCapability('fetch page then web search');
     expect(result.kind).toBe('ambiguous');
     if (result.kind === 'ambiguous') {
       const capabilities = result.candidates.map((c) => c.capability).sort();
-      expect(capabilities).toEqual(['serp', 'web-search']);
+      expect(capabilities).toEqual(['scrape', 'web-search']);
+    }
+  });
+
+  // The `serp` capability was folded into `web-search` (see preference.ts's
+  // header). This test pins the reason it was folded rather than merely
+  // renamed: wording that names both a search engine and the web used to hit
+  // two capabilities that shared one declared ordering, and `run` refused as
+  // `ambiguous-capability` over a distinction this repo's provider policy does
+  // not draw. One capability now owns both phrasings, so it resolves.
+  it('no longer treats SERP wording and web-search wording as competing capabilities', () => {
+    const result = inferCapability('google search web');
+    expect(result.kind).toBe('matched');
+    if (result.kind === 'matched') {
+      expect(result.capability).toBe('web-search');
+      expect(result.matchedPhrases.sort()).toEqual(['google search', 'search web']);
     }
   });
 });
@@ -503,6 +521,20 @@ describe('inferCapability', () => {
 describe('CAPABILITY_KEYWORDS and CAPABILITY_PREFERENCES', () => {
   it('define preference hints for every capability that has keywords', () => {
     expect(Object.keys(CAPABILITY_PREFERENCES).sort()).toEqual(Object.keys(CAPABILITY_KEYWORDS).sort());
+  });
+
+  // The same assertion intent.ts's METHOD_INTENTS and providers.ts's
+  // RECOMMENDATIONS carry in their own tests. It matters MORE here, not less:
+  // this table is derived, so its arrays are fresh objects rather than the
+  // declared table's own, and a consumer that sorted one in place would
+  // silently reorder `run`'s tie-break process-wide while providers.ts still
+  // read correctly. `readonly string[]` stops that at compile time only —
+  // nothing stops a JS consumer of the shipped bundle.
+  it('freezes the derived table and each of its lists', () => {
+    expect(Object.isFrozen(CAPABILITY_PREFERENCES)).toBe(true);
+    for (const list of Object.values(CAPABILITY_PREFERENCES)) {
+      expect(Object.isFrozen(list)).toBe(true);
+    }
   });
 
   it('makes every capability in CAPABILITY_KEYWORDS reachable through inferCapability', () => {
@@ -611,9 +643,12 @@ describe('rankCandidates', () => {
 
   it('lets a higher term score beat capability preference (tier 4 is compared before tier 5)', () => {
     // Load-bearing consequence of the tier order, pinned so it cannot change
-    // silently: firecrawl is CAPABILITY_PREFERENCES.scrape[0] and scrapingbee
-    // is [1], but scrapingbee scores higher on terms (both query terms hit its
-    // identifiers, weight 3 each) and therefore wins outright.
+    // silently: firecrawl and scrapingbee both appear in
+    // CAPABILITY_PREFERENCES.scrape (now a view of providers.ts's declared
+    // `scrape` RECOMMENDATIONS: firecrawl ranks ahead of scrapingbee there),
+    // but scrapingbee scores higher on terms (both query terms hit its
+    // identifiers, weight 3 each) and therefore wins outright regardless of
+    // which one the declared table prefers.
     const preferred = makeCandidate({
       backendId: 'firecrawl',
       method: 'fetch',
@@ -630,9 +665,11 @@ describe('rankCandidates', () => {
 
     expect(ranked[0]?.candidate.backendId).toBe('scrapingbee');
     expect(ranked[0]?.explanation.termScore).toBe(6);
-    expect(ranked[0]?.explanation.preference).toEqual({ capability: 'scrape', position: 1 });
-    // ...and the loser really was the top-preference backend.
-    expect(ranked[1]?.explanation.preference).toEqual({ capability: 'scrape', position: 0 });
+    // scrapingbee is a `fallback`-tier entry in the declared `scrape` list
+    // (providers.ts), well behind firecrawl -- and still wins on term score.
+    expect(ranked[0]?.explanation.preference).toEqual({ capability: 'scrape', position: 6 });
+    // ...and the loser really was ranked ahead of it in the declared table.
+    expect(ranked[1]?.explanation.preference).toEqual({ capability: 'scrape', position: 2 });
     expect(ranked[1]?.explanation.termScore).toBe(2);
   });
 
@@ -687,19 +724,34 @@ describe('selectForRun', () => {
     expect(result.outcome).toBe('selected');
     if (result.outcome === 'selected') {
       expect(result.chosen.candidate.backendId).toBe('exa');
-      expect(result.chosen.explanation.preference).toEqual({ capability: 'web-search', position: 0 });
+      // `web-search` is now a view of providers.ts's declared `search` list
+      // (['you', 'exa', 'brave', 'firecrawl', 'geonode']); `you` is not among
+      // the matched candidates here, so exa (position 1 in that list) is
+      // still the best-ranked of the three that are.
+      expect(result.chosen.explanation.preference).toEqual({ capability: 'web-search', position: 1 });
       // The whole matched set survived async exclusion, firecrawl included.
       expect(result.ranked.map((r) => r.candidate.backendId).sort()).toEqual(['brave', 'exa', 'firecrawl']);
     }
   });
 
-  it('selects firecrawl for "scrape url" over scraperapi/brightdata, with all three backends\' real info text', () => {
-    // Against the live catalog these are the only deployed rungs of
+  it('selects brightdata for "scrape url" over scraperapi/firecrawl, with all three backends\' real info text', () => {
+    // Against the live catalog these are three of the deployed rungs of
     // CAPABILITY_PREFERENCES.scrape, and every one of their real backend info
     // strings contains an async word ("polled by job id" / "async jobs API" /
     // "async trigger/poll/download flow"). If async detection read
     // backendInfoText, all three would be excluded and `run "scrape url"`
     // would answer no-match — the `scrape` capability would be dead.
+    //
+    // The winner here is `brightdata`, not `firecrawl` as it was under the
+    // old hand-written table: CAPABILITY_PREFERENCES.scrape is now a view of
+    // providers.ts's declared `scrape` RECOMMENDATIONS
+    // (scrapingdog, brightdata, firecrawl, geonode, apify, scraperapi,
+    // scrapingbee — in that order), which ranks Bright Data's Web Unlocker
+    // ahead of Firecrawl for undifferentiated scrape requests. This is a
+    // legitimate consequence of switching `run`'s tie-break source to the
+    // declared table (the governing port spec), not a regression: scrapingdog
+    // isn't one of the candidates here, so brightdata (secondary, position 1)
+    // is genuinely the best-ranked of the three that are.
     const infoText: Record<string, string> = {
       firecrawl: FIRECRAWL_INFO,
       scraperapi: SCRAPERAPI_INFO,
@@ -719,16 +771,37 @@ describe('selectForRun', () => {
 
     expect(result.outcome).toBe('selected');
     if (result.outcome === 'selected') {
-      expect(result.chosen.candidate.backendId).toBe('firecrawl');
-      expect(result.chosen.explanation.preference).toEqual({ capability: 'scrape', position: 0 });
-      expect(result.ranked.map((r) => r.candidate.backendId)).toEqual(['firecrawl', 'scraperapi', 'brightdata']);
+      expect(result.chosen.candidate.backendId).toBe('brightdata');
+      expect(result.chosen.explanation.preference).toEqual({ capability: 'scrape', position: 1 });
+      expect(result.ranked.map((r) => r.candidate.backendId)).toEqual(['brightdata', 'firecrawl', 'scraperapi']);
     }
   });
 
-  it('selects a serp provider for "google search results" despite the backends\' async info text', () => {
-    // Same hazard for the serp capability: scraperapi is
-    // CAPABILITY_PREFERENCES.serp[0], brightdata is last, and both real info
-    // strings contain async words.
+  it('refuses rather than arbitrarily picking a serp provider for "google search results", and still does not async-exclude either backend', () => {
+    // Two things are pinned here, and the second is the reason the test
+    // exists at all.
+    //
+    // 1. The async-info-text hazard (unchanged from before the port): both
+    //    of these are real deployed SERP rungs whose real backend info
+    //    strings contain async words. If async detection read
+    //    backendInfoText, both would be excluded and the outcome would be
+    //    `async-excluded` (or `no-match`) — SERP wording would be dead as a
+    //    capability signal. Both candidates surviving into `ranked` is what
+    //    proves it does not.
+    //
+    // 2. No arbitrary auto-pick. "google search" infers `web-search` (which
+    //    absorbed the former `serp` capability's phrases), and `web-search`
+    //    derives its ordering from providers.ts's declared `search` list
+    //    (you/exa/brave/firecrawl/geonode) — which names neither scraperapi
+    //    nor brightdata, so the inferred capability discriminates nothing
+    //    among these two.
+    //    A capability hint that discriminates nothing is not a hint (see
+    //    selectForRun's `matched` branch), so this must land on the
+    //    overridable multi-backend refusal — NOT on `selected` with whichever
+    //    backend the catalog happened to list first, which would silently
+    //    make catalog order the provider policy on a billed path. The caller
+    //    can still promote `ranked[0]` with `--allow-unhinted-auto-pick`, or
+    //    name the tool exactly.
     const scraperapi = makeCandidate({
       backendId: 'scraperapi',
       method: 'serp',
@@ -746,11 +819,61 @@ describe('selectForRun', () => {
 
     const result = selectForRun([brightdata, scraperapi], 'google search results');
 
+    // Hazard 1: neither backend was thrown out by async-lifecycle exclusion.
+    expect(result.outcome).not.toBe('async-excluded');
+    expect(result.outcome).not.toBe('no-match');
+
+    // Hazard 2: nothing was auto-selected off an empty preference list.
+    expect(result.outcome).toBe('refused-unhinted-multi-backend');
+    if (result.outcome === 'refused-unhinted-multi-backend') {
+      expect(result.reason).toEqual({ kind: 'unhinted-multi-backend', backends: ['brightdata', 'scraperapi'] });
+      // Both candidates are present and promotable under
+      // --allow-unhinted-auto-pick: the async info text excluded neither.
+      expect(result.ranked).toHaveLength(2);
+      expect(result.ranked.map((r) => r.candidate.backendId).sort()).toEqual(['brightdata', 'scraperapi']);
+      // No preference position was handed out — the `search` roster names
+      // neither of these, which is exactly why this refused.
+      expect(result.ranked.every((r) => r.explanation.preference === undefined)).toBe(true);
+    }
+  });
+
+  it('still auto-picks a non-discriminating capability hint when every candidate is from one backend', () => {
+    // The other exit from selectForRun's "the hint discriminates nothing"
+    // fall-through, and the one that proves the guard narrows *which rules
+    // decide* rather than turning a working call into a refusal: `web-search`
+    // is inferred here too, and the declared `search` roster names scraperapi
+    // no more than it did in the test above — but with a single backend in play
+    // there is no cross-provider policy to get wrong, so the un-hinted rules
+    // select rather than refuse. `run "google search results"` against a
+    // catalog entitled for one SERP provider therefore behaves exactly as it
+    // did before the guard existed.
+    const candidates = [
+      makeCandidate({
+        backendId: 'scraperapi',
+        method: 'serp',
+        title: 'Google SERP',
+        description: 'Run a google search and return the results',
+        backendInfoText: SCRAPERAPI_INFO,
+      }),
+      makeCandidate({
+        backendId: 'scraperapi',
+        method: 'serp_structured',
+        title: 'Google SERP (structured)',
+        description: 'Run a google search and return the results as structured fields',
+        backendInfoText: SCRAPERAPI_INFO,
+      }),
+    ];
+
+    const result = selectForRun(candidates, 'google search results');
+
     expect(result.outcome).toBe('selected');
     if (result.outcome === 'selected') {
       expect(result.chosen.candidate.backendId).toBe('scraperapi');
-      expect(result.chosen.explanation.preference).toEqual({ capability: 'serp', position: 0 });
       expect(result.ranked).toHaveLength(2);
+      // Selected by the un-hinted rules, so no preference position was handed
+      // out — the distinguishing evidence that this went through the
+      // fall-through and not through the hinted branch.
+      expect(result.ranked.every((r) => r.explanation.preference === undefined)).toBe(true);
     }
   });
 
@@ -806,7 +929,7 @@ describe('selectForRun', () => {
       expect(result.reason.kind).toBe('ambiguous-capability');
       // Copy before sorting: `.sort()` mutates in place, and this array is the
       // engine's own, not a defensive copy.
-      expect([...result.reason.capabilities].sort()).toEqual(['scrape', 'serp']);
+      expect([...result.reason.capabilities].sort()).toEqual(['scrape', 'web-search']);
       // Ambiguous capability is NOT overridable by --allow-unhinted-auto-pick,
       // so this variant offers no promotable `ranked` list — only display-only
       // alternatives.
@@ -828,7 +951,7 @@ describe('selectForRun', () => {
     expect(result.outcome).toBe('refused-ambiguous-capability');
     if (result.outcome === 'refused-ambiguous-capability') {
       // CAPABILITY_LIST order in preference.ts, not intent order: scrape first.
-      expect(result.reason.capabilities).toEqual(['scrape', 'serp']);
+      expect(result.reason.capabilities).toEqual(['scrape', 'web-search']);
     }
   });
 
@@ -1044,7 +1167,7 @@ describe('RunSelection outcome discriminant', () => {
       'no-match',
       'async-excluded:1',
       'selected:acme_list_widgets',
-      'refused-ambiguous-capability:scrape+serp',
+      'refused-ambiguous-capability:scrape+web-search',
       'refused-unhinted-multi-backend:acme+beta:2',
     ]);
   });

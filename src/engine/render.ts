@@ -12,8 +12,15 @@
 import type { HttpBindings, ToolCandidate } from './catalog.js';
 import type { BoundRequest } from './bindings.js';
 import type { CredentialDisplay, StoreCredentialsResult } from './credentials.js';
+import type { Intent } from './intent.js';
+import type { OneStepResult } from './one-step.js';
+import type { AnnotatedProviderRow, CapabilityGroup, ListedProviderRow, ProviderRow } from './provider-view.js';
+import { NOT_SUBSTITUTES_NOTE, annotate, annotateListed } from './provider-view.js';
+import { RECOMMENDATION_SOURCE } from './providers.js';
+import type { Tier } from './providers.js';
 import type { RankExplanation, RankedCandidate, RunSelection } from './rank.js';
 import type { AttemptLog, RunOutcome, RunReport } from './retry.js';
+import { failureFooter, successFooter } from './steering.js';
 
 // ---------------------------------------------------------------------------
 // Small shared helpers.
@@ -144,7 +151,16 @@ export type CliErrorKind =
   /** `--body-json` failed validation against the binding's own media-type schema. Exit 2. */
   | 'invalid-body'
   /** `--version` could not read the version out of `package.json`. Exit 2. */
-  | 'version-unavailable';
+  | 'version-unavailable'
+  /**
+   * `call`/`run` resolved to (or, for `run`, would have auto-picked by an
+   * exact tool-name match) a backend on the deny-list
+   * (`FEZO_EXCLUDED_BACKENDS` / providers.ts's `isExcluded`). Exit 2.
+   * Distinct from `tool-not-found`: the tool genuinely exists in the live
+   * catalog -- this CLI simply refuses to call it, regardless of what the
+   * gateway serves, and regardless of whether the caller named it exactly.
+   */
+  | 'backend-excluded';
 
 export function renderError(kind: CliErrorKind, message: string): string {
   return toJson({ error: { kind, message } });
@@ -431,6 +447,122 @@ export function renderRun(input: RunRenderInput, json: boolean): string {
 }
 
 // ---------------------------------------------------------------------------
+// web-search / scrape / crawl (one-step.ts's ranked walk)
+//
+// Everything here composes data one-step.ts already produced (`OneStepResult`)
+// with steering.ts's footer sentences. Per this file's module doc, this is
+// where presentation decisions live -- in particular, the routing note (which
+// provider served the result, any providers `--extra-json` disqualified, any
+// cap that stopped the walk) is prose ONLY in the human view; under `--json`
+// the governing spec requires the same information as fields, not text
+// appended to a document, so a script reads `served`/`arg_rejected`/
+// `stopped_by` directly rather than parsing a sentence.
+// ---------------------------------------------------------------------------
+
+/** Wire shape one `OneStepResult` renders as under `--json`. snake_case,
+ * matching every other wire type in this module (`AnnotatedProviderRow`,
+ * `AnnotatedListedProviderRow`). */
+interface OneStepJson {
+  command: string;
+  intent: Intent;
+  value: string;
+  max_attempts: number;
+  served?: { backend_id: string; provider: string; rank: number; success: boolean };
+  /** Providers whose own schema rejected the assembled args -- the caller's to
+   * fix by editing `--extra-json`. See one-step.ts's `argRejected`. */
+  arg_rejected: string[];
+  /** Providers reached but whose MANIFEST needed an argument this command does
+   * not supply -- not the caller's to fix. Separate from `arg_rejected` so a
+   * script can tell "your argument cost you rank 1" from "rank 1 is not
+   * reachable this way". See one-step.ts's `manifestRejected`. */
+  manifest_rejected: string[];
+  skipped: string[];
+  stopped_by?: 'max-attempts' | 'deadline';
+  attempts: readonly AttemptLog[];
+  result: object;
+  billed_any_attempt: boolean;
+  billing: string;
+}
+
+export function renderOneStep(result: OneStepResult, json: boolean): string {
+  const { spec, value, maxAttempts, report, served, argRejected, manifestRejected, skipped } = result;
+  const billedAnyAttempt = report.attempts.some((attempt) => attempt.billed);
+
+  if (json) {
+    const doc: OneStepJson = {
+      command: spec.command,
+      intent: spec.intent,
+      value,
+      max_attempts: maxAttempts,
+      ...(served !== undefined
+        ? { served: { backend_id: served.backendId, provider: served.displayName, rank: served.rank, success: served.success } }
+        : {}),
+      arg_rejected: argRejected,
+      manifest_rejected: manifestRejected,
+      skipped,
+      ...(report.stoppedBy !== undefined ? { stopped_by: report.stoppedBy } : {}),
+      attempts: report.attempts,
+      result: outcomeToJson(report.outcome),
+      billed_any_attempt: billedAnyAttempt,
+      billing: BILLING_STATEMENT,
+    };
+    return toJson(doc);
+  }
+
+  const lines = [`${spec.command} "${value}"`];
+  if (served !== undefined) {
+    lines.push(
+      served.success
+        ? successFooter(served.displayName, spec.intent, served.rank)
+        : failureFooter(served.displayName, spec.intent, served.rank),
+    );
+  } else {
+    // Nothing in the walk was ever actually reached -- every declared
+    // provider was either passed over by `buildWalk` (named in `skipped`) or
+    // had its assembled args rejected before any request went out (named in
+    // `argRejected`, reported separately below). Adapted from mcp-server's
+    // one_step.ts "No zug provider could serve..." message, pointed at
+    // fezoctl's own commands instead of zug's MCP tool names.
+    const skippedText = skipped.length > 0 ? ` Skipped: ${skipped.join('; ')}.` : '';
+    lines.push(
+      `No provider could serve ${spec.intent} for this input.${skippedText} Run ` +
+        `\`fezoctl providers --intent ${spec.intent}\` to inspect the ranking, then \`fezoctl call <tool>\` ` +
+        'or `fezoctl run` to target one directly.',
+    );
+  }
+  if (argRejected.length > 0) {
+    // Reported even when `served` above is a success -- see one-step.ts's
+    // `OneStepResult.argRejected` doc for why this must never be silent.
+    lines.push(
+      `Skipped ${argRejected.join(', ')}: the --extra-json arguments did not match their schema -- run ` +
+        `\`fezoctl providers --intent ${spec.intent} --detail schema\` to see what each provider accepts.`,
+    );
+  }
+  if (manifestRejected.length > 0) {
+    // Unconditional for the same reason as `argRejected` directly above, and
+    // deliberately NOT folded into the `skipped` list, which is printed only
+    // when nothing served the call: a higher-ranked provider dropped out on a
+    // successful run is exactly the case the caller cannot otherwise see. The
+    // wording names the manifest, not the caller's arguments -- see
+    // one-step.ts's `manifestRejected` doc.
+    lines.push(
+      `Skipped ${manifestRejected.join(', ')}: that provider's manifest requires an argument ` +
+        `\`${spec.command}\` does not supply -- run \`fezoctl schema <tool>\` to see its bindings, then ` +
+        '`fezoctl call <tool>` to supply them yourself.',
+    );
+  }
+  if (report.stoppedBy === 'max-attempts') {
+    lines.push(`Stopped after ${String(maxAttempts)} provider(s); lower-ranked ones were not tried.`);
+  } else if (report.stoppedBy === 'deadline') {
+    lines.push('Stopped on the time budget; lower-ranked providers were not tried.');
+  }
+  lines.push(...renderAttemptsText(report.attempts));
+  lines.push(`billed: ${String(billedAnyAttempt)}`);
+  lines.push(...renderOutcomeText(report.outcome));
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // catalog
 // ---------------------------------------------------------------------------
 
@@ -467,6 +599,284 @@ export function renderCatalog(candidates: readonly ToolCandidate[], json: boolea
     lines.push(`${backendId}:`);
     for (const candidate of methods) {
       lines.push(`  ${candidate.tool} (${candidate.httpMethod} ${candidate.path}) — ${candidate.description}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// providers / list-providers
+//
+// Both commands render provider-view.ts data. `renderProviders` covers the
+// per-intent view (`viewForIntent`/`groupByCapability`); `renderListProviders`
+// covers the cross-intent merge (`listProviders`). Detail-level shaping
+// (`names`/`descriptions`/`schema`) and `--limit` truncation happen here,
+// not in cli.ts or provider-view.ts, on the same principle as the rest of
+// this module: engine code produces data, this file decides what a command
+// actually prints.
+// ---------------------------------------------------------------------------
+
+/** How many fallback method names a `names`-detail row carries when the
+ * provider has no declared entry point for this intent -- enough to act on,
+ * few enough to keep the sweep this detail level exists for cheap. */
+const NAMES_FALLBACK_METHODS = 3;
+
+/**
+ * `--detail names` shape: the minimal, cheap-to-scan row for a wide sweep.
+ *
+ * "Cheap" means it omits the why/when prose, the full method list, and any
+ * inlined schema -- NOT that it omits identity. It carries exactly the fields
+ * the human `names` view prints on its own identity line (rank, tier,
+ * provider, backend_id, billing, and the rated/not-recommended flags), because
+ * the two views must not disagree about what a detail level means: a script
+ * reading `providers --intent social --json` at the default level has to be
+ * able to see that a provider is advised against, which a human running the
+ * same command without `--json` sees as `[not recommended]`.
+ */
+interface NamesRow {
+  backend_id: string;
+  rank: number;
+  tier: Tier;
+  provider: string;
+  billing: ProviderRow['billing'];
+  /** False only for a backend no declared list mentions at all. */
+  rated: boolean;
+  /** Present only for a provider assessed and advised against. */
+  not_recommended?: { reason: string };
+  /** The provider's declared entry points for this intent. Empty for an
+   * off-list or unrated provider -- the declared lists name entry points per
+   * capability and neither case has one -- in which case `methods` carries a
+   * fallback so the row is still actionable. */
+  entry_methods: string[];
+  /** Present only when `entry_methods` is empty: the first few of this
+   * provider's name-sorted methods, so `--detail names` never returns a row
+   * with nothing callable on it. A separate key on purpose -- these are not
+   * declared entry points and must not be mistaken for them. */
+  methods?: string[];
+  /** How many further method names `methods` dropped, present only when that
+   * number is non-zero. The human view prints the same cap as `(+N more)`;
+   * emitting it here too is this module's own rule that "a truncation a caller
+   * cannot see is the failure mode the `omitted` rule exists to prevent" --
+   * which applies at least as much to the machine-readable view, where there
+   * is no other way to tell three methods from three-of-nine. */
+  methods_omitted?: number;
+  /** The ranking's provenance, present only under `--explain`. Carried at this
+   * detail level too because `--explain` is documented (HELP_TEXT and README)
+   * as adding provenance to EVERY row, and `names` is the default detail --
+   * so dropping it here made the flag a no-op on the most common `--json`
+   * path while the human view printed it. */
+  source?: { doc: string; prepared: string };
+}
+
+function toNamesRow(row: AnnotatedProviderRow): NamesRow {
+  const base = {
+    backend_id: row.backend_id,
+    rank: row.rank,
+    tier: row.tier,
+    provider: row.provider,
+    billing: row.billing,
+    rated: row.rated,
+    entry_methods: row.entry_methods,
+    ...(row.not_recommended !== undefined ? { not_recommended: row.not_recommended } : {}),
+    ...(row.source !== undefined ? { source: row.source } : {}),
+  };
+  if (row.entry_methods.length > 0) return base;
+  const omitted = Math.max(0, row.methods.length - NAMES_FALLBACK_METHODS);
+  return {
+    ...base,
+    methods: row.methods.slice(0, NAMES_FALLBACK_METHODS),
+    ...(omitted > 0 ? { methods_omitted: omitted } : {}),
+  };
+}
+
+/** Maps every candidate's tool name to its own `inputSchema`, for `--detail
+ * schema`'s `method_schemas` lookup. Built once per render call, not once per
+ * row: two providers never share a tool name (see tool-name.ts), so one flat
+ * map covers the whole session's catalog. */
+function schemaByToolName(candidates: readonly ToolCandidate[]): Map<string, object> {
+  const map = new Map<string, object>();
+  for (const c of candidates) map.set(c.tool, c.inputSchema);
+  return map;
+}
+
+type RenderedProviderRow = NamesRow | AnnotatedProviderRow | (AnnotatedProviderRow & { method_schemas: Record<string, object> });
+
+export interface ProvidersRenderOptions {
+  json: boolean;
+  /** Present when the caller scoped the request to one intent (`--intent`).
+   * `providers` then renders exactly that one group's fields at the top
+   * level, with no `groups` wrapper and no `NOT_SUBSTITUTES_NOTE` (comparing
+   * across capabilities isn't at stake when the caller already picked one). */
+  intent?: Intent;
+  detail: 'names' | 'descriptions' | 'schema';
+  limit: number;
+  explain: boolean;
+  /** Every candidate in the current session's catalog; consulted only at
+   * `--detail schema`, to look up each surfaced method's input schema by tool
+   * name (`schemaByToolName`). */
+  candidates: readonly ToolCandidate[];
+}
+
+function renderOneProviderRow(row: ProviderRow, options: ProvidersRenderOptions, schemas: Map<string, object>): RenderedProviderRow {
+  const annotated = annotate(row, { explain: options.explain });
+  if (options.detail === 'names') return toNamesRow(annotated);
+  if (options.detail === 'schema') {
+    const method_schemas: Record<string, object> = {};
+    for (const m of row.methods) {
+      const s = schemas.get(m);
+      if (s !== undefined) method_schemas[m] = s;
+    }
+    return { ...annotated, method_schemas };
+  }
+  return annotated;
+}
+
+/**
+ * Text rendering of one provider row, honouring `--detail` and `--explain`
+ * exactly as the `--json` path does -- HELP_TEXT documents `--detail` as
+ * output verbosity, not as a `--json`-only shape, so the two views must agree
+ * about what each level means:
+ *
+ *   - `names`: the cheap sweep -- the identity line plus what is callable
+ *     (`entry_methods`, or a capped `methods` sample when the provider has no
+ *     declared entry point for this intent). No why/when prose: that is what
+ *     `descriptions` is for, and printing it here made the default level and
+ *     `descriptions` produce identical output.
+ *   - `descriptions`: adds why / when / not_recommended, and the provider's
+ *     FULL method list. Nothing is capped at this level -- a caller who asked
+ *     for the fuller view must not be silently handed three of eight methods.
+ *   - `schema`: adds the tool names whose input schemas `--json` would inline,
+ *     as a pointer to `fezoctl schema <tool>`. The schemas themselves are not
+ *     printed: a JSON Schema per method is machine-readable output, and this
+ *     is the human view.
+ *
+ * `--explain` adds the same per-row provenance citation `annotate` adds to the
+ * wire shape (the doc and when it was read), so the flag has the same visible
+ * reach in both views.
+ */
+function renderProviderRowText(row: ProviderRow, options: ProvidersRenderOptions, schemas: Map<string, object>): string[] {
+  const flags = [row.rated ? undefined : 'unrated', row.notRecommended !== undefined ? 'not recommended' : undefined].filter(
+    (f): f is string => f !== undefined,
+  );
+  const flagsText = flags.length > 0 ? ` [${flags.join(', ')}]` : '';
+  const lines = [`  ${String(row.rank)}. [${row.tier}] ${row.provider} (${row.backendId}, ${row.billing})${flagsText}`];
+
+  const verbose = options.detail !== 'names';
+  if (verbose) {
+    lines.push(`     why: ${row.why}`);
+    if (row.when !== undefined) lines.push(`     when: ${row.when}`);
+    if (row.notRecommended !== undefined) lines.push(`     not_recommended: ${row.notRecommended.reason}`);
+  }
+
+  if (row.entryMethods.length > 0) lines.push(`     entry_methods: [${row.entryMethods.join(', ')}]`);
+  if (verbose) {
+    lines.push(`     methods: [${row.methods.join(', ')}]`);
+  } else if (row.entryMethods.length === 0) {
+    // The `names`-level fallback so the cheap sweep never returns a row with
+    // nothing callable on it. Capped -- but the count of what the cap dropped
+    // is printed, because a truncation a caller cannot see is the failure mode
+    // the `omitted` rule exists to prevent.
+    const shown = row.methods.slice(0, NAMES_FALLBACK_METHODS);
+    const more = row.methods.length - shown.length;
+    lines.push(`     methods: [${shown.join(', ')}]${more > 0 ? ` (+${String(more)} more)` : ''}`);
+  }
+
+  if (options.detail === 'schema') {
+    const withSchemas = row.methods.filter((m) => schemas.has(m));
+    if (withSchemas.length > 0) {
+      lines.push(`     schemas: [${withSchemas.join(', ')}] — run \`fezoctl schema <tool>\` for each`);
+    }
+  }
+
+  if (options.explain) {
+    lines.push(`     source: ${RECOMMENDATION_SOURCE.doc} (prepared ${RECOMMENDATION_SOURCE.preparedAt})`);
+  }
+  return lines;
+}
+
+export function renderProviders(groups: readonly CapabilityGroup[], options: ProvidersRenderOptions): string {
+  const schemas = options.detail === 'schema' ? schemaByToolName(options.candidates) : new Map<string, object>();
+
+  const rendered = groups.map((group) => {
+    const truncated = group.providers.slice(0, options.limit);
+    const omitted = Math.max(0, group.providers.length - truncated.length);
+    return {
+      group,
+      truncated,
+      omitted,
+      rows: truncated.map((row) => renderOneProviderRow(row, options, schemas)),
+    };
+  });
+
+  if (options.json) {
+    if (options.intent !== undefined) {
+      const only = rendered[0];
+      return toJson({
+        recommendations: RECOMMENDATION_SOURCE,
+        capability: options.intent,
+        ...(only?.group.bestValue !== undefined ? { best_value: only.group.bestValue } : {}),
+        omitted: only?.omitted ?? 0,
+        providers: only?.rows ?? [],
+      });
+    }
+    return toJson({
+      recommendations: RECOMMENDATION_SOURCE,
+      note: NOT_SUBSTITUTES_NOTE,
+      groups: rendered.map(({ group, omitted, rows }) => ({
+        capability: group.capability,
+        ...(group.bestValue !== undefined ? { best_value: group.bestValue } : {}),
+        omitted,
+        providers: rows,
+      })),
+    });
+  }
+
+  const lines: string[] = [`recommendations: ${RECOMMENDATION_SOURCE.doc} (prepared ${RECOMMENDATION_SOURCE.preparedAt})`];
+  if (options.intent === undefined) lines.push(NOT_SUBSTITUTES_NOTE);
+
+  for (const { group, omitted, truncated } of rendered) {
+    const bestValueText = group.bestValue ?? '(none)';
+    const omittedText = omitted > 0 ? `, omitted: ${String(omitted)}` : '';
+    lines.push(`\n${group.capability} — best_value: ${bestValueText}${omittedText}`);
+    if (truncated.length === 0) {
+      lines.push('  (no providers)');
+      continue;
+    }
+    for (const row of truncated) lines.push(...renderProviderRowText(row, options, schemas));
+  }
+  return lines.join('\n');
+}
+
+export function renderListProviders(rows: readonly ListedProviderRow[], json: boolean): string {
+  if (json) {
+    return toJson({ recommendations: RECOMMENDATION_SOURCE, providers: rows.map(annotateListed) });
+  }
+
+  if (rows.length === 0) return 'providers: (none)';
+
+  const lines = [
+    `recommendations: ${RECOMMENDATION_SOURCE.doc} (prepared ${RECOMMENDATION_SOURCE.preparedAt})`,
+    `providers — ${String(rows.length)} backend(s)`,
+  ];
+  for (const row of rows) {
+    const status = row.rated ? '' : ' [unrated]';
+    lines.push(`  ${row.provider} (${row.backendId}, ${row.billing})${status}`);
+    if (row.why !== undefined) lines.push(`    why: ${row.why}`);
+    if (row.when !== undefined) lines.push(`    when: ${row.when}`);
+    lines.push(`    categories: [${row.categories.join(', ')}]`);
+    lines.push(`    methods: [${row.methods.join(', ')}]`);
+    if (row.recommendations.length > 0) {
+      lines.push('    recommendations:');
+      for (const rec of row.recommendations) {
+        const notRecommendedText = rec.notRecommended !== undefined ? ` (not recommended: ${rec.notRecommended.reason})` : '';
+        // "declared rank", not bare "rank": this is the position in
+        // providers.ts's declared table, which is deliberately not the
+        // catalog-filtered rank `providers` prints -- see
+        // `ListedProviderRow.recommendations`' doc comment. Saying which one
+        // it is here is what stops a reader comparing the two outputs and
+        // concluding one of them is wrong.
+        lines.push(`      ${rec.intent}: declared rank ${String(rec.rank)} (${rec.tier}) — ${rec.why}${notRecommendedText}`);
+      }
     }
   }
   return lines.join('\n');

@@ -346,7 +346,11 @@ describe('root-scan ignore files', () => {
   it('both exclude the non-runtime docs and repo-only config', () => {
     for (const relPath of ignoreFiles) {
       const declared = patterns(relPath);
-      for (const expected of ['README.md', 'CODEX.md', '.npmignore', '.gitignore', '.gitattributes']) {
+      // `docs/` is the research prose behind the declared provider ranking
+      // (`docs/providers-score.md`, cited by src/engine/providers.ts). The
+      // ranking itself ships compiled into the bundle; the reasoning is for
+      // whoever refreshes the table, and nothing in the runtime flow reads it.
+      for (const expected of ['README.md', 'CODEX.md', 'docs/', '.npmignore', '.gitignore', '.gitattributes']) {
         expect(declared, relPath).toContain(expected);
       }
       // LICENSE is a deliberate keep: the terms travel with the code.

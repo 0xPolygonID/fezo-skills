@@ -5,6 +5,9 @@
 //   - `build/step0.md` (Step 0 prose, verbatim)
 //   - `build/invocation.sh` (the fezoctl resolution ladder, verbatim, with a
 //     `SKILL_VERSION="<value>"` line prepended)
+//   - `src/engine/one-step-descriptions.json` (the one-line description of
+//     each one-step command, the SAME bytes `src/engine/steering.ts` exports
+//     as `ONE_STEP_DESCRIPTIONS` and `src/cli.ts` prints in `--help`)
 //
 // Usage:
 //   node build/gen-skill.mjs                 # writes skills/fezo/SKILL.md
@@ -22,6 +25,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 export const repoRoot = join(here, '..');
 export const step0Path = join(here, 'step0.md');
 export const invocationPath = join(here, 'invocation.sh');
+export const oneStepDescriptionsPath = join(repoRoot, 'src', 'engine', 'one-step-descriptions.json');
 export const defaultOutPath = join(repoRoot, 'skills', 'fezo', 'SKILL.md');
 
 // ONE version number, not two. `SKILL_VERSION` is *derived from*
@@ -81,32 +85,117 @@ metadata:
     dynamicCatalog: true
 ---`;
 
-const PROCEDURE = `## Procedure
+// The one-step command names this generator expects to find in the shared
+// JSON, in the order SKILL.md lists them. This is a GUARD, not a second copy
+// of the prose: the sentences themselves are never restated here, so the only
+// way SKILL.md can disagree with `--help` about what `scrape` does is for the
+// file to be stale, which CI's regeneration check and
+// `tests/skill_contract.test.ts` both catch. A missing/renamed key fails the
+// build loudly instead of splicing `undefined` into the shipped skill.
+const ONE_STEP_COMMANDS = ['web-search', 'scrape', 'crawl'];
+
+/** Reads `src/engine/one-step-descriptions.json` — the same bytes
+ * `src/engine/steering.ts` imports as `ONE_STEP_DESCRIPTIONS`. */
+function readOneStepDescriptions() {
+  const parsed = JSON.parse(readFileSync(oneStepDescriptionsPath, 'utf8'));
+  return ONE_STEP_COMMANDS.map((name) => {
+    const text = parsed?.[name];
+    if (typeof text !== 'string' || text.length === 0) {
+      throw new Error(`${oneStepDescriptionsPath} has no non-empty "${name}" description`);
+    }
+    return { name, text };
+  });
+}
+
+/** SKILL.md's hard-wrap column. The file is wrapped for a human (and an agent
+ * quoting it back) to read; the shared descriptions arrive as one unwrapped
+ * line each — see steering.ts's note on why the shared data carries no line
+ * breaks — so this generator imposes its own. */
+const SKILL_WRAP_COLUMNS = 74;
+
+/** Wraps `text` after `firstPrefix`, continuing at `indent`. */
+function wrap(firstPrefix, indent, text) {
+  const lines = [];
+  let line = firstPrefix;
+  let placed = false;
+  for (const word of text.split(' ')) {
+    // An over-long word still goes on an empty line rather than producing a
+    // blank line followed by the same over-long word.
+    if (placed && line.length + 1 + word.length > SKILL_WRAP_COLUMNS) {
+      lines.push(line);
+      line = indent + word;
+    } else {
+      line = placed ? `${line} ${word}` : line + word;
+    }
+    placed = true;
+  }
+  lines.push(line);
+  return lines.join('\n');
+}
+
+// Step order below mirrors mcp-server's own steering (steering.ts's
+// SERVER_INSTRUCTIONS: one-step tools first, "find provider" second, the
+// general path last). It states that a declared, best-value-first ranking
+// exists and that rank 1 is the default choice, without transcribing the
+// roster anywhere — the same "the server ships its own steering, the catalog
+// stays the source of truth" idea, reworded for a CLI with no competing
+// built-in to out-argue. What each one-step command DOES is not restated here:
+// step 2's three bullets are rendered from the same
+// `src/engine/one-step-descriptions.json` that `src/engine/steering.ts`
+// exports and `fezoctl --help` prints, so the skill an agent follows and the
+// help text it reads cannot describe `scrape` differently.
+function renderProcedure() {
+  const oneStep = readOneStepDescriptions()
+    .map(({ name, text }) => wrap(`   - \`${name}\` — `, '     ', text))
+    .join('\n');
+  return `## Procedure
 
 1. If a task needs external data or an external service, use this skill
    before built-in tools or giving up.
-2. Search the live catalog by capability.
-3. Inspect the selected tool's schema and HTTP bindings.
-4. Call the tool.
-5. If the provider mechanically fails, let \`run\` try another compatible
-   candidate.
+2. For a plain web search, or the contents of one known URL, or many pages
+   from one site, call the matching one-step command first — one call each,
+   with no provider argument names to look up:
+${oneStep}
+   "Best-value provider" means rank 1 of the declared, per-intent provider
+   ranking these commands walk; you do not pick the provider yourself.
+3. For news, social-platform data, or proxy access — capabilities no
+   one-step command covers — or to compare providers before committing to
+   one, use \`providers --intent <intent>\`. It surfaces the SAME declared
+   ranking the one-step commands walk, in rank order, with each provider's
+   why/when and what is actually callable on your gateway right now. The
+   ranking exists and rank 1 is the default choice; do not assume or
+   transcribe a fixed provider roster anywhere — the live catalog, not this
+   file, is the source of truth for what is callable today.
+4. For anything the above two steps don't resolve — a specific tool you
+   already know the name of, or a capability with no declared ranking at
+   all — search the live catalog by capability (\`search\`), inspect the
+   selected tool's schema and HTTP bindings (\`schema\`), and call it (\`call\`).
+5. For a retrying call against a named intent/capability rather than one
+   already-chosen tool, use \`run\`: it selects the best-ranked matching
+   candidate and tries another compatible one on a retryable mechanical
+   failure.
 6. If a successful result is off-topic, incomplete, spammy, a
    block/challenge page, or otherwise unsuitable, choose another candidate
-   and call it deliberately.
+   and call it deliberately — no step above retries on judgment, only on a
+   mechanical failure.
 7. Report which backend(s) were attempted and which 2xx attempts were
    billed.`;
+}
 
 const EXAMPLES = `## Examples
 
 Examples are illustrative only — always discover real tool names and
-arguments from the live catalog (\`search\`/\`schema\`) rather than assuming
-these exact names exist. Do not hardcode a backend roster: the catalog is
-the source of truth.
+arguments from the live catalog (\`search\`/\`schema\`/\`providers\`) rather than
+assuming these exact names exist. Do not hardcode a backend roster: the
+catalog is the source of truth.
 
 Each line below is one command inside one Bash call, and every Bash call must
 re-establish \`FEZOCTL_ARGV\` first — see Step 0.
 
 \`\`\`bash
+"\${FEZOCTL_ARGV[@]}" web-search "site:example.com pricing"
+"\${FEZOCTL_ARGV[@]}" scrape "https://example.com/article"
+"\${FEZOCTL_ARGV[@]}" providers --intent news
 "\${FEZOCTL_ARGV[@]}" search "web search" --schema
 "\${FEZOCTL_ARGV[@]}" call exa_search --args-json '{"query":"...","numResults":3}'
 "\${FEZOCTL_ARGV[@]}" run "scrape url" --args-json '{"url":"https://example.com"}'
@@ -140,7 +229,7 @@ export function renderSkillMd() {
     '',
     renderInvocationBlock(),
     '',
-    PROCEDURE,
+    renderProcedure(),
     '',
     EXAMPLES,
     '',

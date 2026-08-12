@@ -20,6 +20,7 @@ function candidate(overrides: Partial<ToolCandidate> & Pick<ToolCandidate, 'path
     inputSchema: {},
     userSettings: [],
     backendInfoText: '',
+    backendCategories: [],
     billingModel: 'per_call',
     ...overrides,
   };

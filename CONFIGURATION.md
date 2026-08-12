@@ -65,6 +65,52 @@ credentials — there are no aliases. Any other name is ignored silently, so if
 a credential is not taking effect, check the spelling of the variable before
 anything else; `fezoctl doctor` reports what actually resolved.
 
+## `FEZO_EXCLUDED_BACKENDS` (not a credential)
+
+One more environment variable `fezoctl` reads, kept out of the table above
+because it configures policy, not authentication: which backends `fezoctl`
+refuses to surface or call, regardless of what the gateway itself serves. The
+default deny-list is `falai,alpaca` — see the README's ["Deny-listed
+backends"](README.md#deny-listed-backends-falai-alpaca) for why those two
+specifically, and for how `search`/`catalog`/`providers`/`list-providers`
+filter them out while `call`/`run` refuse to reach one by name even when you
+already know it.
+
+Two rules about the value, both load-bearing:
+
+- **It REPLACES the default, it does not extend it.** Setting
+  `FEZO_EXCLUDED_BACKENDS=geonode` excludes *only* `geonode` — `falai` and
+  `alpaca` are no longer excluded unless you list them too. There is no
+  "default plus one more" shorthand; write out every id you want excluded.
+- **An explicitly empty string is honoured as "exclude nothing"** — a
+  genuinely distinct state from leaving the variable unset. `fezoctl` reads
+  the variable as **absent vs. present**, not as truthy vs. falsy:
+
+  | Value | Effect |
+  | --- | --- |
+  | *(unset)* | Default deny-list: `falai`, `alpaca`. |
+  | `FEZO_EXCLUDED_BACKENDS=""` | Deny-list is empty — every backend the gateway serves is callable, including `falai`/`alpaca`. |
+  | `FEZO_EXCLUDED_BACKENDS="geonode,apify"` | Deny-list is exactly `geonode` and `apify` — `falai`/`alpaca` are NOT excluded unless also listed. |
+
+  This is what makes the `falai`/`alpaca` exclusion reversible without a
+  release, in both directions: an operator can run with nothing excluded
+  without inventing a placeholder id, and without that meaning "and also keep
+  the two defaults."
+
+The value is a comma-separated list of backend ids, trimmed of surrounding
+whitespace, with blank entries dropped (`FEZO_EXCLUDED_BACKENDS=" geonode ,  "`
+excludes exactly `geonode`). It is resolved once per `fezoctl` invocation from
+the same injected `env` credentials read from — never cached at module load —
+so it responds to a changed environment on the very next command, same as
+`FEZO_URL`/`FEZO_API_KEY`.
+
+`fezoctl doctor`'s `preference-hints` check (see the README's
+["`doctor`"](README.md#doctor)) warns, but never fails, if the declared
+provider table names a backend or entry method your current catalog does not
+publish — unrelated to this variable, but worth knowing about if you exclude
+a backend that provider policy still recommends: the recommendation itself is
+unaffected, only what `fezoctl` will actually call.
+
 ## Resolution order
 
 `FEZO_URL` and `FEZO_API_KEY` are each resolved independently through the

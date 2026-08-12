@@ -562,7 +562,9 @@ export type RunSelection =
 /**
  * Decides what (if anything) `run` should auto-select for a free-text
  * intent: search, apply async-lifecycle exclusion, infer a capability from
- * the intent, and rank. Never throws and never consults
+ * the intent, and rank. An inferred capability only counts as a hint if its
+ * preference list actually names one of the eligible candidates' backends —
+ * see the comment on the `matched` branch. Never throws and never consults
  * `--allow-unhinted-auto-pick` — a refusal is a returned decision. The one
  * overridable refusal (`refused-unhinted-multi-backend`) carries the full
  * ranked list so the CLI can promote `ranked[0]` itself; the non-overridable
@@ -600,13 +602,32 @@ export function selectForRun(candidates: readonly ToolCandidate[], intent: strin
   }
 
   if (inference.kind === 'matched') {
-    const ranked = rankCandidates(eligible, intent, inference.capability);
-    const chosen = ranked[0];
-    if (chosen === undefined) return { outcome: 'no-match' };
-    return { outcome: 'selected', chosen, ranked };
+    // A hint that discriminates nothing is not a hint. CAPABILITY_PREFERENCES
+    // is a sparse *view* of the declared provider table (see preference.ts),
+    // so a capability can be inferred for an intent whose eligible candidates
+    // are all absent from that capability's list — e.g. a SERP query that
+    // matches only SERP-specialist backends, none of which the declared
+    // `search` roster names. Ranking with such a hint assigns no preference
+    // position to anything, so tier 5 decides nothing and the winner falls
+    // out of input/catalog order while still being reported as a hinted
+    // `selected` — exactly the "alphabetical/catalog order becomes the
+    // provider policy" outcome the unhinted branch below refuses, but on a
+    // billed path and with no `--allow-unhinted-auto-pick` gate in front of
+    // it. So we only take the hinted branch when at least one eligible
+    // candidate's backend actually appears in the preference list; otherwise
+    // we fall through and let the unhinted rules decide (single backend ->
+    // select, several -> the overridable refusal).
+    const preferred = CAPABILITY_PREFERENCES[inference.capability];
+    const discriminates = eligible.some((match) => preferred.includes(match.candidate.backendId));
+    if (discriminates) {
+      const ranked = rankCandidates(eligible, intent, inference.capability);
+      const chosen = ranked[0];
+      if (chosen === undefined) return { outcome: 'no-match' };
+      return { outcome: 'selected', chosen, ranked };
+    }
   }
 
-  // No capability hint. Auto-pick is safe only when every matched candidate
+  // No usable capability hint. Auto-pick is safe only when every matched candidate
   // is from the same backend — there is no cross-provider policy to get
   // wrong in that case. Once two or more backends are in play, picking one
   // without a hint would silently make alphabetical/catalog order into the

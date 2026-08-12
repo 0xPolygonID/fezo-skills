@@ -50,7 +50,13 @@ import {
   storeCredentials,
   systemKeychainRunner,
 } from './engine/credentials.js';
-import { CAPABILITY_PREFERENCES, inferCapability } from './engine/preference.js';
+import type { Intent } from './engine/intent.js';
+import { INTENTS } from './engine/intent.js';
+import type { OneStepSpec } from './engine/one-step.js';
+import { MAX_PROVIDER_ATTEMPTS, ONE_STEP_SPECS, runOneStep } from './engine/one-step.js';
+import { inferCapability } from './engine/preference.js';
+import { groupByCapability, listProviders } from './engine/provider-view.js';
+import { isExcluded, recommendationsFor, resolveExcludedBackends } from './engine/providers.js';
 import type { RunSelection } from './engine/rank.js';
 import { rankCandidates, searchCandidates, selectForRun } from './engine/rank.js';
 import type { CliErrorKind, DoctorCheck } from './engine/render.js';
@@ -59,6 +65,9 @@ import {
   renderCatalog,
   renderDoctor,
   renderError,
+  renderListProviders,
+  renderOneStep,
+  renderProviders,
   renderRun,
   renderSchema,
   renderSearch,
@@ -70,14 +79,25 @@ import type { AttemptLog, MechanicalFailure, RunReport } from './engine/retry.js
 import { classifyFailure, run } from './engine/retry.js';
 import type { ValidationResult } from './engine/schema.js';
 import { SchemaValidatorCache, validateArgs } from './engine/schema.js';
+import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS } from './engine/steering.js';
 import { findCandidateByToolName } from './engine/tool-name.js';
 
 // ---------------------------------------------------------------------------
 // argv parsing.
 // ---------------------------------------------------------------------------
 
-const BOOLEAN_FLAGS = new Set(['--json', '--schema', '--retry-empty-2xx', '--allow-unhinted-auto-pick', '--key-stdin']);
-const VALUE_FLAGS = new Set(['--args-json', '--body-json', '--max-attempts', '--url', '--storage']);
+const BOOLEAN_FLAGS = new Set(['--json', '--schema', '--retry-empty-2xx', '--allow-unhinted-auto-pick', '--key-stdin', '--explain']);
+const VALUE_FLAGS = new Set([
+  '--args-json',
+  '--body-json',
+  '--max-attempts',
+  '--url',
+  '--storage',
+  '--intent',
+  '--detail',
+  '--limit',
+  '--extra-json',
+]);
 
 interface Flags {
   positionals: string[];
@@ -86,11 +106,19 @@ interface Flags {
   retryEmpty2xx: boolean;
   allowUnhintedAutoPick: boolean;
   keyStdin: boolean;
+  explain: boolean;
   argsJson?: string;
   bodyJson?: string;
   maxAttempts?: string;
   url?: string;
   storage?: string;
+  intent?: string;
+  detail?: string;
+  limit?: string;
+  /** `web-search`/`scrape`/`crawl`'s provider-specific options, merged into
+   * the resolved candidate's args alongside the command's single positional
+   * value -- see one-step.ts's `runOneStep`. */
+  extraJson?: string;
 }
 
 type ParseResult = { ok: true; flags: Flags } | { ok: false; error: string };
@@ -127,11 +155,16 @@ function parseArgv(argv: readonly string[]): ParseResult {
       retryEmpty2xx: booleans.has('--retry-empty-2xx'),
       allowUnhintedAutoPick: booleans.has('--allow-unhinted-auto-pick'),
       keyStdin: booleans.has('--key-stdin'),
+      explain: booleans.has('--explain'),
       ...(values['--args-json'] !== undefined ? { argsJson: values['--args-json'] } : {}),
       ...(values['--body-json'] !== undefined ? { bodyJson: values['--body-json'] } : {}),
       ...(values['--max-attempts'] !== undefined ? { maxAttempts: values['--max-attempts'] } : {}),
       ...(values['--url'] !== undefined ? { url: values['--url'] } : {}),
       ...(values['--storage'] !== undefined ? { storage: values['--storage'] } : {}),
+      ...(values['--intent'] !== undefined ? { intent: values['--intent'] } : {}),
+      ...(values['--detail'] !== undefined ? { detail: values['--detail'] } : {}),
+      ...(values['--limit'] !== undefined ? { limit: values['--limit'] } : {}),
+      ...(values['--extra-json'] !== undefined ? { extraJson: values['--extra-json'] } : {}),
     },
   };
 }
@@ -319,6 +352,51 @@ const EXIT_OK = 0;
 const EXIT_USAGE = 1;
 const EXIT_OPERATIONAL = 2;
 
+/** Default `providers --limit`: enough providers per group to act on, few
+ * enough to keep the default call cheap to read. Truncation past this is
+ * always reported via `omitted`, never silent -- see render.ts's
+ * `renderProviders`. */
+const DEFAULT_PROVIDERS_LIMIT = 5;
+
+/** HELP_TEXT's hard-wrap column. Everything in that block is wrapped by hand
+ * to this width; the one part that cannot be (the one-step descriptions, which
+ * arrive from `steering.ts` as single unwrapped lines shared with SKILL.md) is
+ * wrapped to the same column by `oneStepHelpBlock` below. */
+const HELP_WRAP_COLUMNS = 78;
+
+/**
+ * The three one-step command descriptions as their own labelled block.
+ *
+ * They are rendered rather than inlined because the source strings are shared
+ * data (`ONE_STEP_DESCRIPTIONS`, also read by `build/gen-skill.mjs` for
+ * SKILL.md), so they cannot carry either consumer's line breaks — and because
+ * splicing three ~150-column sentences into a hand-wrapped paragraph is what
+ * this block previously did, which read as one interrupted sentence.
+ */
+function oneStepHelpBlock(): string {
+  const labelWidth = Math.max(...ONE_STEP_COMMANDS.map((name) => name.length));
+  const indent = ' '.repeat(2 + labelWidth + 2);
+  const lines: string[] = [];
+  for (const name of ONE_STEP_COMMANDS) {
+    let line = `  ${name.padEnd(labelWidth)}  `;
+    let placed = false;
+    for (const word of ONE_STEP_DESCRIPTIONS[name].split(' ')) {
+      // An over-long word still goes on an empty line rather than producing a
+      // blank line followed by the same over-long word — hence the `placed`
+      // guard instead of a pure width test.
+      if (placed && line.length + 1 + word.length > HELP_WRAP_COLUMNS) {
+        lines.push(line);
+        line = indent + word;
+      } else {
+        line = placed ? `${line} ${word}` : line + word;
+      }
+      placed = true;
+    }
+    lines.push(line);
+  }
+  return lines.join('\n');
+}
+
 const HELP_TEXT = `fezoctl — discover and call Fezo gateway tools from the live catalog
 
 Usage:
@@ -327,7 +405,13 @@ Usage:
   fezoctl call <tool> --args-json '<json>' [--body-json '<json>'] [--json]
   fezoctl run "<intent>" --args-json '<json>' [--body-json '<json>']
              [--max-attempts N] [--retry-empty-2xx] [--allow-unhinted-auto-pick] [--json]
+  fezoctl web-search "<query>" [--extra-json '<json>'] [--max-attempts N] [--json]
+  fezoctl scrape <url>         [--extra-json '<json>'] [--max-attempts N] [--json]
+  fezoctl crawl <url>          [--extra-json '<json>'] [--max-attempts N] [--json]
   fezoctl catalog [--json]
+  fezoctl providers [--intent <intent>] [--detail names|descriptions|schema]
+                     [--limit N] [--explain] [--json]
+  fezoctl list-providers [--json]
   fezoctl setup --key-stdin [--url <url>] [--storage keychain|dotenv] [--json]
   fezoctl doctor [--json]
   fezoctl --version
@@ -336,22 +420,74 @@ Usage:
 Credentials are never accepted as a command-line argument: setup --key-stdin
 reads the API key from stdin. Otherwise, set FEZO_URL and FEZO_API_KEY.
 
+providers/list-providers surface the declared, per-intent provider ranking
+(src/engine/providers.ts) instead of catalog/registration order: intents are
+${INTENTS.join(', ')}.
+providers --detail defaults to "names" (a cheap sweep: rank, provider and
+what is callable on it); "descriptions" adds the full why/when prose and the
+provider's complete method list, "schema" additionally names each surfaced
+method's input schema (inlined under --json, listed as tool names to pass to
+\`fezoctl schema\` otherwise). --explain adds the ranking's provenance (which
+doc it was read from, and when) to every row. --limit caps each capability
+group and always reports what it dropped as "omitted".
+
+providers ranks by what your catalog actually serves, so a provider's rank
+moves when a higher-ranked one is absent; list-providers reports the DECLARED
+rank instead — the provider's fixed position in the table — which is why the
+two commands can print different numbers for the same provider.
+
+web-search/scrape/crawl each walk providers.ts's declared ranking for their
+own intent (search/scrape/crawl respectively) top-down, calling one provider
+at a time and falling back to the next on a retryable failure — no need to
+know any provider's argument name or call convention up front. --extra-json
+merges provider-specific options into whichever candidate the walk lands on
+(result counts, formats, timeouts — never the query/url itself); a provider
+whose own schema rejects those merged arguments is skipped and named in the
+output, even when a later, lower-ranked provider then succeeds. --max-attempts
+here defaults to ${String(MAX_PROVIDER_ATTEMPTS)}, NOT run's default of 2: run's budget is a RETRY
+budget for repeated failures on one already-selected capability; a one-step
+command's budget is a RANKED-FALLBACK budget across several genuinely
+different, separately-priced providers, so a higher default is deliberate. The
+walk also carries its own 60-second wall-clock deadline, not configurable from
+the command line: on expiry it stops STARTING new attempts (never aborting one
+already in flight, which would discard a result already billed) and reports
+whichever candidate answered last. Deny-listed and not-recommended providers
+are never attempted by any of the three commands.
+
+What each one is for (the same sentences skills/fezo/SKILL.md uses):
+
+${oneStepHelpBlock()}
+
+FEZO_EXCLUDED_BACKENDS overrides the default deny-listed backends (falai,
+alpaca): a comma-separated backend id list that REPLACES the default, or an
+explicitly empty string to exclude nothing. Excluded backends never appear in
+search/catalog/providers/list-providers, are never attempted by
+web-search/scrape/crawl, and schema/call/run refuse to reach one even when
+named by its exact tool name.
+
 With --json, stdout is always a JSON document — never empty. A failure that
 never reached the gateway is {"error":{"kind":"...","message":"..."}}, where
 kind is one of: usage, credentials-not-configured, catalog-unavailable,
-tool-not-found, invalid-args, invalid-body, version-unavailable. A call/run
-that did reach the gateway emits its full attempt-log document instead (the
-failure is in its outcome/result, alongside what was billed). The
-human-readable message always goes to stderr, and exit codes do not change.
+tool-not-found, invalid-args, invalid-body, version-unavailable,
+backend-excluded. A call/run/web-search/scrape/crawl that did reach the
+gateway emits its full attempt-log document instead (the failure is in its
+outcome/result, alongside what was billed, and — for the three one-step
+commands — which provider served it, its rank, any provider --extra-json
+disqualified, and any cap that stopped the walk, all as fields rather than
+prose). The human-readable message always goes to stderr, and exit codes do
+not change.
 
 Exit codes:
   0  success
-  1  usage error: a bad command/flag, or an unparseable --args-json/--body-json
-     payload — rejected before any candidate is selected or called.
+  1  usage error: a bad command/flag, or an unparseable
+     --args-json/--body-json/--extra-json payload — rejected before any
+     candidate is selected or called.
   2  operational failure: credentials not configured, the gateway/catalog
-     could not be reached or read, arguments failed schema validation, or a
-     call/run that did not end in success (including a run refusal, an empty
-     match, or doctor finding a hard failure).
+     could not be reached or read, arguments failed schema validation, a
+     schema/call/run that named a deny-listed backend, or a
+     call/run/web-search/scrape/crawl that did not end in success (including
+     a run refusal, an empty match, a one-step walk with no provider to serve
+     it, or doctor finding a hard failure).
 `;
 
 // ---------------------------------------------------------------------------
@@ -472,11 +608,94 @@ function parseJsonFlag(
   }
 }
 
+/**
+ * Narrows a parsed `--extra-json` value to a plain object, without a type
+ * assertion -- same defensive-parse idiom as catalog.ts's `asRecord`. `null`
+ * and an array both fail `typeof value === 'object'`'s intent (an array is
+ * technically `typeof 'object'`, hence the explicit `Array.isArray` guard);
+ * both are usage errors here because `{...extra, [argName]: value}` (see
+ * one-step.ts's `runOneStep`) requires a spreadable object.
+ */
+function asPlainObject(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Deny-list helpers (carry-forward from Phase 1's threaded `isExcluded`).
+//
+// `search`/`catalog`/`providers`/`list-providers` simply never show an
+// excluded backend: `filterExcluded` drops its candidates before anything
+// else touches the catalog. `call`/`run` are different: a caller may already
+// know an excluded backend's exact tool name (from memory, from docs, from an
+// old `search` result cached before the deny-list changed), so silently
+// filtering their candidate list first would make them fall through to a
+// generic "tool not found"/"no match" -- true, but not the reason, and not
+// actionable the same way. Both commands instead resolve against the FULL
+// (unfiltered) catalog and refuse by name with the dedicated
+// `backend-excluded` kind when the resolved backend is on the list. See
+// `cmdCall` and `cmdRun`.
+// ---------------------------------------------------------------------------
+
+function filterExcluded(candidates: readonly ToolCandidate[], excluded: readonly string[]): ToolCandidate[] {
+  return candidates.filter((c) => !isExcluded(c.backendId, excluded));
+}
+
+/** `verb` is what the refusing command would have done, so the message names
+ * the action the caller actually attempted -- "cannot be called" is wrong for
+ * `schema`, which never calls anything. */
+function excludedBackendMessage(backendId: string, tool: string, verb: 'called' | 'inspected' = 'called'): string {
+  return `backend "${backendId}" is excluded (FEZO_EXCLUDED_BACKENDS); "${tool}" cannot be ${verb}`;
+}
+
+/**
+ * `run`'s "even when the caller names the tool exactly" case: does the raw
+ * intent string exactly equal an EXCLUDED backend's tool name (or its
+ * `{backendId}_{method}` join)? Reuses `searchCandidates`'s own exact-match
+ * computation (`SearchMatch.exactMatch === 'tool'`) rather than re-deriving
+ * exactness here a second time -- see rank.ts's `classifyTier` for why an
+ * intent string and a tokenized query can disagree about what "named exactly"
+ * means, and why that decision must be made in exactly one place.
+ */
+function exactExcludedToolMatch(
+  candidates: readonly ToolCandidate[],
+  excluded: readonly string[],
+  intent: string,
+): ToolCandidate | undefined {
+  const excludedCandidates = candidates.filter((c) => isExcluded(c.backendId, excluded));
+  const match = searchCandidates(excludedCandidates, intent).find((m) => m.exactMatch === 'tool');
+  return match?.candidate;
+}
+
+/**
+ * `--intent`'s value against `INTENTS` (intent.ts), without a type assertion:
+ * returns the matching element of `INTENTS` itself (already typed `Intent`)
+ * rather than coercing the caller's raw string, so there is exactly one
+ * source of truth for which strings are valid intents.
+ */
+function parseIntentFlag(raw: string): Intent | undefined {
+  for (const intent of INTENTS) {
+    if (intent === raw) return intent;
+  }
+  return undefined;
+}
+
+type ProvidersDetail = 'names' | 'descriptions' | 'schema';
+
+/** `--detail`'s value, narrowed by literal comparison rather than a type
+ * assertion -- see `parseIntentFlag`'s comment for why this repo avoids `as`
+ * for this shape of check. */
+function parseDetailFlag(raw: string): ProvidersDetail | undefined {
+  if (raw === 'names' || raw === 'descriptions' || raw === 'schema') return raw;
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Commands.
 // ---------------------------------------------------------------------------
 
-async function cmdSearch(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
+async function cmdSearch(flags: Flags, deps: CliDeps, emit: Emit, excluded: readonly string[]): Promise<number> {
   const query = flags.positionals.join(' ');
   if (query.length === 0) {
     emitUsageError(emit, 'search', 'requires a query, e.g. `fezoctl search "scrape this page"`');
@@ -486,7 +705,8 @@ async function cmdSearch(flags: Flags, deps: CliDeps, emit: Emit): Promise<numbe
   const gateway = await openGateway(deps, emit);
   if (!gateway.ok) return gateway.exitCode;
 
-  const matches = searchCandidates(gateway.session.candidates, query);
+  const candidates = filterExcluded(gateway.session.candidates, excluded);
+  const matches = searchCandidates(candidates, query);
   const inference = inferCapability(query);
   const capability = inference.kind === 'matched' ? inference.capability : undefined;
   const ranked = rankCandidates(matches, query, capability);
@@ -495,7 +715,7 @@ async function cmdSearch(flags: Flags, deps: CliDeps, emit: Emit): Promise<numbe
   return EXIT_OK;
 }
 
-async function cmdSchema(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
+async function cmdSchema(flags: Flags, deps: CliDeps, emit: Emit, excluded: readonly string[]): Promise<number> {
   const tool = flags.positionals[0];
   if (tool === undefined || flags.positionals.length > 1) {
     emitUsageError(emit, 'schema', 'requires exactly one tool name, e.g. `fezoctl schema firecrawl_scrape`');
@@ -505,9 +725,24 @@ async function cmdSchema(flags: Flags, deps: CliDeps, emit: Emit): Promise<numbe
   const gateway = await openGateway(deps, emit);
   if (!gateway.ok) return gateway.exitCode;
 
+  // Resolved against the FULL catalog, then refused by name -- the same
+  // ordering `cmdCall` uses, and for the same reason (a caller who already
+  // knows the tool name deserves the actual reason, not a "tool not found"
+  // that is true but unactionable).
+  //
+  // `schema` refuses rather than merely filtering, even though it calls
+  // nothing and bills nothing, because the alternative is worse for the one
+  // caller who reaches it: an agent handed a full input schema and binding map
+  // for a backend this CLI will not call has been invited to assemble a call
+  // that `cmdCall` then rejects. Refusing here spends one command instead of
+  // two and names FEZO_EXCLUDED_BACKENDS, which is the thing to change.
   const candidate = findCandidateByToolName(gateway.session.candidates, tool);
   if (!candidate) {
     emitFailure(emit, 'tool-not-found', `tool "${tool}" was not found in the catalog`);
+    return EXIT_OPERATIONAL;
+  }
+  if (isExcluded(candidate.backendId, excluded)) {
+    emitFailure(emit, 'backend-excluded', excludedBackendMessage(candidate.backendId, tool, 'inspected'));
     return EXIT_OPERATIONAL;
   }
 
@@ -515,7 +750,7 @@ async function cmdSchema(flags: Flags, deps: CliDeps, emit: Emit): Promise<numbe
   return EXIT_OK;
 }
 
-async function cmdCall(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
+async function cmdCall(flags: Flags, deps: CliDeps, emit: Emit, excluded: readonly string[]): Promise<number> {
   const tool = flags.positionals[0];
   if (tool === undefined || flags.positionals.length > 1) {
     emitUsageError(emit, 'call', 'requires exactly one tool name, e.g. `fezoctl call firecrawl_scrape --args-json \'{...}\'`');
@@ -541,7 +776,15 @@ async function cmdCall(flags: Flags, deps: CliDeps, emit: Emit): Promise<number>
   if (!gateway.ok) return gateway.exitCode;
   const { creds } = gateway.session;
 
+  // Resolved against the FULL catalog, not a pre-filtered one: see this
+  // file's "Deny-list helpers" comment for why `call` must recognize an
+  // excluded backend by name rather than let it fall through to a generic
+  // tool-not-found.
   const candidate = findCandidateByToolName(gateway.session.candidates, tool);
+  if (candidate && isExcluded(candidate.backendId, excluded)) {
+    emitFailure(emit, 'backend-excluded', excludedBackendMessage(candidate.backendId, tool));
+    return EXIT_OPERATIONAL;
+  }
   if (!candidate) {
     // Not an `emitFailure` envelope: this path has a full attempt log (the
     // synthesized `tool_not_in_catalog` classification `run` would have
@@ -589,7 +832,7 @@ async function cmdCall(flags: Flags, deps: CliDeps, emit: Emit): Promise<number>
   return report.outcome.kind === 'success' ? EXIT_OK : EXIT_OPERATIONAL;
 }
 
-async function cmdRun(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
+async function cmdRun(flags: Flags, deps: CliDeps, emit: Emit, excluded: readonly string[]): Promise<number> {
   const intent = flags.positionals.join(' ');
   if (intent.length === 0) {
     emitUsageError(emit, 'run', 'requires an intent, e.g. `fezoctl run "scrape this page" --args-json \'{...}\'`');
@@ -631,7 +874,19 @@ async function cmdRun(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> 
   if (!gateway.ok) return gateway.exitCode;
   const { creds } = gateway.session;
 
-  const selection = selectForRun(gateway.session.candidates, intent);
+  // Checked against the FULL catalog before anything is filtered: this is
+  // `run`'s "even when the caller names the tool exactly" refusal -- see this
+  // file's "Deny-list helpers" comment. Once past this check, excluded
+  // backends are filtered out entirely so no hinted or unhinted auto-pick can
+  // reach one either.
+  const excludedMatch = exactExcludedToolMatch(gateway.session.candidates, excluded, intent);
+  if (excludedMatch) {
+    emitFailure(emit, 'backend-excluded', excludedBackendMessage(excludedMatch.backendId, excludedMatch.tool));
+    return EXIT_OPERATIONAL;
+  }
+
+  const candidates = filterExcluded(gateway.session.candidates, excluded);
+  const selection = selectForRun(candidates, intent);
   const runCandidates = candidatesToRun(selection, flags.allowUnhintedAutoPick);
 
   let report: RunReport | undefined;
@@ -669,11 +924,146 @@ async function cmdRun(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> 
   return report.outcome.kind === 'success' ? EXIT_OK : EXIT_OPERATIONAL;
 }
 
-async function cmdCatalog(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
+// ---------------------------------------------------------------------------
+// web-search / scrape / crawl (one-step.ts's ranked walk). One function
+// parameterized over `OneStepSpec` rather than three near-identical command
+// functions: the three commands differ only in which spec they pass, and
+// `runCli`'s dispatch (below) supplies that from `ONE_STEP_SPECS`.
+// ---------------------------------------------------------------------------
+
+function oneStepArgWord(argKind: OneStepSpec['argKind']): string {
+  return argKind === 'query' ? 'a query' : 'a URL';
+}
+
+async function cmdOneStep(spec: OneStepSpec, flags: Flags, deps: CliDeps, emit: Emit, excluded: readonly string[]): Promise<number> {
+  const value = flags.positionals.join(' ');
+  if (value.length === 0) {
+    emitUsageError(emit, spec.command, `requires ${oneStepArgWord(spec.argKind)}, e.g. \`fezoctl ${spec.command} "..."\``);
+    return EXIT_USAGE;
+  }
+
+  let extra: Record<string, unknown> = {};
+  if (flags.extraJson !== undefined) {
+    const parsed = parseJsonFlag(flags.extraJson, '--extra-json', spec.command, emit);
+    if (!parsed.ok) return EXIT_USAGE;
+    const asObject = asPlainObject(parsed.value);
+    if (asObject === undefined) {
+      emitUsageError(emit, spec.command, '--extra-json must be a JSON object');
+      return EXIT_USAGE;
+    }
+    extra = asObject;
+  }
+
+  // Defaults to MAX_PROVIDER_ATTEMPTS (3), NOT `run`'s DEFAULT_MAX_ATTEMPTS
+  // (2): this is a ranked-FALLBACK budget across distinct providers, not a
+  // retry budget for one already-selected candidate -- see HELP_TEXT's note
+  // on the distinction. Same validation as `run`'s `--max-attempts`
+  // (integer >= 1), for the same reason (a budget of zero would call nothing
+  // and then report the outcome as an operational failure).
+  let maxAttempts = MAX_PROVIDER_ATTEMPTS;
+  if (flags.maxAttempts !== undefined) {
+    const n = Number(flags.maxAttempts);
+    if (!Number.isInteger(n) || n < 1) {
+      emitUsageError(emit, spec.command, '--max-attempts must be an integer >= 1');
+      return EXIT_USAGE;
+    }
+    maxAttempts = n;
+  }
+
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
+  const { creds } = gateway.session;
+
+  const result = await runOneStep(
+    spec,
+    value,
+    extra,
+    gateway.session.candidates,
+    excluded,
+    { baseUrl: creds.baseUrl, apiKey: creds.apiKey, ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}) },
+    maxAttempts,
+  );
+
+  emit.out(renderOneStep(result, flags.json));
+
+  // No provider ever actually reached -> operational failure, same exit code
+  // family as `run`'s empty match. Otherwise mirror the served candidate's own
+  // outcome (`run()`'s classification already decided success vs. failure).
+  if (result.served === undefined) return EXIT_OPERATIONAL;
+  return result.report.outcome.kind === 'success' ? EXIT_OK : EXIT_OPERATIONAL;
+}
+
+async function cmdCatalog(flags: Flags, deps: CliDeps, emit: Emit, excluded: readonly string[]): Promise<number> {
   const gateway = await openGateway(deps, emit);
   if (!gateway.ok) return gateway.exitCode;
 
-  emit.out(renderCatalog(gateway.session.candidates, flags.json));
+  emit.out(renderCatalog(filterExcluded(gateway.session.candidates, excluded), flags.json));
+  return EXIT_OK;
+}
+
+// ---------------------------------------------------------------------------
+// providers / list-providers.
+// ---------------------------------------------------------------------------
+
+async function cmdProviders(flags: Flags, deps: CliDeps, emit: Emit, excluded: readonly string[]): Promise<number> {
+  let intent: Intent | undefined;
+  if (flags.intent !== undefined) {
+    intent = parseIntentFlag(flags.intent);
+    if (intent === undefined) {
+      emitUsageError(emit, 'providers', `unknown --intent "${flags.intent}"; must be one of ${INTENTS.join(', ')}`);
+      return EXIT_USAGE;
+    }
+  }
+
+  const detail = parseDetailFlag(flags.detail ?? 'names');
+  if (detail === undefined) {
+    emitUsageError(emit, 'providers', '--detail must be "names", "descriptions", or "schema"');
+    return EXIT_USAGE;
+  }
+
+  let limit = DEFAULT_PROVIDERS_LIMIT;
+  if (flags.limit !== undefined) {
+    const n = Number(flags.limit);
+    if (!Number.isInteger(n) || n < 1) {
+      emitUsageError(emit, 'providers', '--limit must be an integer >= 1');
+      return EXIT_USAGE;
+    }
+    limit = n;
+  }
+
+  // Every validation above runs before this line: unknown --intent/--detail
+  // and a non-numeric/<1 --limit are usage errors, rejected before any
+  // network call, per the governing spec.
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
+
+  // Unfiltered candidates go straight into groupByCapability: the deny-list
+  // is threaded through as `excluded` and applied inside viewForIntent's own
+  // three passes (see provider-view.ts), so there is no separate pre-filter
+  // step here — passing an already-filtered candidate list would just make
+  // that internal check a no-op.
+  const groups = groupByCapability(gateway.session.candidates, excluded);
+  const scoped = intent !== undefined ? groups.filter((g) => g.capability === intent) : groups;
+
+  emit.out(
+    renderProviders(scoped, {
+      json: flags.json,
+      detail,
+      limit,
+      explain: flags.explain,
+      candidates: gateway.session.candidates,
+      ...(intent !== undefined ? { intent } : {}),
+    }),
+  );
+  return EXIT_OK;
+}
+
+async function cmdListProviders(flags: Flags, deps: CliDeps, emit: Emit, excluded: readonly string[]): Promise<number> {
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
+
+  const rows = listProviders(gateway.session.candidates, excluded);
+  emit.out(renderListProviders(rows, flags.json));
   return EXIT_OK;
 }
 
@@ -864,23 +1254,56 @@ async function cmdDoctor(flags: Flags, deps: CliDeps, emit: Emit): Promise<numbe
   }
 
   if (candidates !== undefined) {
+    // Ported scope: the old check only looked at `CAPABILITY_PREFERENCES`
+    // (scrape/web-search's two buckets). This validates the WHOLE declared
+    // table (all seven intents' RECOMMENDATIONS, providers.ts) against the
+    // live catalog, two independent ways a declared row can be stale:
+    //   - the backend itself is absent from this gateway's catalog entirely;
+    //   - the backend is present, but the specific `entryMethods` name this
+    //     repo advertises as a "genuine entry point" for the intent (what
+    //     `providers`/`list-providers`/the one-step walk try first) is not
+    //     one of its published tool names.
+    // A backend that is wholly absent trivially fails the second check too
+    // (none of its tool names are published), so `missingEntryMethods` is
+    // reported ADDITIONALLY, not instead of, `missingBackends` — a reviewer
+    // reading "brightdata" only in the backends list would otherwise have to
+    // re-derive that its entry methods are unreachable too.
     const liveBackends = new Set(candidates.map((candidate) => candidate.backendId));
-    const hintedBackends = new Set<string>([
-      ...CAPABILITY_PREFERENCES.scrape,
-      ...CAPABILITY_PREFERENCES.serp,
-      ...CAPABILITY_PREFERENCES['web-search'],
-    ]);
-    const missing = [...hintedBackends].filter((backendId) => !liveBackends.has(backendId)).sort();
-    checks.push(
-      missing.length === 0
-        ? { name: 'preference-hints', status: 'ok', message: 'every backend named in CAPABILITY_PREFERENCES is present in the live catalog' }
-        : {
-            name: 'preference-hints',
-            status: 'warn',
-            message: `preference hints name backend(s) absent from the live catalog: ${missing.join(', ')}`,
-            details: { missing },
-          },
-    );
+    const liveTools = new Set(candidates.map((candidate) => candidate.tool));
+    const missingBackends = new Set<string>();
+    const missingEntryMethods = new Set<string>();
+    for (const intent of INTENTS) {
+      for (const rec of recommendationsFor(intent)) {
+        if (!liveBackends.has(rec.backendId)) missingBackends.add(rec.backendId);
+        for (const method of rec.entryMethods) {
+          if (!liveTools.has(method)) missingEntryMethods.add(method);
+        }
+      }
+    }
+    const missingBackendsList = [...missingBackends].sort();
+    const missingEntryMethodsList = [...missingEntryMethods].sort();
+    if (missingBackendsList.length === 0 && missingEntryMethodsList.length === 0) {
+      checks.push({
+        name: 'preference-hints',
+        status: 'ok',
+        message: 'every backend and entry method declared in providers.ts (RECOMMENDATIONS) is present in the live catalog',
+      });
+    } else {
+      const clauses: string[] = [];
+      if (missingBackendsList.length > 0) clauses.push(`backend(s) absent from the live catalog: ${missingBackendsList.join(', ')}`);
+      if (missingEntryMethodsList.length > 0) clauses.push(`declared entry method(s) not published: ${missingEntryMethodsList.join(', ')}`);
+      // A `warn`, never a `fail`: a declared row naming a backend/method this
+      // particular gateway does not (yet, or ever) expose does not mean
+      // fezoctl is broken — the affected row just contributes no ranking
+      // signal, exactly like the pre-fix check's own reasoning for the two
+      // buckets it covered.
+      checks.push({
+        name: 'preference-hints',
+        status: 'warn',
+        message: `providers.ts declares ${clauses.join('; ')}`,
+        details: { missingBackends: missingBackendsList, missingEntryMethods: missingEntryMethodsList },
+      });
+    }
   } else {
     checks.push({ name: 'preference-hints', status: 'skipped', message: 'skipped: catalog unavailable' });
   }
@@ -945,18 +1368,37 @@ export async function runCli(argv: readonly string[], deps: CliDeps = {}): Promi
   }
   const { flags } = parsed;
   const emit: Emit = { out: write, err: writeErr, json: flags.json };
+  // Resolved once, here, and threaded to every command that needs it — never
+  // read from `process.env` inside a command function. See providers.ts's
+  // module doc for why a module-load-time env read would be wrong for
+  // fezo-skills specifically; the same reasoning applies to reading it more
+  // than once per `runCli` call.
+  const excluded = resolveExcludedBackends(deps.env ?? process.env);
+
+  // One-step commands dispatch through a single lookup rather than three
+  // `case` arms that each hand-pick their own spec: `ONE_STEP_SPECS` is the
+  // one place the command-name-to-spec mapping is declared (one-step.ts), so
+  // adding a fourth one-step command needs no change here.
+  const oneStepSpec = ONE_STEP_SPECS.find((spec) => spec.command === first);
+  if (oneStepSpec) {
+    return finish(await cmdOneStep(oneStepSpec, flags, deps, emit, excluded));
+  }
 
   switch (first) {
     case 'search':
-      return finish(await cmdSearch(flags, deps, emit));
+      return finish(await cmdSearch(flags, deps, emit, excluded));
     case 'schema':
-      return finish(await cmdSchema(flags, deps, emit));
+      return finish(await cmdSchema(flags, deps, emit, excluded));
     case 'call':
-      return finish(await cmdCall(flags, deps, emit));
+      return finish(await cmdCall(flags, deps, emit, excluded));
     case 'run':
-      return finish(await cmdRun(flags, deps, emit));
+      return finish(await cmdRun(flags, deps, emit, excluded));
     case 'catalog':
-      return finish(await cmdCatalog(flags, deps, emit));
+      return finish(await cmdCatalog(flags, deps, emit, excluded));
+    case 'providers':
+      return finish(await cmdProviders(flags, deps, emit, excluded));
+    case 'list-providers':
+      return finish(await cmdListProviders(flags, deps, emit, excluded));
     case 'setup':
       return finish(await cmdSetup(flags, deps, emit));
     case 'doctor':

@@ -8200,6 +8200,7 @@ function normalizeCatalog(parsed) {
       continue;
     }
     const backendInfoText = formatBackendInfoText(backendRec.info);
+    const backendCategories = asStringArray(asRecord(backendRec.info)?.categories) ?? [];
     const billingModel = parseBillingModel(backendRec.billing);
     const userSettings = asStringArray(backendRec.user_settings) ?? [];
     const methodsRaw = asArray(backendRec.methods) ?? [];
@@ -8240,6 +8241,7 @@ function normalizeCatalog(parsed) {
         inputSchema,
         userSettings,
         backendInfoText,
+        backendCategories,
         billingModel,
         ...title !== void 0 ? { title } : {},
         ...outputSchema !== void 0 ? { outputSchema } : {}
@@ -8667,6 +8669,1088 @@ function storeCredentials(options) {
   return { storage: "keychain", apiKey: apiKeyOutcome, url: urlOutcome };
 }
 
+// src/engine/intent.ts
+var INTENTS = ["search", "scrape", "crawl", "news", "social", "proxy", "other"];
+Object.freeze(INTENTS);
+var INTENT_DESCRIPTIONS = {
+  search: "Find information or pages on the open web (queries, questions, lookups).",
+  scrape: "Fetch and extract the content of a specific, already-known page or URL.",
+  crawl: "Discover and collect many pages from a site or a structured dataset run.",
+  news: "Find news articles or clustered news events, optionally by recency.",
+  social: "Read social-platform content: posts, profiles, follows, mentions, trends.",
+  proxy: "Route a request through a proxy/unlocker network rather than fetch content directly.",
+  other: "Anything that does not fit the capabilities above."
+};
+Object.freeze(INTENT_DESCRIPTIONS);
+var METHOD_INTENTS = {
+  // -- you (internal/youbackend/routes.go:81,100,113,131,147,158) --
+  you_search: ["search", "news"],
+  you_contents: ["scrape"],
+  you_research: ["search"],
+  you_research_start: ["search"],
+  you_research_status: ["search"],
+  you_finance_research: ["search"],
+  // -- brightdata (internal/brightdatabackend/routes.go:28,34; manifest.go:77,107,127) --
+  brightdata_unlock: ["scrape", "social", "proxy"],
+  brightdata_serp: ["search"],
+  brightdata_scrape_async: ["crawl", "social"],
+  brightdata_snapshot_progress: ["crawl"],
+  brightdata_snapshot: ["crawl"],
+  // -- geonode (internal/geonodebackend/manifest.go:63,102,136,188) --
+  geonode_scrape: ["scrape", "proxy"],
+  geonode_search: ["search"],
+  geonode_crawl: ["crawl"],
+  geonode_crawl_status: ["crawl"],
+  // -- brave (internal/bravebackend/routes.go:38-43) --
+  brave_search: ["search"],
+  brave_news: ["news"],
+  brave_images: ["search"],
+  brave_videos: ["search"],
+  // -- scrapingdog (internal/scrapingdogbackend/routes.go:58,73,88,98,109,121,133,144) --
+  scrapingdog_scrape: ["scrape"],
+  scrapingdog_google_search: ["search"],
+  scrapingdog_google_maps: ["search"],
+  scrapingdog_amazon_product: ["scrape"],
+  scrapingdog_amazon_search: ["search"],
+  scrapingdog_amazon_offers: ["scrape"],
+  scrapingdog_linkedin: ["social"],
+  scrapingdog_linkedin_jobs: ["social"],
+  // -- exa (internal/exabackend/manifest.go:58,103) --
+  exa_search: ["search"],
+  exa_contents: ["scrape"],
+  // -- newsapi (internal/newsapibackend/routes.go:116,135) --
+  newsapi_articles: ["news"],
+  newsapi_events: ["news"],
+  // -- firecrawl (internal/firecrawlbackend/manifest.go:67,121,158,192,244) --
+  firecrawl_scrape: ["scrape"],
+  firecrawl_map: ["crawl"],
+  firecrawl_search: ["search"],
+  firecrawl_crawl: ["crawl"],
+  firecrawl_crawl_status: ["crawl"],
+  // -- apify (internal/apifybackend/manifest.go:66,105,141; dotted names) --
+  apify_runs_submit: ["scrape", "crawl", "social"],
+  apify_runs_get: ["other"],
+  apify_runs_dataset: ["other"],
+  // -- scraperapi (internal/scraperapibackend/routes.go:48,61-86) --
+  scraperapi_scrape: ["scrape"],
+  scraperapi_amazon_product: ["scrape"],
+  scraperapi_amazon_search: ["search"],
+  scraperapi_amazon_offers: ["scrape"],
+  scraperapi_ebay_product: ["scrape"],
+  scraperapi_ebay_search: ["search"],
+  scraperapi_walmart_product: ["scrape"],
+  scraperapi_walmart_search: ["search"],
+  scraperapi_walmart_category: ["scrape"],
+  scraperapi_walmart_reviews: ["scrape"],
+  scraperapi_google_search: ["search"],
+  scraperapi_google_news: ["news"],
+  scraperapi_google_jobs: ["search"],
+  scraperapi_google_shopping: ["search"],
+  scraperapi_google_maps: ["search"],
+  scraperapi_redfin_agent_details: ["scrape"],
+  scraperapi_redfin_for_rent: ["search"],
+  scraperapi_redfin_for_sale: ["search"],
+  scraperapi_redfin_listing_search: ["search"],
+  // -- scrapingbee (internal/scrapingbeebackend/routes.go:53-175) --
+  scrapingbee_scrape: ["scrape"],
+  scrapingbee_google: ["search"],
+  scrapingbee_amazon_product: ["scrape"],
+  scrapingbee_amazon_search: ["search"],
+  scrapingbee_youtube_search: ["search"],
+  scrapingbee_youtube_metadata: ["scrape"],
+  scrapingbee_youtube_subtitles: ["scrape"],
+  scrapingbee_walmart_product: ["scrape"],
+  scrapingbee_walmart_search: ["search"],
+  scrapingbee_chatgpt: ["other"],
+  scrapingbee_gemini: ["other"],
+  // -- xro (internal/xrobackend/routes.go:68-95) --
+  xro_tweet_lookup: ["social"],
+  xro_tweets_lookup: ["social"],
+  xro_tweets_search_recent: ["social"],
+  xro_tweets_search_all: ["social"],
+  xro_tweets_counts_recent: ["social"],
+  xro_tweets_counts_all: ["social"],
+  xro_user_tweets: ["social"],
+  xro_user_mentions: ["social"],
+  xro_user_lookup: ["social"],
+  xro_user_by_username: ["social"],
+  xro_users_lookup: ["social"],
+  xro_users_by: ["social"],
+  xro_user_followers: ["social"],
+  xro_user_following: ["social"],
+  xro_trends_by_woeid: ["social"],
+  xro_space_lookup: ["social"],
+  xro_spaces_lookup: ["social"],
+  xro_spaces_by_creator_ids: ["social"],
+  xro_spaces_search: ["social"],
+  xro_space_tweets: ["social"],
+  xro_space_buyers: ["social"],
+  xro_list_lookup: ["social"],
+  xro_list_tweets: ["social"],
+  xro_list_members: ["social"],
+  xro_list_followers: ["social"],
+  xro_user_owned_lists: ["social"],
+  xro_user_list_memberships: ["social"],
+  xro_user_followed_lists: ["social"]
+};
+Object.freeze(METHOD_INTENTS);
+for (const intents of Object.values(METHOD_INTENTS)) Object.freeze(intents);
+var KEYWORD_RULES = [
+  { intent: "crawl", substrings: ["crawl"] },
+  { intent: "search", substrings: ["search"] },
+  { intent: "scrape", substrings: ["scrape", "unlock", "fetch", "contents"] },
+  { intent: "news", substrings: ["news", "article", "event"] },
+  { intent: "social", substrings: ["tweet", "post", "user"] },
+  { intent: "proxy", substrings: ["proxy"], tokens: ["ip"] }
+];
+var CATEGORY_RULES = [
+  { category: "Search", intents: ["search"] },
+  { category: "Crawl", intents: ["scrape", "crawl"] }
+];
+function classifyMethod(backendId, method, categories) {
+  const toolName = methodToToolName(backendId, method.name);
+  const known = METHOD_INTENTS[toolName];
+  if (known) return [...known];
+  const haystack = `${method.name} ${method.path ?? ""} ${method.description ?? ""}`.toLowerCase();
+  const tokens = new Set(haystack.split(/[^a-z0-9]+/));
+  for (const rule of KEYWORD_RULES) {
+    if (rule.substrings?.some((kw) => haystack.includes(kw))) return [rule.intent];
+    if (rule.tokens?.some((tk) => tokens.has(tk))) return [rule.intent];
+  }
+  for (const rule of CATEGORY_RULES) {
+    if (categories?.includes(rule.category)) return [...rule.intents];
+  }
+  return ["other"];
+}
+function classifyCandidate(candidate) {
+  return classifyMethod(
+    candidate.backendId,
+    { name: candidate.method, path: candidate.path, description: candidate.description },
+    candidate.backendCategories
+  );
+}
+
+// src/engine/providers.ts
+var RECOMMENDATION_SOURCE = {
+  doc: "docs/providers-score.md",
+  preparedAt: "2026-08-05"
+};
+var RECOMMENDATIONS = {
+  // § "AI agent / RAG grounding": You primary; Exa where semantic/neural
+  // retrieval quality matters most; Brave where independent index / data
+  // sovereignty are priorities. A score-derived order would have put `brave`
+  // (80.6) ahead of `exa` (79.5) — the doc's own prose orders them the other
+  // way, and declared order follows the doc's prose, not the arithmetic.
+  search: [
+    {
+      backendId: "you",
+      displayName: "You.com",
+      tier: "primary",
+      why: "cheapest quality AI search, clean data rights",
+      entryMethods: ["you_search"]
+    },
+    {
+      backendId: "exa",
+      displayName: "Exa",
+      tier: "secondary",
+      why: "neural/semantic retrieval with deep research and monitors",
+      when: "semantic/neural retrieval quality matters most",
+      entryMethods: ["exa_search"]
+    },
+    {
+      backendId: "brave",
+      displayName: "Brave Search",
+      tier: "secondary",
+      why: "independent 30B+ page index; official MCP server; structured data",
+      when: "independent index / data sovereignty",
+      entryMethods: ["brave_search"]
+    },
+    {
+      backendId: "firecrawl",
+      displayName: "Firecrawl",
+      tier: "fallback",
+      why: "LLM-ready markdown search as a last resort when dedicated search APIs are exhausted",
+      entryMethods: ["firecrawl_search"]
+    },
+    {
+      backendId: "geonode",
+      displayName: "Geonode",
+      tier: "fallback",
+      why: "flat per-request search endpoint on top of the cheapest proxy floor",
+      entryMethods: ["geonode_search"]
+    }
+  ],
+  // § "Still the best-value scraping API": Scrapingdog leads deliberately.
+  // A score-derived order would put `brightdata` (87.7) first and make
+  // `best_value: "brightdata"`, which contradicts providers-score.md:9
+  // ("our best-value picks are: Scrapingdog"). Declared order + the `when`
+  // note + the fallback contract still gets a hard-target scrape to Bright
+  // Data on the second hop, which is what the doc actually recommends.
+  scrape: [
+    {
+      backendId: "scrapingdog",
+      displayName: "Scrapingdog",
+      tier: "primary",
+      why: "best-value managed scraping API; no charge for blocked requests",
+      entryMethods: ["scrapingdog_scrape"]
+    },
+    {
+      backendId: "brightdata",
+      displayName: "Bright Data",
+      tier: "secondary",
+      why: "highest benchmarked success rate and breadth; premium",
+      when: "hard/anti-bot targets (Cloudflare, DataDome), or when Scrapingdog success on your targets drops below ~50%",
+      // Bright Data has no `scrape` method: the single-page entry point is
+      // the Web Unlocker (internal/brightdatabackend/routes.go:28).
+      entryMethods: ["brightdata_unlock"]
+    },
+    {
+      backendId: "firecrawl",
+      displayName: "Firecrawl",
+      tier: "secondary",
+      why: "fastest path to production, AI-ready",
+      entryMethods: ["firecrawl_scrape"]
+    },
+    {
+      backendId: "geonode",
+      displayName: "Geonode",
+      tier: "secondary",
+      why: "flat $0.13/1k-request scrape endpoint; no credit multipliers",
+      entryMethods: ["geonode_scrape"]
+    },
+    {
+      backendId: "apify",
+      displayName: "Apify",
+      tier: "fallback",
+      why: "least predictable billing; failed runs still bill",
+      // `runs.submit` -> `apify_runs_submit` via methodToToolName's
+      // non-alnum coercion (internal/apifybackend/manifest.go:66). The
+      // `runs.get`/`runs.dataset` pair are poll/fetch, not entry points.
+      entryMethods: ["apify_runs_submit"]
+    },
+    {
+      backendId: "scraperapi",
+      displayName: "ScraperAPI",
+      tier: "fallback",
+      why: "mid-tier all-rounder",
+      entryMethods: ["scraperapi_scrape"]
+    },
+    {
+      backendId: "scrapingbee",
+      displayName: "ScrapingBee",
+      tier: "fallback",
+      why: "~31% benchmarked success; 0% on LinkedIn/Walmart/X",
+      entryMethods: ["scrapingbee_scrape"]
+    }
+  ],
+  crawl: [
+    {
+      backendId: "firecrawl",
+      displayName: "Firecrawl",
+      tier: "primary",
+      why: "fastest path to production, AI-ready",
+      entryMethods: ["firecrawl_crawl"]
+    },
+    {
+      backendId: "geonode",
+      displayName: "Geonode",
+      tier: "secondary",
+      why: "best value proxy; flat-rate crawl endpoint",
+      entryMethods: ["geonode_crawl"]
+    },
+    {
+      backendId: "brightdata",
+      displayName: "Bright Data",
+      tier: "secondary",
+      // There is no Bright Data "Crawl API" on this gateway: multi-page
+      // collection is the async Web Scraper API's trigger/poll/download
+      // flow, whose only entry point is the trigger. snapshot_progress and
+      // snapshot are deliberately excluded — they are how you finish a run,
+      // not how you start one.
+      why: "async Web Scraper API (dataset collection) with the strongest anti-bot handling for hard targets",
+      entryMethods: ["brightdata_scrape_async"]
+    },
+    {
+      backendId: "apify",
+      displayName: "Apify",
+      tier: "fallback",
+      why: "actor marketplace; unpredictable billing",
+      entryMethods: ["apify_runs_submit"]
+    }
+  ],
+  news: [
+    {
+      backendId: "newsapi",
+      displayName: "NewsAPI.ai",
+      tier: "primary",
+      why: "enriched entity/sentiment/event intelligence, archive depth back to 2014",
+      // internal/newsapibackend/routes.go:116,135 — `articles` for
+      // individual article text, `events` for the AI-clustered story view.
+      entryMethods: ["newsapi_articles", "newsapi_events"]
+    },
+    {
+      backendId: "you",
+      displayName: "You.com",
+      tier: "secondary",
+      // providers-score.md:69 credits You.com with a News Search product,
+      // but this gateway exposes no news route (internal/youbackend/
+      // routes.go:81-158), so the entry point is the general search
+      // endpoint with a freshness filter.
+      why: "same clean, cheap index; freshness-filtered search stands in for a dedicated news endpoint",
+      entryMethods: ["you_search"]
+    },
+    {
+      backendId: "brave",
+      displayName: "Brave Search",
+      tier: "fallback",
+      why: "independent index with a dedicated news endpoint",
+      // internal/bravebackend/routes.go:39 — `brave_news`, not
+      // `brave_search`, which returns web results.
+      entryMethods: ["brave_news"]
+    }
+  ],
+  // § TL;DR economics argument: third-party alternatives are ~30-90x cheaper
+  // than the official X API for the same data, so Apify and Bright Data are
+  // both primary; xro is last by construction, no bucket arithmetic needed.
+  social: [
+    {
+      backendId: "apify",
+      displayName: "Apify",
+      tier: "primary",
+      why: "actor marketplace covers social scraping at a fraction of official-API cost",
+      entryMethods: ["apify_runs_submit"]
+    },
+    {
+      backendId: "brightdata",
+      displayName: "Bright Data",
+      tier: "primary",
+      why: "prebuilt datasets and unlocker cover social targets the official API restricts",
+      // Datasets (including the Social Media scrapers) are collected via
+      // the async trigger; the unlocker covers a single public profile page.
+      entryMethods: ["brightdata_scrape_async", "brightdata_unlock"]
+    },
+    {
+      backendId: "xro",
+      displayName: "X API (read-only)",
+      tier: "fallback",
+      why: "authoritative first-party data, for when that is the compliance requirement",
+      notRecommended: {
+        reason: "~30\u201390\xD7 costlier than third-party alternatives, hard 2M-read cap, heaviest TOS/lock-in risk \u2014 use only when first-party authenticity is mandatory"
+      },
+      // internal/xrobackend/routes.go:70-71 — the search endpoints.
+      // `xro_tweet_search` does not exist; `xro_tweet_lookup` is a by-id
+      // fetch and is not a discovery entry point.
+      entryMethods: ["xro_tweets_search_recent", "xro_tweets_search_all"]
+    }
+  ],
+  // Neither backend exposes a raw proxy endpoint over this gateway — the proxy
+  // networks are fronted by request-shaped methods (Geonode's Scraper API,
+  // Bright Data's Web Unlocker), and those are what an agent can actually call.
+  // The declared order still reflects the doc's § Proxy Infrastructure ranking.
+  proxy: [
+    {
+      backendId: "geonode",
+      displayName: "Geonode",
+      tier: "primary",
+      why: "best value proxy; lowest-price-guaranteed residential floor, reached through the flat-rate Scraper API",
+      entryMethods: ["geonode_scrape"]
+    },
+    {
+      backendId: "brightdata",
+      displayName: "Bright Data",
+      tier: "secondary",
+      why: "best for enterprise / hard targets; largest network, no concurrency limit, reached through the Web Unlocker",
+      entryMethods: ["brightdata_unlock"]
+    }
+  ],
+  // No declared recommendations — a method that classifies here is still
+  // returned (see intent.ts), just unranked.
+  other: []
+};
+for (const list of Object.values(RECOMMENDATIONS)) {
+  for (const rec of list) {
+    Object.freeze(rec.entryMethods);
+    if (rec.notRecommended) Object.freeze(rec.notRecommended);
+    Object.freeze(rec);
+  }
+  Object.freeze(list);
+}
+Object.freeze(RECOMMENDATIONS);
+var DEFAULT_EXCLUDED_BACKENDS = ["falai", "alpaca"];
+function resolveExcludedBackends(env) {
+  const raw = env.FEZO_EXCLUDED_BACKENDS;
+  if (raw === void 0) return [...DEFAULT_EXCLUDED_BACKENDS];
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+function isExcluded(backendId, excluded) {
+  return excluded.includes(backendId);
+}
+var EMPTY_RECOMMENDATIONS = [];
+Object.freeze(EMPTY_RECOMMENDATIONS);
+function recommendationsFor(intent) {
+  return RECOMMENDATIONS[intent] ?? EMPTY_RECOMMENDATIONS;
+}
+function recommendationFor(intent, backendId) {
+  return recommendationsFor(intent).find((r) => r.backendId === backendId);
+}
+function declaredIntentsFor(backendId) {
+  return INTENTS.filter((intent) => RECOMMENDATIONS[intent].some((r) => r.backendId === backendId));
+}
+function displayNameFor(backendId) {
+  for (const list of Object.values(RECOMMENDATIONS)) {
+    const found = list.find((r) => r.backendId === backendId);
+    if (found) return found.displayName;
+  }
+  return void 0;
+}
+
+// src/engine/provider-view.ts
+var NOT_SUBSTITUTES_NOTE = "These providers are not substitutes for one another \u2014 they span distinct functional categories (search, scrape/crawl, news, social, proxy). Compare providers within one capability group; a top rank in one group says nothing about fitness for another.";
+var UNRATED_WHY = "Not yet assessed against the declared recommendations \u2014 unrecommended because it is unrated, not because it is known to be bad.";
+function offListWhy(intent, backendId) {
+  const elsewhere = declaredIntentsFor(backendId).filter(
+    (i) => i !== intent && !recommendationFor(i, backendId)?.notRecommended
+  );
+  const tail = elsewhere.length > 0 ? `it is a recommended provider for ${elsewhere.join(", ")}` : "it is not a recommended provider for any capability";
+  return `Assessed, but not among the recommended providers for ${intent} \u2014 ${tail}. Prefer the ranked providers above for this capability.`;
+}
+function indexByBackend(candidates) {
+  const byBackend = /* @__PURE__ */ new Map();
+  for (const c of candidates) {
+    const list = byBackend.get(c.backendId);
+    if (list) list.push(c);
+    else byBackend.set(c.backendId, [c]);
+  }
+  return byBackend;
+}
+function buildRow(backendId, tier, rated, provider, why, when, notRecommended, declaredEntryMethods, methodsByBackend) {
+  const backendCandidates = methodsByBackend.get(backendId);
+  if (!backendCandidates || backendCandidates.length === 0) return void 0;
+  const methods = backendCandidates.map((c) => c.tool).sort();
+  const methodSet = new Set(methods);
+  const entryMethods = declaredEntryMethods.filter((m) => methodSet.has(m));
+  const first = backendCandidates[0];
+  const categories = first?.backendCategories ?? [];
+  const billing = first?.billingModel ?? "dynamic";
+  return {
+    tier,
+    rated,
+    backendId,
+    provider,
+    categories,
+    billing,
+    why,
+    ...when !== void 0 ? { when } : {},
+    ...notRecommended !== void 0 ? { notRecommended } : {},
+    methods,
+    entryMethods
+  };
+}
+function viewForIntent(candidates, intent, excluded) {
+  const methodsByBackend = indexByBackend(candidates);
+  const recs = recommendationsFor(intent);
+  const declaredIds = new Set(recs.map((r) => r.backendId));
+  const rows = [];
+  for (const rec of recs.filter((r) => !r.notRecommended && !isExcluded(r.backendId, excluded))) {
+    const row = buildRow(
+      rec.backendId,
+      rec.tier,
+      true,
+      rec.displayName,
+      rec.why,
+      rec.when,
+      void 0,
+      rec.entryMethods,
+      methodsByBackend
+    );
+    if (row) rows.push(row);
+  }
+  const offListIds = [...methodsByBackend.keys()].filter((id) => !declaredIds.has(id) && !isExcluded(id, excluded)).filter(
+    (id) => (
+      // `classifyCandidate`, not a hand-rolled classification: see this
+      // module's "PORTING NOTE" on why fezo's candidate description carries
+      // no injected framing and so needs none of mcp-server's workaround.
+      (methodsByBackend.get(id) ?? []).some((c) => classifyCandidate(c).includes(intent))
+    )
+  ).sort();
+  for (const id of offListIds) {
+    const declaredName = displayNameFor(id);
+    const row = declaredName === void 0 ? buildRow(id, "fallback", false, id, UNRATED_WHY, void 0, void 0, [], methodsByBackend) : buildRow(id, "fallback", true, declaredName, offListWhy(intent, id), void 0, void 0, [], methodsByBackend);
+    if (row) rows.push(row);
+  }
+  for (const rec of recs.filter((r) => r.notRecommended && !isExcluded(r.backendId, excluded))) {
+    const row = buildRow(
+      rec.backendId,
+      rec.tier,
+      true,
+      rec.displayName,
+      rec.why,
+      rec.when,
+      rec.notRecommended,
+      rec.entryMethods,
+      methodsByBackend
+    );
+    if (row) rows.push(row);
+  }
+  return rows.map((row, i) => ({ ...row, rank: i + 1 }));
+}
+function groupByCapability(candidates, excluded) {
+  return INTENTS.map((capability) => {
+    const providers = viewForIntent(candidates, capability, excluded);
+    const top = providers[0];
+    const topRec = top !== void 0 ? recommendationFor(capability, top.backendId) : void 0;
+    const bestValue = top !== void 0 && topRec && !topRec.notRecommended ? top.backendId : void 0;
+    return { capability, ...bestValue !== void 0 ? { bestValue } : {}, providers };
+  });
+}
+function annotate(row, options = {}) {
+  return {
+    rank: row.rank,
+    tier: row.tier,
+    rated: row.rated,
+    backend_id: row.backendId,
+    provider: row.provider,
+    categories: row.categories,
+    billing: row.billing,
+    why: row.why,
+    methods: row.methods,
+    entry_methods: row.entryMethods,
+    ...row.when !== void 0 ? { when: row.when } : {},
+    ...row.notRecommended !== void 0 ? { not_recommended: row.notRecommended } : {},
+    ...options.explain ? { source: { doc: RECOMMENDATION_SOURCE.doc, prepared: RECOMMENDATION_SOURCE.preparedAt } } : {}
+  };
+}
+function listProviders(candidates, excluded) {
+  const methodsByBackend = indexByBackend(candidates);
+  const backendIds = [...methodsByBackend.keys()].filter((id) => !isExcluded(id, excluded));
+  const scored = backendIds.map((backendId) => {
+    const declared = declaredIntentsFor(backendId);
+    const rated = declared.length > 0;
+    const recs = declared.map((intent) => {
+      const rec = recommendationFor(intent, backendId);
+      const rank = rec ? recommendationsFor(intent).findIndex((r) => r.backendId === backendId) + 1 : 0;
+      return {
+        intent,
+        rank,
+        tier: rec?.tier ?? "fallback",
+        why: rec?.why ?? "",
+        when: rec?.when,
+        notRecommended: rec?.notRecommended
+      };
+    });
+    const activeRecs = recs.filter((r) => r.notRecommended === void 0);
+    const allNotRecommended = rated && activeRecs.length === 0;
+    const bestRec = activeRecs.reduce(
+      (best, r) => !best || r.rank < best.rank ? r : best,
+      void 0
+    );
+    const bestScore = bestRec ? bestRec.rank : Number.POSITIVE_INFINITY;
+    const backendCandidates = methodsByBackend.get(backendId) ?? [];
+    const methods = backendCandidates.map((c) => c.tool).sort();
+    const first = backendCandidates[0];
+    const row = {
+      backendId,
+      provider: displayNameFor(backendId) ?? backendId,
+      rated,
+      categories: first?.backendCategories ?? [],
+      billing: first?.billingModel ?? "dynamic",
+      ...bestRec?.why !== void 0 ? { why: bestRec.why } : {},
+      ...bestRec?.when !== void 0 ? { when: bestRec.when } : {},
+      methods,
+      recommendations: recs.map((r) => ({
+        intent: r.intent,
+        rank: r.rank,
+        tier: r.tier,
+        why: r.why,
+        ...r.when !== void 0 ? { when: r.when } : {},
+        ...r.notRecommended !== void 0 ? { notRecommended: r.notRecommended } : {}
+      }))
+    };
+    const bucket = rated && !allNotRecommended ? 0 : rated ? 2 : 1;
+    return { row, bucket, bestScore };
+  });
+  scored.sort((a, b) => {
+    if (a.bucket !== b.bucket) return a.bucket - b.bucket;
+    if (a.bucket === 0 && a.bestScore !== b.bestScore) return a.bestScore - b.bestScore;
+    return a.row.backendId.localeCompare(b.row.backendId);
+  });
+  return scored.map((s) => s.row);
+}
+function annotateListed(row) {
+  return {
+    backend_id: row.backendId,
+    provider: row.provider,
+    rated: row.rated,
+    categories: row.categories,
+    billing: row.billing,
+    ...row.why !== void 0 ? { why: row.why } : {},
+    ...row.when !== void 0 ? { when: row.when } : {},
+    methods: row.methods,
+    recommendations: row.recommendations.map((r) => ({
+      intent: r.intent,
+      rank: r.rank,
+      tier: r.tier,
+      why: r.why,
+      ...r.when !== void 0 ? { when: r.when } : {},
+      ...r.notRecommended !== void 0 ? { not_recommended: r.notRecommended } : {}
+    }))
+  };
+}
+
+// src/engine/errors.ts
+function isRecord2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function parseCallError(status, bodyText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return { kind: "backend", status, body: bodyText };
+  }
+  if (isRecord2(parsed)) {
+    const err = parsed.error;
+    if (isRecord2(err) && typeof err.code === "string" && typeof err.message === "string") {
+      return { kind: "gateway", status, code: err.code, message: err.message };
+    }
+  }
+  return { kind: "backend", status, body: bodyText };
+}
+
+// src/engine/client.ts
+var GatewayCallError = class extends Error {
+  status;
+  detail;
+  constructor(detail) {
+    super(
+      detail.kind === "gateway" ? `gateway error ${detail.status} (${detail.code}): ${detail.message}` : `backend error ${detail.status}`
+    );
+    this.name = "GatewayCallError";
+    this.status = detail.status;
+    this.detail = detail;
+  }
+};
+function warn4(message) {
+  process.stderr.write(`fezoctl: ${message}
+`);
+}
+async function callTool(options) {
+  const fetchFn = options.fetchFn ?? fetch;
+  const bound = bindArgs(options.candidate, options.args, options.bodyJson);
+  const queryString = new URLSearchParams(bound.query).toString();
+  const url = `${options.baseUrl.replace(/\/$/, "")}/v1/${options.candidate.backendId}${bound.path}` + (queryString.length > 0 ? `?${queryString}` : "");
+  const hasBody = Object.hasOwn(bound, "body");
+  const clientOwnedHeaders = hasBody ? ["authorization", "content-type"] : ["authorization"];
+  const headers = {};
+  for (const [name, value] of Object.entries(bound.headers)) {
+    if (clientOwnedHeaders.includes(name.toLowerCase())) {
+      warn4(`${options.candidate.tool}: ignoring bound header "${name}" -- it is set by the client and may not be overridden`);
+      continue;
+    }
+    headers[name] = value;
+  }
+  headers.Authorization = `Bearer ${options.apiKey}`;
+  const init = { method: options.candidate.httpMethod, headers };
+  if (hasBody) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(bound.body);
+  }
+  const response = await fetchFn(url, init);
+  const bodyText = await response.text();
+  if (!response.ok) {
+    throw new GatewayCallError(parseCallError(response.status, bodyText));
+  }
+  return { status: response.status, bodyText };
+}
+
+// src/engine/schema.ts
+var PERMISSIVE_SCHEMA = { type: "object" };
+var ajv = newSchemaCompiler();
+function warn5(message) {
+  process.stderr.write(`fezoctl: ${message}
+`);
+}
+function errorDetail(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+function compileSchema(schema) {
+  try {
+    return ajv.compile(schema);
+  } catch (err) {
+    warn5(`failed to compile input_schema; using permissive validator (${errorDetail(err)})`);
+    return ajv.compile(PERMISSIVE_SCHEMA);
+  }
+}
+function ajvErrorsToText(errors) {
+  if (!errors || errors.length === 0) return "invalid input";
+  return errors.map((e) => `${e.instancePath || "(root)"} ${e.message}`).join("; ");
+}
+var SchemaValidatorCache = class {
+  byObject = /* @__PURE__ */ new WeakMap();
+  trueValidator;
+  falseValidator;
+  /** Returns the cached validator for `schema`, compiling it on first use. */
+  get(schema) {
+    if (schema === true) {
+      const existing = this.trueValidator;
+      if (existing) return existing;
+      const compiled2 = compileSchema(true);
+      this.trueValidator = compiled2;
+      return compiled2;
+    }
+    if (schema === false) {
+      const existing = this.falseValidator;
+      if (existing) return existing;
+      const compiled2 = compileSchema(false);
+      this.falseValidator = compiled2;
+      return compiled2;
+    }
+    const cached = this.byObject.get(schema);
+    if (cached) return cached;
+    const compiled = compileSchema(schema);
+    this.byObject.set(schema, compiled);
+    return compiled;
+  }
+};
+function validateArgs(validateFn, value) {
+  if (validateFn(value)) return { valid: true };
+  return { valid: false, errorText: ajvErrorsToText(validateFn.errors) };
+}
+
+// src/engine/retry.ts
+var ABORT_CODES = /* @__PURE__ */ new Set(["unauthorized", "limit_exceeded", "insufficient_balance"]);
+var RETRY_CODES = /* @__PURE__ */ new Set([
+  "quota_exceeded",
+  "rate_limited",
+  "backend_unavailable",
+  "provider_disabled",
+  "backend_not_configured",
+  "backend_not_found",
+  "backend_error",
+  "tool_not_in_catalog"
+]);
+var RETRYABLE_CODELESS_STATUSES = /* @__PURE__ */ new Set([402, 429, 500, 502, 503]);
+function classifyFailure(failure) {
+  switch (failure.kind) {
+    case "invalid-arguments":
+      return { decision: "retry", reason: `candidate rejected the supplied arguments: ${failure.message}` };
+    case "transport":
+      return { decision: "retry", reason: `transport failure: ${failure.message}` };
+    case "gateway": {
+      const { code, status } = failure;
+      if (ABORT_CODES.has(code)) {
+        return { decision: "abort", reason: `gateway code "${code}"`, httpStatus: status, gatewayCode: code };
+      }
+      if (RETRY_CODES.has(code)) {
+        return { decision: "retry", reason: `gateway code "${code}"`, httpStatus: status, gatewayCode: code };
+      }
+      return {
+        decision: "give_up",
+        reason: `unrecognized gateway code "${code}"`,
+        httpStatus: status,
+        gatewayCode: code
+      };
+    }
+    case "backend": {
+      const { status } = failure;
+      if (RETRYABLE_CODELESS_STATUSES.has(status)) {
+        return { decision: "retry", reason: `code-less HTTP ${status}`, httpStatus: status };
+      }
+      return { decision: "give_up", reason: `non-retryable HTTP ${status} with no gateway code`, httpStatus: status };
+    }
+  }
+}
+function buildLog(candidate, status, reason, billed, httpStatus, gatewayCode, preflight) {
+  return {
+    tool: candidate.tool,
+    backendId: candidate.backendId,
+    status,
+    reason,
+    billed,
+    ...httpStatus !== void 0 ? { httpStatus } : {},
+    ...gatewayCode !== void 0 ? { gatewayCode } : {},
+    ...preflight !== void 0 ? { preflight } : {}
+  };
+}
+function warn6(message) {
+  process.stderr.write(`fezoctl: ${message}
+`);
+}
+var DEFAULT_MAX_ATTEMPTS = 2;
+function isEmptyBody(bodyText) {
+  return bodyText.trim().length === 0;
+}
+function classifyThrown(err) {
+  if (err instanceof BindingError) {
+    return { kind: "invalid-arguments", message: err.message };
+  }
+  if (err instanceof GatewayCallError) {
+    return err.detail;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return { kind: "transport", message };
+}
+async function attemptCandidate(candidate, options, retryEmpty2xx, validators) {
+  const argsValidation = validateArgs(validators.get(candidate.inputSchema), options.args);
+  if (!argsValidation.valid) {
+    const failure = {
+      kind: "invalid-arguments",
+      message: `arguments do not match ${candidate.tool}'s input schema: ${argsValidation.errorText}`
+    };
+    const classified = classifyFailure(failure);
+    return {
+      log: buildLog(candidate, classified.decision, classified.reason, false, void 0, void 0, "schema"),
+      preflightFailure: true
+    };
+  }
+  try {
+    const result = await callTool({
+      baseUrl: options.baseUrl,
+      apiKey: options.apiKey,
+      candidate,
+      args: options.args,
+      ...options.bodyJson !== void 0 ? { bodyJson: options.bodyJson } : {},
+      ...options.fetchFn !== void 0 ? { fetchFn: options.fetchFn } : {}
+    });
+    if (isEmptyBody(result.bodyText)) {
+      if (retryEmpty2xx) {
+        warn6(
+          `${candidate.tool}: got an empty response body on a ${result.status} (already billed) and --retry-empty-2xx is set -- trying another candidate, which bills again`
+        );
+        return {
+          log: buildLog(candidate, "retry", "empty 2xx response body (--retry-empty-2xx)", true, result.status),
+          preflightFailure: false
+        };
+      }
+      return {
+        log: buildLog(candidate, "success", "empty 2xx response body (not retried; --retry-empty-2xx not set)", true, result.status),
+        result,
+        preflightFailure: false
+      };
+    }
+    return {
+      log: buildLog(candidate, "success", `${result.status} response`, true, result.status),
+      result,
+      preflightFailure: false
+    };
+  } catch (err) {
+    const failure = classifyThrown(err);
+    const classified = classifyFailure(failure);
+    const preflight = failure.kind === "invalid-arguments" ? "binding" : void 0;
+    return {
+      log: buildLog(
+        candidate,
+        classified.decision,
+        classified.reason,
+        false,
+        classified.httpStatus,
+        classified.gatewayCode,
+        preflight
+      ),
+      preflightFailure: preflight !== void 0
+    };
+  }
+}
+async function run(options) {
+  const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  const retryEmpty2xx = options.retryEmpty2xx ?? false;
+  const attempts = [];
+  if (options.candidates.length === 0) {
+    return { outcome: { kind: "give_up", reason: "no candidates to try" }, attempts };
+  }
+  let attemptBudgetExhausted = false;
+  let deadlineExceeded = false;
+  let callsMade = 0;
+  let preflightSkips = 0;
+  const validators = new SchemaValidatorCache();
+  const clock = options.deadline?.clock ?? Date.now;
+  const deadlineAt = options.deadline !== void 0 ? clock() + options.deadline.ms : void 0;
+  for (const candidate of options.candidates) {
+    if (callsMade >= maxAttempts) {
+      attemptBudgetExhausted = true;
+      break;
+    }
+    if (attempts.length > 0 && deadlineAt !== void 0 && clock() >= deadlineAt) {
+      deadlineExceeded = true;
+      break;
+    }
+    const candidateArgs = options.argsFor ? options.argsFor(candidate) : options.args;
+    const attemptOptions = {
+      baseUrl: options.baseUrl,
+      apiKey: options.apiKey,
+      args: candidateArgs,
+      ...options.bodyJson !== void 0 ? { bodyJson: options.bodyJson } : {},
+      ...options.fetchFn !== void 0 ? { fetchFn: options.fetchFn } : {}
+    };
+    const { log, result, preflightFailure } = await attemptCandidate(candidate, attemptOptions, retryEmpty2xx, validators);
+    attempts.push(log);
+    if (preflightFailure) {
+      preflightSkips += 1;
+    } else {
+      callsMade += 1;
+    }
+    if (log.status === "success") {
+      if (result === void 0) {
+        throw new Error("internal error: a successful attempt has no CallToolResult");
+      }
+      return { outcome: { kind: "success", candidate, result }, attempts };
+    }
+    if (log.status === "abort") {
+      return { outcome: { kind: "aborted", reason: log.reason }, attempts };
+    }
+    if (log.status === "give_up") {
+      return { outcome: { kind: "give_up", reason: log.reason }, attempts };
+    }
+  }
+  const everyAttemptWasAPreflightSkip = attempts.length > 0 && preflightSkips === attempts.length;
+  const reason = everyAttemptWasAPreflightSkip ? `no candidate accepted the supplied arguments: all ${attempts.length} candidate(s) rejected them before any request was sent (see the attempt log for each candidate's reason)` : deadlineExceeded ? `wall-clock deadline (${String(options.deadline?.ms)}ms) reached with candidates remaining` : attemptBudgetExhausted ? `max attempts (${maxAttempts}) reached with candidates remaining` : "no more candidates to try";
+  let stoppedBy;
+  if (deadlineExceeded) stoppedBy = "deadline";
+  else if (attemptBudgetExhausted) stoppedBy = "max-attempts";
+  return {
+    outcome: { kind: "give_up", reason },
+    attempts,
+    ...stoppedBy !== void 0 ? { stoppedBy } : {}
+  };
+}
+
+// src/engine/one-step.ts
+function asRecord2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
+}
+function asStringArray2(value) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const item of value) {
+    if (typeof item === "string") out.push(item);
+  }
+  return out;
+}
+var ARG_CANDIDATES = {
+  query: ["query", "q", "search", "search_query", "keyword", "keywords", "term", "text", "prompt"],
+  url: ["url", "target_url", "page_url", "link", "website", "start_url"]
+};
+Object.freeze(ARG_CANDIDATES.query);
+Object.freeze(ARG_CANDIDATES.url);
+Object.freeze(ARG_CANDIDATES);
+function resolveArgName(inputSchema, kind) {
+  const schema = asRecord2(inputSchema);
+  const props = schema ? asRecord2(schema.properties) : void 0;
+  if (!props) return void 0;
+  const required = new Set(schema ? asStringArray2(schema.required) : []);
+  const present = ARG_CANDIDATES[kind].filter((name) => name in props);
+  if (present.length === 0) return void 0;
+  const preferred = present.find((name) => required.has(name));
+  if (preferred !== void 0) return preferred;
+  const first = present[0];
+  if (first === void 0) return void 0;
+  return first;
+}
+var ONE_STEP_SPECS = [
+  { command: "web-search", intent: "search", argKind: "query" },
+  { command: "scrape", intent: "scrape", argKind: "url" },
+  { command: "crawl", intent: "crawl", argKind: "url" }
+];
+for (const spec of ONE_STEP_SPECS) Object.freeze(spec);
+Object.freeze(ONE_STEP_SPECS);
+var MAX_PROVIDER_ATTEMPTS = 3;
+var WALK_DEADLINE_MS = 6e4;
+function buildWalk(spec, candidates, excluded) {
+  const byBackend = /* @__PURE__ */ new Map();
+  for (const c of candidates) {
+    const list = byBackend.get(c.backendId);
+    if (list) list.push(c);
+    else byBackend.set(c.backendId, [c]);
+  }
+  const rankByBackend = new Map(viewForIntent(candidates, spec.intent, excluded).map((row) => [row.backendId, row.rank]));
+  const walk = [];
+  const skipped = [];
+  for (const rec of recommendationsFor(spec.intent)) {
+    if (rec.notRecommended || isExcluded(rec.backendId, excluded)) continue;
+    const backendCandidates = byBackend.get(rec.backendId);
+    if (!backendCandidates) {
+      skipped.push(`${rec.backendId} (not in catalog)`);
+      continue;
+    }
+    const rank = rankByBackend.get(rec.backendId);
+    if (rank === void 0) {
+      skipped.push(`${rec.backendId} (no callable method)`);
+      continue;
+    }
+    let matched;
+    for (const entry of rec.entryMethods) {
+      const candidate = backendCandidates.find((c) => c.tool === entry);
+      if (!candidate) continue;
+      const argName = resolveArgName(candidate.inputSchema, spec.argKind);
+      if (argName !== void 0) {
+        matched = { candidate, argName };
+        break;
+      }
+    }
+    if (!matched) {
+      skipped.push(`${rec.backendId} (no ${spec.argKind} argument)`);
+      continue;
+    }
+    walk.push({ candidate: matched.candidate, argName: matched.argName, backendId: rec.backendId, displayName: rec.displayName, rank });
+  }
+  return { walk, skipped };
+}
+function isCallerFixableArgRejection(attempt) {
+  return attempt.preflight === "schema";
+}
+function isPreflightRejection(attempt) {
+  return attempt.preflight !== void 0;
+}
+async function runOneStep(spec, value, extra, candidates, excluded, gateway, maxAttempts = MAX_PROVIDER_ATTEMPTS, deadline = { ms: WALK_DEADLINE_MS }) {
+  const { walk, skipped } = buildWalk(spec, candidates, excluded);
+  const stepByTool = new Map(walk.map((step) => [step.candidate.tool, step]));
+  const report = await run({
+    baseUrl: gateway.baseUrl,
+    apiKey: gateway.apiKey,
+    candidates: walk.map((step) => step.candidate),
+    // Fallback only (see retry.ts's `RunOptions.args` doc): every element of
+    // `candidates` above came from `walk`, and the `argsFor` below always has
+    // an entry for each of them, so this value is never actually read in
+    // practice. It exists only because `args` is a required field on
+    // `RunOptions`.
+    args: { ...extra, [spec.argKind]: value },
+    argsFor: (candidate) => {
+      const step = stepByTool.get(candidate.tool);
+      return step !== void 0 ? { ...extra, [step.argName]: value } : { ...extra, [spec.argKind]: value };
+    },
+    maxAttempts,
+    deadline,
+    ...gateway.fetchFn !== void 0 ? { fetchFn: gateway.fetchFn } : {}
+  });
+  const argRejected = [];
+  const manifestRejected = [];
+  for (const attempt of report.attempts) {
+    const step = stepByTool.get(attempt.tool);
+    if (step === void 0) continue;
+    if (isCallerFixableArgRejection(attempt)) argRejected.push(step.displayName);
+    else if (attempt.preflight === "binding") manifestRejected.push(step.displayName);
+  }
+  const realAttempts = report.attempts.filter((attempt) => !isPreflightRejection(attempt));
+  const lastReal = realAttempts[realAttempts.length - 1];
+  const servedStep = lastReal !== void 0 ? stepByTool.get(lastReal.tool) : void 0;
+  const served = servedStep !== void 0 ? {
+    backendId: servedStep.backendId,
+    displayName: servedStep.displayName,
+    rank: servedStep.rank,
+    success: report.outcome.kind === "success"
+  } : void 0;
+  return {
+    spec,
+    value,
+    maxAttempts,
+    report,
+    skipped,
+    argRejected,
+    manifestRejected,
+    ...served !== void 0 ? { served } : {}
+  };
+}
+
 // src/engine/preference.ts
 var CAPABILITY_KEYWORDS = {
   scrape: [
@@ -8679,15 +9763,35 @@ var CAPABILITY_KEYWORDS = {
     "unlock url",
     "webpage"
   ],
-  serp: ["serp", "google search", "google results", "search engine results"],
-  "web-search": ["web search", "search web", "internet search", "find sources", "research web"]
+  // The first four phrases were the former `serp` capability's; they are kept
+  // verbatim so wording that used to infer `serp` still infers a capability.
+  // See this module's header for why the bucket was merged rather than kept.
+  "web-search": [
+    "serp",
+    "google search",
+    "google results",
+    "search engine results",
+    "web search",
+    "search web",
+    "internet search",
+    "find sources",
+    "research web"
+  ]
 };
-var CAPABILITY_LIST = ["scrape", "serp", "web-search"];
+var CAPABILITY_LIST = ["scrape", "web-search"];
+var CAPABILITY_INTENTS = {
+  scrape: "scrape",
+  "web-search": "search"
+};
+function declaredOrder(intent) {
+  return recommendationsFor(intent).filter((rec) => rec.notRecommended === void 0).map((rec) => rec.backendId);
+}
 var CAPABILITY_PREFERENCES = {
-  scrape: ["firecrawl", "scrapingbee", "scrapingdog", "geonode", "scraperapi", "brightdata"],
-  serp: ["scraperapi", "scrapingbee", "scrapingdog", "brightdata"],
-  "web-search": ["exa", "brave", "firecrawl", "geonode", "you"]
+  scrape: declaredOrder(CAPABILITY_INTENTS.scrape),
+  "web-search": declaredOrder(CAPABILITY_INTENTS["web-search"])
 };
+for (const list of Object.values(CAPABILITY_PREFERENCES)) Object.freeze(list);
+Object.freeze(CAPABILITY_PREFERENCES);
 function inferCapability(intent) {
   const lowered = intent.toLowerCase();
   const allMatches = [];
@@ -8798,14 +9902,14 @@ function hasAsyncTextPhrase(candidate) {
   const text = `${candidate.title ?? ""} ${candidate.description}`.toLowerCase();
   return ASYNC_TEXT_PHRASES.some((phrase) => text.includes(phrase));
 }
-function isRecord2(value) {
+function isRecord3(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function hasAsyncOutputShape(candidate) {
   const schema = candidate.outputSchema;
-  if (!isRecord2(schema)) return false;
+  if (!isRecord3(schema)) return false;
   const properties = schema.properties;
-  if (!isRecord2(properties)) return false;
+  if (!isRecord3(properties)) return false;
   const keys = Object.keys(properties);
   if (keys.length === 0) return false;
   return keys.every((key) => ASYNC_ID_PROPERTY_NAMES.has(key.toLowerCase()));
@@ -8895,10 +9999,14 @@ function selectForRun(candidates, intent) {
     };
   }
   if (inference.kind === "matched") {
-    const ranked2 = rankCandidates(eligible, intent, inference.capability);
-    const chosen2 = ranked2[0];
-    if (chosen2 === void 0) return { outcome: "no-match" };
-    return { outcome: "selected", chosen: chosen2, ranked: ranked2 };
+    const preferred = CAPABILITY_PREFERENCES[inference.capability];
+    const discriminates = eligible.some((match) => preferred.includes(match.candidate.backendId));
+    if (discriminates) {
+      const ranked2 = rankCandidates(eligible, intent, inference.capability);
+      const chosen2 = ranked2[0];
+      if (chosen2 === void 0) return { outcome: "no-match" };
+      return { outcome: "selected", chosen: chosen2, ranked: ranked2 };
+    }
   }
   const ranked = rankCandidates(eligible, intent);
   const backends = new Set(eligible.map((match) => match.candidate.backendId));
@@ -8913,6 +10021,25 @@ function selectForRun(candidates, intent) {
   if (chosen === void 0) return { outcome: "no-match" };
   return { outcome: "selected", chosen, ranked };
 }
+
+// src/engine/one-step-descriptions.json
+var one_step_descriptions_default = {
+  "web-search": 'Search the live web and get ranked results in one call. Picks the best-value provider for "search" and falls back down the ranking on a blocked target or a rate limit.',
+  scrape: 'Fetch and extract the contents of one known URL in a single call. Picks the best-value provider for "scrape" and falls back down the ranking on a block or a rate limit.',
+  crawl: 'Discover and collect many pages from one site in a single call. Picks the best-value provider for "crawl" and falls back down the ranking on a block or a rate limit.'
+};
+
+// src/engine/steering.ts
+function successFooter(provider, intent, rank) {
+  return `Served by ${provider} (rank ${String(rank)} of ${intent}). For a different provider, more options, or a capability no one-step command covers (news, social, proxy), run \`fezoctl providers --intent ${intent}\`.`;
+}
+function failureFooter(provider, intent, rank) {
+  return `${provider} failed (rank ${String(rank)} of ${intent}). Run \`fezoctl providers --intent ${intent}\` for the remaining ranked providers, then \`fezoctl call <tool>\` or \`fezoctl run\` to try one directly.`;
+}
+var ONE_STEP_COMMANDS = ["web-search", "scrape", "crawl"];
+var ONE_STEP_DESCRIPTIONS = one_step_descriptions_default;
+Object.freeze(ONE_STEP_DESCRIPTIONS);
+Object.freeze(ONE_STEP_COMMANDS);
 
 // src/engine/render.ts
 function toJson(value) {
@@ -9184,6 +10311,58 @@ function renderRun(input, json) {
   }
   return lines.join("\n");
 }
+function renderOneStep(result, json) {
+  const { spec, value, maxAttempts, report, served, argRejected, manifestRejected, skipped } = result;
+  const billedAnyAttempt = report.attempts.some((attempt) => attempt.billed);
+  if (json) {
+    const doc = {
+      command: spec.command,
+      intent: spec.intent,
+      value,
+      max_attempts: maxAttempts,
+      ...served !== void 0 ? { served: { backend_id: served.backendId, provider: served.displayName, rank: served.rank, success: served.success } } : {},
+      arg_rejected: argRejected,
+      manifest_rejected: manifestRejected,
+      skipped,
+      ...report.stoppedBy !== void 0 ? { stopped_by: report.stoppedBy } : {},
+      attempts: report.attempts,
+      result: outcomeToJson(report.outcome),
+      billed_any_attempt: billedAnyAttempt,
+      billing: BILLING_STATEMENT
+    };
+    return toJson(doc);
+  }
+  const lines = [`${spec.command} "${value}"`];
+  if (served !== void 0) {
+    lines.push(
+      served.success ? successFooter(served.displayName, spec.intent, served.rank) : failureFooter(served.displayName, spec.intent, served.rank)
+    );
+  } else {
+    const skippedText = skipped.length > 0 ? ` Skipped: ${skipped.join("; ")}.` : "";
+    lines.push(
+      `No provider could serve ${spec.intent} for this input.${skippedText} Run \`fezoctl providers --intent ${spec.intent}\` to inspect the ranking, then \`fezoctl call <tool>\` or \`fezoctl run\` to target one directly.`
+    );
+  }
+  if (argRejected.length > 0) {
+    lines.push(
+      `Skipped ${argRejected.join(", ")}: the --extra-json arguments did not match their schema -- run \`fezoctl providers --intent ${spec.intent} --detail schema\` to see what each provider accepts.`
+    );
+  }
+  if (manifestRejected.length > 0) {
+    lines.push(
+      `Skipped ${manifestRejected.join(", ")}: that provider's manifest requires an argument \`${spec.command}\` does not supply -- run \`fezoctl schema <tool>\` to see its bindings, then \`fezoctl call <tool>\` to supply them yourself.`
+    );
+  }
+  if (report.stoppedBy === "max-attempts") {
+    lines.push(`Stopped after ${String(maxAttempts)} provider(s); lower-ranked ones were not tried.`);
+  } else if (report.stoppedBy === "deadline") {
+    lines.push("Stopped on the time budget; lower-ranked providers were not tried.");
+  }
+  lines.push(...renderAttemptsText(report.attempts));
+  lines.push(`billed: ${String(billedAnyAttempt)}`);
+  lines.push(...renderOutcomeText(report.outcome));
+  return lines.join("\n");
+}
 function renderCatalog(candidates, json) {
   const byBackend = /* @__PURE__ */ new Map();
   for (const candidate of candidates) {
@@ -9214,6 +10393,151 @@ function renderCatalog(candidates, json) {
     lines.push(`${backendId}:`);
     for (const candidate of methods) {
       lines.push(`  ${candidate.tool} (${candidate.httpMethod} ${candidate.path}) \u2014 ${candidate.description}`);
+    }
+  }
+  return lines.join("\n");
+}
+var NAMES_FALLBACK_METHODS = 3;
+function toNamesRow(row) {
+  const base = {
+    backend_id: row.backend_id,
+    rank: row.rank,
+    tier: row.tier,
+    provider: row.provider,
+    billing: row.billing,
+    rated: row.rated,
+    entry_methods: row.entry_methods,
+    ...row.not_recommended !== void 0 ? { not_recommended: row.not_recommended } : {},
+    ...row.source !== void 0 ? { source: row.source } : {}
+  };
+  if (row.entry_methods.length > 0) return base;
+  const omitted = Math.max(0, row.methods.length - NAMES_FALLBACK_METHODS);
+  return {
+    ...base,
+    methods: row.methods.slice(0, NAMES_FALLBACK_METHODS),
+    ...omitted > 0 ? { methods_omitted: omitted } : {}
+  };
+}
+function schemaByToolName(candidates) {
+  const map = /* @__PURE__ */ new Map();
+  for (const c of candidates) map.set(c.tool, c.inputSchema);
+  return map;
+}
+function renderOneProviderRow(row, options, schemas) {
+  const annotated = annotate(row, { explain: options.explain });
+  if (options.detail === "names") return toNamesRow(annotated);
+  if (options.detail === "schema") {
+    const method_schemas = {};
+    for (const m of row.methods) {
+      const s = schemas.get(m);
+      if (s !== void 0) method_schemas[m] = s;
+    }
+    return { ...annotated, method_schemas };
+  }
+  return annotated;
+}
+function renderProviderRowText(row, options, schemas) {
+  const flags = [row.rated ? void 0 : "unrated", row.notRecommended !== void 0 ? "not recommended" : void 0].filter(
+    (f) => f !== void 0
+  );
+  const flagsText = flags.length > 0 ? ` [${flags.join(", ")}]` : "";
+  const lines = [`  ${String(row.rank)}. [${row.tier}] ${row.provider} (${row.backendId}, ${row.billing})${flagsText}`];
+  const verbose = options.detail !== "names";
+  if (verbose) {
+    lines.push(`     why: ${row.why}`);
+    if (row.when !== void 0) lines.push(`     when: ${row.when}`);
+    if (row.notRecommended !== void 0) lines.push(`     not_recommended: ${row.notRecommended.reason}`);
+  }
+  if (row.entryMethods.length > 0) lines.push(`     entry_methods: [${row.entryMethods.join(", ")}]`);
+  if (verbose) {
+    lines.push(`     methods: [${row.methods.join(", ")}]`);
+  } else if (row.entryMethods.length === 0) {
+    const shown = row.methods.slice(0, NAMES_FALLBACK_METHODS);
+    const more = row.methods.length - shown.length;
+    lines.push(`     methods: [${shown.join(", ")}]${more > 0 ? ` (+${String(more)} more)` : ""}`);
+  }
+  if (options.detail === "schema") {
+    const withSchemas = row.methods.filter((m) => schemas.has(m));
+    if (withSchemas.length > 0) {
+      lines.push(`     schemas: [${withSchemas.join(", ")}] \u2014 run \`fezoctl schema <tool>\` for each`);
+    }
+  }
+  if (options.explain) {
+    lines.push(`     source: ${RECOMMENDATION_SOURCE.doc} (prepared ${RECOMMENDATION_SOURCE.preparedAt})`);
+  }
+  return lines;
+}
+function renderProviders(groups, options) {
+  const schemas = options.detail === "schema" ? schemaByToolName(options.candidates) : /* @__PURE__ */ new Map();
+  const rendered = groups.map((group) => {
+    const truncated = group.providers.slice(0, options.limit);
+    const omitted = Math.max(0, group.providers.length - truncated.length);
+    return {
+      group,
+      truncated,
+      omitted,
+      rows: truncated.map((row) => renderOneProviderRow(row, options, schemas))
+    };
+  });
+  if (options.json) {
+    if (options.intent !== void 0) {
+      const only = rendered[0];
+      return toJson({
+        recommendations: RECOMMENDATION_SOURCE,
+        capability: options.intent,
+        ...only?.group.bestValue !== void 0 ? { best_value: only.group.bestValue } : {},
+        omitted: only?.omitted ?? 0,
+        providers: only?.rows ?? []
+      });
+    }
+    return toJson({
+      recommendations: RECOMMENDATION_SOURCE,
+      note: NOT_SUBSTITUTES_NOTE,
+      groups: rendered.map(({ group, omitted, rows }) => ({
+        capability: group.capability,
+        ...group.bestValue !== void 0 ? { best_value: group.bestValue } : {},
+        omitted,
+        providers: rows
+      }))
+    });
+  }
+  const lines = [`recommendations: ${RECOMMENDATION_SOURCE.doc} (prepared ${RECOMMENDATION_SOURCE.preparedAt})`];
+  if (options.intent === void 0) lines.push(NOT_SUBSTITUTES_NOTE);
+  for (const { group, omitted, truncated } of rendered) {
+    const bestValueText = group.bestValue ?? "(none)";
+    const omittedText = omitted > 0 ? `, omitted: ${String(omitted)}` : "";
+    lines.push(`
+${group.capability} \u2014 best_value: ${bestValueText}${omittedText}`);
+    if (truncated.length === 0) {
+      lines.push("  (no providers)");
+      continue;
+    }
+    for (const row of truncated) lines.push(...renderProviderRowText(row, options, schemas));
+  }
+  return lines.join("\n");
+}
+function renderListProviders(rows, json) {
+  if (json) {
+    return toJson({ recommendations: RECOMMENDATION_SOURCE, providers: rows.map(annotateListed) });
+  }
+  if (rows.length === 0) return "providers: (none)";
+  const lines = [
+    `recommendations: ${RECOMMENDATION_SOURCE.doc} (prepared ${RECOMMENDATION_SOURCE.preparedAt})`,
+    `providers \u2014 ${String(rows.length)} backend(s)`
+  ];
+  for (const row of rows) {
+    const status = row.rated ? "" : " [unrated]";
+    lines.push(`  ${row.provider} (${row.backendId}, ${row.billing})${status}`);
+    if (row.why !== void 0) lines.push(`    why: ${row.why}`);
+    if (row.when !== void 0) lines.push(`    when: ${row.when}`);
+    lines.push(`    categories: [${row.categories.join(", ")}]`);
+    lines.push(`    methods: [${row.methods.join(", ")}]`);
+    if (row.recommendations.length > 0) {
+      lines.push("    recommendations:");
+      for (const rec of row.recommendations) {
+        const notRecommendedText = rec.notRecommended !== void 0 ? ` (not recommended: ${rec.notRecommended.reason})` : "";
+        lines.push(`      ${rec.intent}: declared rank ${String(rec.rank)} (${rec.tier}) \u2014 ${rec.why}${notRecommendedText}`);
+      }
     }
   }
   return lines.join("\n");
@@ -9261,301 +10585,19 @@ function renderSetup(input, json) {
   return lines.join("\n");
 }
 
-// src/engine/errors.ts
-function isRecord3(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-function parseCallError(status, bodyText) {
-  let parsed;
-  try {
-    parsed = JSON.parse(bodyText);
-  } catch {
-    return { kind: "backend", status, body: bodyText };
-  }
-  if (isRecord3(parsed)) {
-    const err = parsed.error;
-    if (isRecord3(err) && typeof err.code === "string" && typeof err.message === "string") {
-      return { kind: "gateway", status, code: err.code, message: err.message };
-    }
-  }
-  return { kind: "backend", status, body: bodyText };
-}
-
-// src/engine/client.ts
-var GatewayCallError = class extends Error {
-  status;
-  detail;
-  constructor(detail) {
-    super(
-      detail.kind === "gateway" ? `gateway error ${detail.status} (${detail.code}): ${detail.message}` : `backend error ${detail.status}`
-    );
-    this.name = "GatewayCallError";
-    this.status = detail.status;
-    this.detail = detail;
-  }
-};
-function warn4(message) {
-  process.stderr.write(`fezoctl: ${message}
-`);
-}
-async function callTool(options) {
-  const fetchFn = options.fetchFn ?? fetch;
-  const bound = bindArgs(options.candidate, options.args, options.bodyJson);
-  const queryString = new URLSearchParams(bound.query).toString();
-  const url = `${options.baseUrl.replace(/\/$/, "")}/v1/${options.candidate.backendId}${bound.path}` + (queryString.length > 0 ? `?${queryString}` : "");
-  const hasBody = Object.hasOwn(bound, "body");
-  const clientOwnedHeaders = hasBody ? ["authorization", "content-type"] : ["authorization"];
-  const headers = {};
-  for (const [name, value] of Object.entries(bound.headers)) {
-    if (clientOwnedHeaders.includes(name.toLowerCase())) {
-      warn4(`${options.candidate.tool}: ignoring bound header "${name}" -- it is set by the client and may not be overridden`);
-      continue;
-    }
-    headers[name] = value;
-  }
-  headers.Authorization = `Bearer ${options.apiKey}`;
-  const init = { method: options.candidate.httpMethod, headers };
-  if (hasBody) {
-    headers["Content-Type"] = "application/json";
-    init.body = JSON.stringify(bound.body);
-  }
-  const response = await fetchFn(url, init);
-  const bodyText = await response.text();
-  if (!response.ok) {
-    throw new GatewayCallError(parseCallError(response.status, bodyText));
-  }
-  return { status: response.status, bodyText };
-}
-
-// src/engine/schema.ts
-var PERMISSIVE_SCHEMA = { type: "object" };
-var ajv = newSchemaCompiler();
-function warn5(message) {
-  process.stderr.write(`fezoctl: ${message}
-`);
-}
-function errorDetail(err) {
-  return err instanceof Error ? err.message : String(err);
-}
-function compileSchema(schema) {
-  try {
-    return ajv.compile(schema);
-  } catch (err) {
-    warn5(`failed to compile input_schema; using permissive validator (${errorDetail(err)})`);
-    return ajv.compile(PERMISSIVE_SCHEMA);
-  }
-}
-function ajvErrorsToText(errors) {
-  if (!errors || errors.length === 0) return "invalid input";
-  return errors.map((e) => `${e.instancePath || "(root)"} ${e.message}`).join("; ");
-}
-var SchemaValidatorCache = class {
-  byObject = /* @__PURE__ */ new WeakMap();
-  trueValidator;
-  falseValidator;
-  /** Returns the cached validator for `schema`, compiling it on first use. */
-  get(schema) {
-    if (schema === true) {
-      const existing = this.trueValidator;
-      if (existing) return existing;
-      const compiled2 = compileSchema(true);
-      this.trueValidator = compiled2;
-      return compiled2;
-    }
-    if (schema === false) {
-      const existing = this.falseValidator;
-      if (existing) return existing;
-      const compiled2 = compileSchema(false);
-      this.falseValidator = compiled2;
-      return compiled2;
-    }
-    const cached = this.byObject.get(schema);
-    if (cached) return cached;
-    const compiled = compileSchema(schema);
-    this.byObject.set(schema, compiled);
-    return compiled;
-  }
-};
-function validateArgs(validateFn, value) {
-  if (validateFn(value)) return { valid: true };
-  return { valid: false, errorText: ajvErrorsToText(validateFn.errors) };
-}
-
-// src/engine/retry.ts
-var ABORT_CODES = /* @__PURE__ */ new Set(["unauthorized", "limit_exceeded", "insufficient_balance"]);
-var RETRY_CODES = /* @__PURE__ */ new Set([
-  "quota_exceeded",
-  "rate_limited",
-  "backend_unavailable",
-  "provider_disabled",
-  "backend_not_configured",
-  "backend_not_found",
-  "backend_error",
-  "tool_not_in_catalog"
-]);
-var RETRYABLE_CODELESS_STATUSES = /* @__PURE__ */ new Set([402, 429, 500, 502, 503]);
-function classifyFailure(failure) {
-  switch (failure.kind) {
-    case "invalid-arguments":
-      return { decision: "retry", reason: `candidate rejected the supplied arguments: ${failure.message}` };
-    case "transport":
-      return { decision: "retry", reason: `transport failure: ${failure.message}` };
-    case "gateway": {
-      const { code, status } = failure;
-      if (ABORT_CODES.has(code)) {
-        return { decision: "abort", reason: `gateway code "${code}"`, httpStatus: status, gatewayCode: code };
-      }
-      if (RETRY_CODES.has(code)) {
-        return { decision: "retry", reason: `gateway code "${code}"`, httpStatus: status, gatewayCode: code };
-      }
-      return {
-        decision: "give_up",
-        reason: `unrecognized gateway code "${code}"`,
-        httpStatus: status,
-        gatewayCode: code
-      };
-    }
-    case "backend": {
-      const { status } = failure;
-      if (RETRYABLE_CODELESS_STATUSES.has(status)) {
-        return { decision: "retry", reason: `code-less HTTP ${status}`, httpStatus: status };
-      }
-      return { decision: "give_up", reason: `non-retryable HTTP ${status} with no gateway code`, httpStatus: status };
-    }
-  }
-}
-function buildLog(candidate, status, reason, billed, httpStatus, gatewayCode) {
-  return {
-    tool: candidate.tool,
-    backendId: candidate.backendId,
-    status,
-    reason,
-    billed,
-    ...httpStatus !== void 0 ? { httpStatus } : {},
-    ...gatewayCode !== void 0 ? { gatewayCode } : {}
-  };
-}
-function warn6(message) {
-  process.stderr.write(`fezoctl: ${message}
-`);
-}
-var DEFAULT_MAX_ATTEMPTS = 2;
-function isEmptyBody(bodyText) {
-  return bodyText.trim().length === 0;
-}
-function classifyThrown(err) {
-  if (err instanceof BindingError) {
-    return { kind: "invalid-arguments", message: err.message };
-  }
-  if (err instanceof GatewayCallError) {
-    return err.detail;
-  }
-  const message = err instanceof Error ? err.message : String(err);
-  return { kind: "transport", message };
-}
-async function attemptCandidate(candidate, options, retryEmpty2xx, validators) {
-  const argsValidation = validateArgs(validators.get(candidate.inputSchema), options.args);
-  if (!argsValidation.valid) {
-    const failure = {
-      kind: "invalid-arguments",
-      message: `arguments do not match ${candidate.tool}'s input schema: ${argsValidation.errorText}`
-    };
-    const classified = classifyFailure(failure);
-    return {
-      log: buildLog(candidate, classified.decision, classified.reason, false),
-      preflightFailure: true
-    };
-  }
-  try {
-    const result = await callTool({
-      baseUrl: options.baseUrl,
-      apiKey: options.apiKey,
-      candidate,
-      args: options.args,
-      ...options.bodyJson !== void 0 ? { bodyJson: options.bodyJson } : {},
-      ...options.fetchFn !== void 0 ? { fetchFn: options.fetchFn } : {}
-    });
-    if (isEmptyBody(result.bodyText)) {
-      if (retryEmpty2xx) {
-        warn6(
-          `${candidate.tool}: got an empty response body on a ${result.status} (already billed) and --retry-empty-2xx is set -- trying another candidate, which bills again`
-        );
-        return {
-          log: buildLog(candidate, "retry", "empty 2xx response body (--retry-empty-2xx)", true, result.status),
-          preflightFailure: false
-        };
-      }
-      return {
-        log: buildLog(candidate, "success", "empty 2xx response body (not retried; --retry-empty-2xx not set)", true, result.status),
-        result,
-        preflightFailure: false
-      };
-    }
-    return {
-      log: buildLog(candidate, "success", `${result.status} response`, true, result.status),
-      result,
-      preflightFailure: false
-    };
-  } catch (err) {
-    const failure = classifyThrown(err);
-    const classified = classifyFailure(failure);
-    return {
-      log: buildLog(
-        candidate,
-        classified.decision,
-        classified.reason,
-        false,
-        classified.httpStatus,
-        classified.gatewayCode
-      ),
-      preflightFailure: failure.kind === "invalid-arguments"
-    };
-  }
-}
-async function run(options) {
-  const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
-  const retryEmpty2xx = options.retryEmpty2xx ?? false;
-  const attempts = [];
-  if (options.candidates.length === 0) {
-    return { outcome: { kind: "give_up", reason: "no candidates to try" }, attempts };
-  }
-  let attemptBudgetExhausted = false;
-  let callsMade = 0;
-  let preflightSkips = 0;
-  const validators = new SchemaValidatorCache();
-  for (const candidate of options.candidates) {
-    if (callsMade >= maxAttempts) {
-      attemptBudgetExhausted = true;
-      break;
-    }
-    const { log, result, preflightFailure } = await attemptCandidate(candidate, options, retryEmpty2xx, validators);
-    attempts.push(log);
-    if (preflightFailure) {
-      preflightSkips += 1;
-    } else {
-      callsMade += 1;
-    }
-    if (log.status === "success") {
-      if (result === void 0) {
-        throw new Error("internal error: a successful attempt has no CallToolResult");
-      }
-      return { outcome: { kind: "success", candidate, result }, attempts };
-    }
-    if (log.status === "abort") {
-      return { outcome: { kind: "aborted", reason: log.reason }, attempts };
-    }
-    if (log.status === "give_up") {
-      return { outcome: { kind: "give_up", reason: log.reason }, attempts };
-    }
-  }
-  const everyAttemptWasAPreflightSkip = attempts.length > 0 && preflightSkips === attempts.length;
-  const reason = everyAttemptWasAPreflightSkip ? `no candidate accepted the supplied arguments: all ${attempts.length} candidate(s) rejected them before any request was sent (see the attempt log for each candidate's reason)` : attemptBudgetExhausted ? `max attempts (${maxAttempts}) reached with candidates remaining` : "no more candidates to try";
-  return { outcome: { kind: "give_up", reason }, attempts };
-}
-
 // src/cli.ts
-var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--schema", "--retry-empty-2xx", "--allow-unhinted-auto-pick", "--key-stdin"]);
-var VALUE_FLAGS = /* @__PURE__ */ new Set(["--args-json", "--body-json", "--max-attempts", "--url", "--storage"]);
+var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--schema", "--retry-empty-2xx", "--allow-unhinted-auto-pick", "--key-stdin", "--explain"]);
+var VALUE_FLAGS = /* @__PURE__ */ new Set([
+  "--args-json",
+  "--body-json",
+  "--max-attempts",
+  "--url",
+  "--storage",
+  "--intent",
+  "--detail",
+  "--limit",
+  "--extra-json"
+]);
 function parseArgv(argv) {
   const positionals = [];
   const values = {};
@@ -9586,11 +10628,16 @@ function parseArgv(argv) {
       retryEmpty2xx: booleans.has("--retry-empty-2xx"),
       allowUnhintedAutoPick: booleans.has("--allow-unhinted-auto-pick"),
       keyStdin: booleans.has("--key-stdin"),
+      explain: booleans.has("--explain"),
       ...values["--args-json"] !== void 0 ? { argsJson: values["--args-json"] } : {},
       ...values["--body-json"] !== void 0 ? { bodyJson: values["--body-json"] } : {},
       ...values["--max-attempts"] !== void 0 ? { maxAttempts: values["--max-attempts"] } : {},
       ...values["--url"] !== void 0 ? { url: values["--url"] } : {},
-      ...values["--storage"] !== void 0 ? { storage: values["--storage"] } : {}
+      ...values["--storage"] !== void 0 ? { storage: values["--storage"] } : {},
+      ...values["--intent"] !== void 0 ? { intent: values["--intent"] } : {},
+      ...values["--detail"] !== void 0 ? { detail: values["--detail"] } : {},
+      ...values["--limit"] !== void 0 ? { limit: values["--limit"] } : {},
+      ...values["--extra-json"] !== void 0 ? { extraJson: values["--extra-json"] } : {}
     }
   };
 }
@@ -9668,6 +10715,28 @@ function validateBodyAgainstBinding(cache, candidate, bodyJson) {
 var EXIT_OK = 0;
 var EXIT_USAGE = 1;
 var EXIT_OPERATIONAL = 2;
+var DEFAULT_PROVIDERS_LIMIT = 5;
+var HELP_WRAP_COLUMNS = 78;
+function oneStepHelpBlock() {
+  const labelWidth = Math.max(...ONE_STEP_COMMANDS.map((name) => name.length));
+  const indent = " ".repeat(2 + labelWidth + 2);
+  const lines = [];
+  for (const name of ONE_STEP_COMMANDS) {
+    let line = `  ${name.padEnd(labelWidth)}  `;
+    let placed = false;
+    for (const word of ONE_STEP_DESCRIPTIONS[name].split(" ")) {
+      if (placed && line.length + 1 + word.length > HELP_WRAP_COLUMNS) {
+        lines.push(line);
+        line = indent + word;
+      } else {
+        line = placed ? `${line} ${word}` : line + word;
+      }
+      placed = true;
+    }
+    lines.push(line);
+  }
+  return lines.join("\n");
+}
 var HELP_TEXT = `fezoctl \u2014 discover and call Fezo gateway tools from the live catalog
 
 Usage:
@@ -9676,7 +10745,13 @@ Usage:
   fezoctl call <tool> --args-json '<json>' [--body-json '<json>'] [--json]
   fezoctl run "<intent>" --args-json '<json>' [--body-json '<json>']
              [--max-attempts N] [--retry-empty-2xx] [--allow-unhinted-auto-pick] [--json]
+  fezoctl web-search "<query>" [--extra-json '<json>'] [--max-attempts N] [--json]
+  fezoctl scrape <url>         [--extra-json '<json>'] [--max-attempts N] [--json]
+  fezoctl crawl <url>          [--extra-json '<json>'] [--max-attempts N] [--json]
   fezoctl catalog [--json]
+  fezoctl providers [--intent <intent>] [--detail names|descriptions|schema]
+                     [--limit N] [--explain] [--json]
+  fezoctl list-providers [--json]
   fezoctl setup --key-stdin [--url <url>] [--storage keychain|dotenv] [--json]
   fezoctl doctor [--json]
   fezoctl --version
@@ -9685,22 +10760,74 @@ Usage:
 Credentials are never accepted as a command-line argument: setup --key-stdin
 reads the API key from stdin. Otherwise, set FEZO_URL and FEZO_API_KEY.
 
+providers/list-providers surface the declared, per-intent provider ranking
+(src/engine/providers.ts) instead of catalog/registration order: intents are
+${INTENTS.join(", ")}.
+providers --detail defaults to "names" (a cheap sweep: rank, provider and
+what is callable on it); "descriptions" adds the full why/when prose and the
+provider's complete method list, "schema" additionally names each surfaced
+method's input schema (inlined under --json, listed as tool names to pass to
+\`fezoctl schema\` otherwise). --explain adds the ranking's provenance (which
+doc it was read from, and when) to every row. --limit caps each capability
+group and always reports what it dropped as "omitted".
+
+providers ranks by what your catalog actually serves, so a provider's rank
+moves when a higher-ranked one is absent; list-providers reports the DECLARED
+rank instead \u2014 the provider's fixed position in the table \u2014 which is why the
+two commands can print different numbers for the same provider.
+
+web-search/scrape/crawl each walk providers.ts's declared ranking for their
+own intent (search/scrape/crawl respectively) top-down, calling one provider
+at a time and falling back to the next on a retryable failure \u2014 no need to
+know any provider's argument name or call convention up front. --extra-json
+merges provider-specific options into whichever candidate the walk lands on
+(result counts, formats, timeouts \u2014 never the query/url itself); a provider
+whose own schema rejects those merged arguments is skipped and named in the
+output, even when a later, lower-ranked provider then succeeds. --max-attempts
+here defaults to ${String(MAX_PROVIDER_ATTEMPTS)}, NOT run's default of 2: run's budget is a RETRY
+budget for repeated failures on one already-selected capability; a one-step
+command's budget is a RANKED-FALLBACK budget across several genuinely
+different, separately-priced providers, so a higher default is deliberate. The
+walk also carries its own 60-second wall-clock deadline, not configurable from
+the command line: on expiry it stops STARTING new attempts (never aborting one
+already in flight, which would discard a result already billed) and reports
+whichever candidate answered last. Deny-listed and not-recommended providers
+are never attempted by any of the three commands.
+
+What each one is for (the same sentences skills/fezo/SKILL.md uses):
+
+${oneStepHelpBlock()}
+
+FEZO_EXCLUDED_BACKENDS overrides the default deny-listed backends (falai,
+alpaca): a comma-separated backend id list that REPLACES the default, or an
+explicitly empty string to exclude nothing. Excluded backends never appear in
+search/catalog/providers/list-providers, are never attempted by
+web-search/scrape/crawl, and schema/call/run refuse to reach one even when
+named by its exact tool name.
+
 With --json, stdout is always a JSON document \u2014 never empty. A failure that
 never reached the gateway is {"error":{"kind":"...","message":"..."}}, where
 kind is one of: usage, credentials-not-configured, catalog-unavailable,
-tool-not-found, invalid-args, invalid-body, version-unavailable. A call/run
-that did reach the gateway emits its full attempt-log document instead (the
-failure is in its outcome/result, alongside what was billed). The
-human-readable message always goes to stderr, and exit codes do not change.
+tool-not-found, invalid-args, invalid-body, version-unavailable,
+backend-excluded. A call/run/web-search/scrape/crawl that did reach the
+gateway emits its full attempt-log document instead (the failure is in its
+outcome/result, alongside what was billed, and \u2014 for the three one-step
+commands \u2014 which provider served it, its rank, any provider --extra-json
+disqualified, and any cap that stopped the walk, all as fields rather than
+prose). The human-readable message always goes to stderr, and exit codes do
+not change.
 
 Exit codes:
   0  success
-  1  usage error: a bad command/flag, or an unparseable --args-json/--body-json
-     payload \u2014 rejected before any candidate is selected or called.
+  1  usage error: a bad command/flag, or an unparseable
+     --args-json/--body-json/--extra-json payload \u2014 rejected before any
+     candidate is selected or called.
   2  operational failure: credentials not configured, the gateway/catalog
-     could not be reached or read, arguments failed schema validation, or a
-     call/run that did not end in success (including a run refusal, an empty
-     match, or doctor finding a hard failure).
+     could not be reached or read, arguments failed schema validation, a
+     schema/call/run that named a deny-listed backend, or a
+     call/run/web-search/scrape/crawl that did not end in success (including
+     a run refusal, an empty match, a one-step walk with no provider to serve
+     it, or doctor finding a hard failure).
 `;
 function emitFailure(emit, kind, message) {
   emit.err(`fezoctl: ${message}
@@ -9760,7 +10887,31 @@ function parseJsonFlag(raw, flagName, command, emit) {
     return { ok: false };
   }
 }
-async function cmdSearch(flags, deps, emit) {
+function asPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
+}
+function filterExcluded(candidates, excluded) {
+  return candidates.filter((c) => !isExcluded(c.backendId, excluded));
+}
+function excludedBackendMessage(backendId, tool, verb = "called") {
+  return `backend "${backendId}" is excluded (FEZO_EXCLUDED_BACKENDS); "${tool}" cannot be ${verb}`;
+}
+function exactExcludedToolMatch(candidates, excluded, intent) {
+  const excludedCandidates = candidates.filter((c) => isExcluded(c.backendId, excluded));
+  const match = searchCandidates(excludedCandidates, intent).find((m) => m.exactMatch === "tool");
+  return match?.candidate;
+}
+function parseIntentFlag(raw) {
+  for (const intent of INTENTS) {
+    if (intent === raw) return intent;
+  }
+  return void 0;
+}
+function parseDetailFlag(raw) {
+  if (raw === "names" || raw === "descriptions" || raw === "schema") return raw;
+  return void 0;
+}
+async function cmdSearch(flags, deps, emit, excluded) {
   const query = flags.positionals.join(" ");
   if (query.length === 0) {
     emitUsageError(emit, "search", 'requires a query, e.g. `fezoctl search "scrape this page"`');
@@ -9768,14 +10919,15 @@ async function cmdSearch(flags, deps, emit) {
   }
   const gateway = await openGateway(deps, emit);
   if (!gateway.ok) return gateway.exitCode;
-  const matches = searchCandidates(gateway.session.candidates, query);
+  const candidates = filterExcluded(gateway.session.candidates, excluded);
+  const matches = searchCandidates(candidates, query);
   const inference = inferCapability(query);
   const capability = inference.kind === "matched" ? inference.capability : void 0;
   const ranked = rankCandidates(matches, query, capability);
   emit.out(renderSearch(ranked, query, { json: flags.json, includeSchema: flags.schema }));
   return EXIT_OK;
 }
-async function cmdSchema(flags, deps, emit) {
+async function cmdSchema(flags, deps, emit, excluded) {
   const tool = flags.positionals[0];
   if (tool === void 0 || flags.positionals.length > 1) {
     emitUsageError(emit, "schema", "requires exactly one tool name, e.g. `fezoctl schema firecrawl_scrape`");
@@ -9788,10 +10940,14 @@ async function cmdSchema(flags, deps, emit) {
     emitFailure(emit, "tool-not-found", `tool "${tool}" was not found in the catalog`);
     return EXIT_OPERATIONAL;
   }
+  if (isExcluded(candidate.backendId, excluded)) {
+    emitFailure(emit, "backend-excluded", excludedBackendMessage(candidate.backendId, tool, "inspected"));
+    return EXIT_OPERATIONAL;
+  }
   emit.out(renderSchema(candidate, flags.json));
   return EXIT_OK;
 }
-async function cmdCall(flags, deps, emit) {
+async function cmdCall(flags, deps, emit, excluded) {
   const tool = flags.positionals[0];
   if (tool === void 0 || flags.positionals.length > 1) {
     emitUsageError(emit, "call", "requires exactly one tool name, e.g. `fezoctl call firecrawl_scrape --args-json '{...}'`");
@@ -9814,6 +10970,10 @@ async function cmdCall(flags, deps, emit) {
   if (!gateway.ok) return gateway.exitCode;
   const { creds } = gateway.session;
   const candidate = findCandidateByToolName(gateway.session.candidates, tool);
+  if (candidate && isExcluded(candidate.backendId, excluded)) {
+    emitFailure(emit, "backend-excluded", excludedBackendMessage(candidate.backendId, tool));
+    return EXIT_OPERATIONAL;
+  }
   if (!candidate) {
     emit.out(renderCall({ tool, report: unresolvedToolReport(tool) }, flags.json));
     return EXIT_OPERATIONAL;
@@ -9851,7 +11011,7 @@ async function cmdCall(flags, deps, emit) {
   emit.out(renderCall({ tool, candidate, ...boundRequest !== void 0 ? { boundRequest } : {}, report }, flags.json));
   return report.outcome.kind === "success" ? EXIT_OK : EXIT_OPERATIONAL;
 }
-async function cmdRun(flags, deps, emit) {
+async function cmdRun(flags, deps, emit, excluded) {
   const intent = flags.positionals.join(" ");
   if (intent.length === 0) {
     emitUsageError(emit, "run", "requires an intent, e.g. `fezoctl run \"scrape this page\" --args-json '{...}'`");
@@ -9882,7 +11042,13 @@ async function cmdRun(flags, deps, emit) {
   const gateway = await openGateway(deps, emit);
   if (!gateway.ok) return gateway.exitCode;
   const { creds } = gateway.session;
-  const selection = selectForRun(gateway.session.candidates, intent);
+  const excludedMatch = exactExcludedToolMatch(gateway.session.candidates, excluded, intent);
+  if (excludedMatch) {
+    emitFailure(emit, "backend-excluded", excludedBackendMessage(excludedMatch.backendId, excludedMatch.tool));
+    return EXIT_OPERATIONAL;
+  }
+  const candidates = filterExcluded(gateway.session.candidates, excluded);
+  const selection = selectForRun(candidates, intent);
   const runCandidates = candidatesToRun(selection, flags.allowUnhintedAutoPick);
   let report;
   if (runCandidates.length > 0) {
@@ -9912,10 +11078,101 @@ async function cmdRun(flags, deps, emit) {
   if (report === void 0) return EXIT_OPERATIONAL;
   return report.outcome.kind === "success" ? EXIT_OK : EXIT_OPERATIONAL;
 }
-async function cmdCatalog(flags, deps, emit) {
+function oneStepArgWord(argKind) {
+  return argKind === "query" ? "a query" : "a URL";
+}
+async function cmdOneStep(spec, flags, deps, emit, excluded) {
+  const value = flags.positionals.join(" ");
+  if (value.length === 0) {
+    emitUsageError(emit, spec.command, `requires ${oneStepArgWord(spec.argKind)}, e.g. \`fezoctl ${spec.command} "..."\``);
+    return EXIT_USAGE;
+  }
+  let extra = {};
+  if (flags.extraJson !== void 0) {
+    const parsed = parseJsonFlag(flags.extraJson, "--extra-json", spec.command, emit);
+    if (!parsed.ok) return EXIT_USAGE;
+    const asObject = asPlainObject(parsed.value);
+    if (asObject === void 0) {
+      emitUsageError(emit, spec.command, "--extra-json must be a JSON object");
+      return EXIT_USAGE;
+    }
+    extra = asObject;
+  }
+  let maxAttempts = MAX_PROVIDER_ATTEMPTS;
+  if (flags.maxAttempts !== void 0) {
+    const n = Number(flags.maxAttempts);
+    if (!Number.isInteger(n) || n < 1) {
+      emitUsageError(emit, spec.command, "--max-attempts must be an integer >= 1");
+      return EXIT_USAGE;
+    }
+    maxAttempts = n;
+  }
   const gateway = await openGateway(deps, emit);
   if (!gateway.ok) return gateway.exitCode;
-  emit.out(renderCatalog(gateway.session.candidates, flags.json));
+  const { creds } = gateway.session;
+  const result = await runOneStep(
+    spec,
+    value,
+    extra,
+    gateway.session.candidates,
+    excluded,
+    { baseUrl: creds.baseUrl, apiKey: creds.apiKey, ...deps.fetchFn !== void 0 ? { fetchFn: deps.fetchFn } : {} },
+    maxAttempts
+  );
+  emit.out(renderOneStep(result, flags.json));
+  if (result.served === void 0) return EXIT_OPERATIONAL;
+  return result.report.outcome.kind === "success" ? EXIT_OK : EXIT_OPERATIONAL;
+}
+async function cmdCatalog(flags, deps, emit, excluded) {
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
+  emit.out(renderCatalog(filterExcluded(gateway.session.candidates, excluded), flags.json));
+  return EXIT_OK;
+}
+async function cmdProviders(flags, deps, emit, excluded) {
+  let intent;
+  if (flags.intent !== void 0) {
+    intent = parseIntentFlag(flags.intent);
+    if (intent === void 0) {
+      emitUsageError(emit, "providers", `unknown --intent "${flags.intent}"; must be one of ${INTENTS.join(", ")}`);
+      return EXIT_USAGE;
+    }
+  }
+  const detail = parseDetailFlag(flags.detail ?? "names");
+  if (detail === void 0) {
+    emitUsageError(emit, "providers", '--detail must be "names", "descriptions", or "schema"');
+    return EXIT_USAGE;
+  }
+  let limit = DEFAULT_PROVIDERS_LIMIT;
+  if (flags.limit !== void 0) {
+    const n = Number(flags.limit);
+    if (!Number.isInteger(n) || n < 1) {
+      emitUsageError(emit, "providers", "--limit must be an integer >= 1");
+      return EXIT_USAGE;
+    }
+    limit = n;
+  }
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
+  const groups = groupByCapability(gateway.session.candidates, excluded);
+  const scoped = intent !== void 0 ? groups.filter((g) => g.capability === intent) : groups;
+  emit.out(
+    renderProviders(scoped, {
+      json: flags.json,
+      detail,
+      limit,
+      explain: flags.explain,
+      candidates: gateway.session.candidates,
+      ...intent !== void 0 ? { intent } : {}
+    })
+  );
+  return EXIT_OK;
+}
+async function cmdListProviders(flags, deps, emit, excluded) {
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
+  const rows = listProviders(gateway.session.candidates, excluded);
+  emit.out(renderListProviders(rows, flags.json));
   return EXIT_OK;
 }
 function verifyStoredField(outcome, expectedSource, resolved2, expectedValue) {
@@ -10015,20 +11272,36 @@ async function cmdDoctor(flags, deps, emit) {
   }
   if (candidates !== void 0) {
     const liveBackends = new Set(candidates.map((candidate) => candidate.backendId));
-    const hintedBackends = /* @__PURE__ */ new Set([
-      ...CAPABILITY_PREFERENCES.scrape,
-      ...CAPABILITY_PREFERENCES.serp,
-      ...CAPABILITY_PREFERENCES["web-search"]
-    ]);
-    const missing = [...hintedBackends].filter((backendId) => !liveBackends.has(backendId)).sort();
-    checks.push(
-      missing.length === 0 ? { name: "preference-hints", status: "ok", message: "every backend named in CAPABILITY_PREFERENCES is present in the live catalog" } : {
+    const liveTools = new Set(candidates.map((candidate) => candidate.tool));
+    const missingBackends = /* @__PURE__ */ new Set();
+    const missingEntryMethods = /* @__PURE__ */ new Set();
+    for (const intent of INTENTS) {
+      for (const rec of recommendationsFor(intent)) {
+        if (!liveBackends.has(rec.backendId)) missingBackends.add(rec.backendId);
+        for (const method of rec.entryMethods) {
+          if (!liveTools.has(method)) missingEntryMethods.add(method);
+        }
+      }
+    }
+    const missingBackendsList = [...missingBackends].sort();
+    const missingEntryMethodsList = [...missingEntryMethods].sort();
+    if (missingBackendsList.length === 0 && missingEntryMethodsList.length === 0) {
+      checks.push({
+        name: "preference-hints",
+        status: "ok",
+        message: "every backend and entry method declared in providers.ts (RECOMMENDATIONS) is present in the live catalog"
+      });
+    } else {
+      const clauses = [];
+      if (missingBackendsList.length > 0) clauses.push(`backend(s) absent from the live catalog: ${missingBackendsList.join(", ")}`);
+      if (missingEntryMethodsList.length > 0) clauses.push(`declared entry method(s) not published: ${missingEntryMethodsList.join(", ")}`);
+      checks.push({
         name: "preference-hints",
         status: "warn",
-        message: `preference hints name backend(s) absent from the live catalog: ${missing.join(", ")}`,
-        details: { missing }
-      }
-    );
+        message: `providers.ts declares ${clauses.join("; ")}`,
+        details: { missingBackends: missingBackendsList, missingEntryMethods: missingEntryMethodsList }
+      });
+    }
   } else {
     checks.push({ name: "preference-hints", status: "skipped", message: "skipped: catalog unavailable" });
   }
@@ -10072,17 +11345,26 @@ async function runCli(argv, deps = {}) {
   }
   const { flags } = parsed;
   const emit = { out: write, err: writeErr, json: flags.json };
+  const excluded = resolveExcludedBackends(deps.env ?? process.env);
+  const oneStepSpec = ONE_STEP_SPECS.find((spec) => spec.command === first);
+  if (oneStepSpec) {
+    return finish(await cmdOneStep(oneStepSpec, flags, deps, emit, excluded));
+  }
   switch (first) {
     case "search":
-      return finish(await cmdSearch(flags, deps, emit));
+      return finish(await cmdSearch(flags, deps, emit, excluded));
     case "schema":
-      return finish(await cmdSchema(flags, deps, emit));
+      return finish(await cmdSchema(flags, deps, emit, excluded));
     case "call":
-      return finish(await cmdCall(flags, deps, emit));
+      return finish(await cmdCall(flags, deps, emit, excluded));
     case "run":
-      return finish(await cmdRun(flags, deps, emit));
+      return finish(await cmdRun(flags, deps, emit, excluded));
     case "catalog":
-      return finish(await cmdCatalog(flags, deps, emit));
+      return finish(await cmdCatalog(flags, deps, emit, excluded));
+    case "providers":
+      return finish(await cmdProviders(flags, deps, emit, excluded));
+    case "list-providers":
+      return finish(await cmdListProviders(flags, deps, emit, excluded));
     case "setup":
       return finish(await cmdSetup(flags, deps, emit));
     case "doctor":

@@ -1,19 +1,49 @@
 // Capability inference and provider-preference policy.
 //
-// This module owns two small data tables and the pure function that reads
-// one of them:
+// This module owns:
 //   - CAPABILITY_KEYWORDS  — how a free-text `run` intent maps to a coarse
-//     "capability" (scrape / serp / web-search), used only to decide which
+//     "capability" (scrape / web-search), used only to decide which
 //     preference hint (if any) applies.
 //   - CAPABILITY_PREFERENCES — sparse, capability-scoped backend orderings
 //     used by rank.ts as a tie-breaker among candidates that already matched
 //     the query on their own merits.
 //
-// Neither table is method ownership and neither is measured fact: they are
-// recorded policy (human preference / cost / capability assumptions) that a
-// human should be able to find, read, and revise without touching search or
-// ranking logic. See the comment above CAPABILITY_PREFERENCES for the
-// explicit "this is policy, not telemetry" note the governing spec requires.
+// CAPABILITY_PREFERENCES is no longer its own hand-written table: it is a
+// *view* onto providers.ts's `RECOMMENDATIONS`, the one declared,
+// per-intent provider policy in this repo. Each legacy capability names one
+// `RECOMMENDATIONS` intent (`scrape` -> `scrape`, `web-search` -> `search`),
+// and the exported ordering is that intent's declared backend order with
+// `notRecommended` entries dropped (a provider assessed and advised against
+// must not win a tie-break). If provider policy ever needs to change, edit
+// providers.ts — this module only reshapes that table into the legacy
+// buckets `rank.ts` already knows how to read, so there is exactly one place
+// a human edits provider policy.
+//
+// `serp` USED TO BE A THIRD CAPABILITY and is now folded into `web-search`.
+// It was dropped, not renamed, because the declared table has no SERP list to
+// derive an ordering from: in providers.ts's taxonomy a Google-SERP request
+// and a general web-search request are both `search`, served by the same
+// declared roster (`you` -> `exa` -> `brave` -> ...), which deliberately
+// prefers real search APIs over scraping a results page. Keeping `serp` as a
+// separate capability that aliased onto `search` bought nothing and cost
+// something real: two capabilities with one ordering between them made
+// "google search for X on the web" ambiguous — a refusal over a distinction
+// this repo's provider policy does not draw. Its keyword phrases are
+// preserved below, under `web-search`, so the same wording still infers a
+// capability; only the bucket changed.
+//
+// This does NOT mean a SERP-specialist query now gets the search roster
+// imposed on it. Those backends are absent from the declared `search` list,
+// so the hint discriminates nothing among them and `selectForRun` (rank.ts)
+// treats it as no hint at all — see `CAPABILITY_PREFERENCES`' doc below.
+//
+// CAPABILITY_KEYWORDS and `inferCapability` are unchanged from before this
+// port: capability inference must not reuse rank.ts's tokenizer (see
+// `inferCapability`'s doc comment below for why), and that reasoning has
+// nothing to do with where the preference *orderings* come from.
+
+import type { Intent } from './intent.js';
+import { recommendationsFor } from './providers.js';
 
 /**
  * Keyword phrases that identify a capability in a free-text `run` intent.
@@ -34,11 +64,23 @@ export const CAPABILITY_KEYWORDS = {
     'unlock url',
     'webpage',
   ],
-  serp: ['serp', 'google search', 'google results', 'search engine results'],
-  'web-search': ['web search', 'search web', 'internet search', 'find sources', 'research web'],
+  // The first four phrases were the former `serp` capability's; they are kept
+  // verbatim so wording that used to infer `serp` still infers a capability.
+  // See this module's header for why the bucket was merged rather than kept.
+  'web-search': [
+    'serp',
+    'google search',
+    'google results',
+    'search engine results',
+    'web search',
+    'search web',
+    'internet search',
+    'find sources',
+    'research web',
+  ],
 } as const;
 
-/** The three capabilities `run` currently has preference policy for. */
+/** The capabilities `run` currently has preference policy for. */
 export type Capability = keyof typeof CAPABILITY_KEYWORDS;
 
 /**
@@ -55,7 +97,30 @@ export type Capability = keyof typeof CAPABILITY_KEYWORDS;
  * that by asserting every capability in `CAPABILITY_KEYWORDS` is reachable
  * through `inferCapability`.
  */
-const CAPABILITY_LIST: readonly Capability[] = ['scrape', 'serp', 'web-search'];
+const CAPABILITY_LIST: readonly Capability[] = ['scrape', 'web-search'];
+
+/**
+ * Which `RECOMMENDATIONS` intent each legacy capability derives its order
+ * from. One capability, one intent — the aliasing that made two capabilities
+ * share `search` is gone (see this module's header on the folded `serp`).
+ */
+const CAPABILITY_INTENTS: Record<Capability, Intent> = {
+  scrape: 'scrape',
+  'web-search': 'search',
+};
+
+/**
+ * Reshapes one `RECOMMENDATIONS` intent list into a bare backend-id order:
+ * `notRecommended` entries are dropped rather than merely left low, because a
+ * provider assessed and advised against must never win a preference
+ * tie-break by default (a caller who actually wants it can still name the
+ * tool directly — `run`'s existing exact-tool-name override is untouched).
+ */
+function declaredOrder(intent: Intent): readonly string[] {
+  return recommendationsFor(intent)
+    .filter((rec) => rec.notRecommended === undefined)
+    .map((rec) => rec.backendId);
+}
 
 /**
  * Per-capability backend preference order, used by rank.ts as tie-break tier
@@ -64,18 +129,37 @@ const CAPABILITY_LIST: readonly Capability[] = ['scrape', 'serp', 'web-search'];
  * make an irrelevant candidate win, and it is never a full roster: a backend
  * absent from a capability's list simply gets no preference boost for it.
  *
- * IMPORTANT: these orderings are recorded human preference/cost/capability
- * assumptions (e.g. "prefer firecrawl for scraping before falling back to
- * harder-target specialists"), not measured facts (latency, success rate,
- * price at call time). Treat edits to this table as a policy change that
- * needs review, not as syncing telemetry. Initial hints, verbatim from the
- * governing specification.
+ * Because it is sparse, a capability can be inferred for a query whose
+ * candidates this table names none of — `web-search` derives from the
+ * declared `search` roster, which lists no SERP specialist, so a SERP-worded
+ * query that matches only SERP specialists gets a hint that orders nothing.
+ * `selectForRun` (rank.ts) therefore treats such a hint as no hint at all
+ * rather than letting catalog order decide a billed call; see the comment on
+ * its `matched` branch.
+ *
+ * IMPORTANT: the orderings behind this view are recorded human
+ * preference/cost/capability assumptions (see providers.ts's module doc),
+ * not measured facts (latency, success rate, price at call time). Treat an
+ * edit to the underlying `RECOMMENDATIONS` table as a policy change that
+ * needs review, not as syncing telemetry — and edit it there, not here: this
+ * object is derived, not authored.
  */
-export const CAPABILITY_PREFERENCES = {
-  scrape: ['firecrawl', 'scrapingbee', 'scrapingdog', 'geonode', 'scraperapi', 'brightdata'],
-  serp: ['scraperapi', 'scrapingbee', 'scrapingdog', 'brightdata'],
-  'web-search': ['exa', 'brave', 'firecrawl', 'geonode', 'you'],
-} as const satisfies Record<Capability, readonly string[]>;
+export const CAPABILITY_PREFERENCES: Record<Capability, readonly string[]> = {
+  scrape: declaredOrder(CAPABILITY_INTENTS.scrape),
+  'web-search': declaredOrder(CAPABILITY_INTENTS['web-search']),
+};
+
+// Frozen for the same reason providers.ts freezes `RECOMMENDATIONS` and
+// intent.ts freezes `METHOD_INTENTS`: determinism here is a property of the
+// data, not of what callers happen to do with it. These arrays are built fresh
+// by `declaredOrder`, so — unlike the declared table they derive from — a
+// consumer that `.sort()`s or `.push()`es one would corrupt only this view,
+// silently reordering `run`'s tie-break process-wide while the source of truth
+// still read correctly. `readonly string[]` already blocks the obvious
+// mutation at compile time; this makes it fail loudly for a caller that gets
+// past the type (an `any`, a JSON round-trip, a JS consumer of the bundle).
+for (const list of Object.values(CAPABILITY_PREFERENCES)) Object.freeze(list);
+Object.freeze(CAPABILITY_PREFERENCES);
 
 /** One capability whose keyword phrases matched the intent, and which phrases matched. */
 export interface CapabilityMatch {
@@ -136,9 +220,9 @@ export function inferCapability(intent: string): CapabilityInferenceResult {
   }
 
   // Multiple capabilities matched. Prefer a capability whose match includes a
-  // multi-word "exact phrase" (e.g. "google search") over one that only hit a
-  // bare single-token keyword (e.g. "serp"): a whole phrase is a much
-  // stronger, less coincidental capability signal.
+  // multi-word "exact phrase" (e.g. "web search") over one that only hit a
+  // bare single-token keyword (e.g. "scrape", "serp"): a whole phrase is a
+  // much stronger, less coincidental capability signal.
   const phraseWinners = allMatches.filter((match) => match.matchedPhrases.some((phrase) => phrase.includes(' ')));
   if (phraseWinners.length === 1) {
     const winner = phraseWinners[0];

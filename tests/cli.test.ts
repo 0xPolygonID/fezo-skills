@@ -11,6 +11,7 @@ import { newSchemaCompiler } from '../src/engine/ajv-instance.js';
 import type { KeychainCommandResult, KeychainRunner } from '../src/engine/credentials.js';
 import type { RunSelection } from '../src/engine/rank.js';
 import type { ToolCandidate } from '../src/engine/catalog.js';
+import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS } from '../src/engine/steering.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures and helpers.
@@ -99,6 +100,7 @@ function candidate(overrides: Partial<ToolCandidate> & Pick<ToolCandidate, 'tool
     inputSchema: {},
     userSettings: [],
     backendInfoText: '',
+    backendCategories: [],
     billingModel: 'per_call',
     ...overrides,
   };
@@ -135,6 +137,60 @@ const SCRAPE_CATALOG: WireBackend[] = [
       },
     ],
   },
+];
+
+// A default-deny-listed backend (providers.ts's DEFAULT_EXCLUDED_BACKENDS),
+// with one live, callable method -- so tests can prove `search`/`catalog`
+// filter it out, and `call`/`run` refuse it BY NAME rather than falling
+// through to a generic tool-not-found/no-match.
+const FALAI_BACKEND: WireBackend = {
+  backend_id: 'falai',
+  billing: { model: 'per_call' },
+  methods: [
+    {
+      name: 'generate',
+      path: '/generate',
+      description: 'Generate an image from a text prompt.',
+      input_schema: {},
+      http: { method: 'POST', query: ['prompt'] },
+    },
+  ],
+};
+
+// Two declared `search` providers (`RECOMMENDATIONS.search`'s rank 1 and 2),
+// used by the `providers`/`list-providers` tests below. `you` publishes only
+// `contents` -- not its declared entry method `you_search` -- so the same
+// fixture also covers the "--detail names never returns a row with nothing
+// callable on it" fallback.
+const SEARCH_PROVIDERS_CATALOG: WireBackend[] = [
+  {
+    backend_id: 'you',
+    billing: { model: 'dynamic' },
+    methods: [
+      { name: 'contents', path: '/contents', description: 'Fetch the contents of a URL.', input_schema: {} },
+      { name: 'research', path: '/research', description: 'Deep research over the web.', input_schema: {} },
+      { name: 'research_start', path: '/research_start', description: 'Start a deep research job.', input_schema: {} },
+      { name: 'finance_research', path: '/finance_research', description: 'Financial research.', input_schema: {} },
+    ],
+  },
+  {
+    backend_id: 'exa',
+    billing: { model: 'per_call' },
+    methods: [
+      { name: 'search', path: '/search', description: 'Neural/semantic search over the web.', input_schema: {} },
+    ],
+  },
+];
+
+// Every declared `search` provider (`RECOMMENDATIONS.search`, all five ranks),
+// each publishing just its own declared entry method -- for `--limit`/
+// `omitted` truncation, which needs more live rows than the default limit.
+const ALL_SEARCH_PROVIDERS_CATALOG: WireBackend[] = [
+  { backend_id: 'you', billing: { model: 'dynamic' }, methods: [{ name: 'search', path: '/search', description: 'Search the web.', input_schema: {} }] },
+  { backend_id: 'exa', billing: { model: 'per_call' }, methods: [{ name: 'search', path: '/search', description: 'Neural search.', input_schema: {} }] },
+  { backend_id: 'brave', billing: { model: 'per_call' }, methods: [{ name: 'search', path: '/search', description: 'Independent-index search.', input_schema: {} }] },
+  { backend_id: 'firecrawl', billing: { model: 'per_call' }, methods: [{ name: 'search', path: '/search', description: 'LLM-ready markdown search.', input_schema: {} }] },
+  { backend_id: 'geonode', billing: { model: 'per_call' }, methods: [{ name: 'search', path: '/search', description: 'Proxy-backed search.', input_schema: {} }] },
 ];
 
 // ---------------------------------------------------------------------------
@@ -464,6 +520,27 @@ describe('search', () => {
     const parsed = JSON.parse(result.stdout) as { results: Record<string, unknown>[] };
     expect(parsed.results.every((r) => !Object.hasOwn(r, 'schema'))).toBe(true);
   });
+
+  it('excludes a deny-listed backend from results, even when it matches the query', async () => {
+    const catalog = [...SCRAPE_CATALOG, FALAI_BACKEND];
+    // A query worded to match falai_generate on its own description alone, so
+    // whether it appears is entirely down to the deny-list, not term overlap
+    // with the other fixtures.
+    const query = 'generate an image from a text prompt';
+
+    const excluded = await runCli(['search', query, '--json'], baseDeps({ fetchFn: multiRouteFetch(catalog) }));
+    const excludedParsed = JSON.parse(excluded.stdout) as { results: { tool: string }[] };
+    expect(excludedParsed.results.some((r) => r.tool === 'falai_generate')).toBe(false);
+
+    // Same query, same catalog, only the env's deny-list differs: proves the
+    // absence above is the deny-list's doing, not a term-matching accident.
+    const included = await runCli(
+      ['search', query, '--json'],
+      baseDeps({ fetchFn: multiRouteFetch(catalog), env: { FEZO_URL: 'https://gw.example.com', FEZO_API_KEY: SECRET, FEZO_EXCLUDED_BACKENDS: '' } }),
+    );
+    const includedParsed = JSON.parse(included.stdout) as { results: { tool: string }[] };
+    expect(includedParsed.results.some((r) => r.tool === 'falai_generate')).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -680,6 +757,53 @@ describe('call', () => {
     expect(parsed.attempts[0]?.gatewayCode).toBe('tool_not_in_catalog');
     expect(parsed.outcome.kind).toBe('give_up');
   });
+
+  // Deny-list enforcement: `call` refuses an excluded backend BY NAME, even
+  // though the tool genuinely exists in the live catalog -- see cli.ts's
+  // "Deny-list helpers" comment. `falai` is one of providers.ts's
+  // DEFAULT_EXCLUDED_BACKENDS, so no env override is needed here.
+  it('refuses a deny-listed backend by its exact tool name -- exit 2, backend-excluded, no call made', async () => {
+    const catalog = [...SCRAPE_CATALOG, FALAI_BACKEND];
+    const fetchFn = multiRouteFetch(catalog);
+    const result = await runCli(
+      ['call', 'falai_generate', '--args-json', '{"prompt":"a cat"}', '--json'],
+      baseDeps({ fetchFn }),
+    );
+    expect(result.exitCode).toBe(2);
+    const parsed = JSON.parse(result.stdout) as { error: { kind: string; message: string } };
+    expect(parsed.error.kind).toBe('backend-excluded');
+    expect(parsed.error.message).toContain('falai');
+    expect(result.stderr).toContain('excluded');
+    // Only the catalog GET happened -- the excluded backend was never billed.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  // `schema` refuses too, rather than merely filtering. It bills nothing, so
+  // this is not a spend guard -- it is so an agent is never handed a full
+  // input schema and binding map for a backend `call` will then refuse,
+  // which costs two commands to learn one fact. The message names the action
+  // actually attempted ("inspected", not "called").
+  it('schema refuses a deny-listed backend by name, with the same kind call uses', async () => {
+    const catalog = [...SCRAPE_CATALOG, FALAI_BACKEND];
+    const fetchFn = multiRouteFetch(catalog);
+    const result = await runCli(['schema', 'falai_generate', '--json'], baseDeps({ fetchFn }));
+
+    expect(result.exitCode).toBe(2);
+    const parsed = JSON.parse(result.stdout) as { error: { kind: string; message: string } };
+    expect(parsed.error.kind).toBe('backend-excluded');
+    expect(parsed.error.message).toContain('cannot be inspected');
+    // Distinct from tool-not-found: the tool really is in the catalog.
+    expect(parsed.error.message).toContain('falai');
+  });
+
+  it('schema still serves a non-excluded backend from the same catalog', async () => {
+    const catalog = [...SCRAPE_CATALOG, FALAI_BACKEND];
+    const result = await runCli(['schema', 'firecrawl_scrape', '--json'], baseDeps({ fetchFn: multiRouteFetch(catalog) }));
+
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { tool: string };
+    expect(parsed.tool).toBe('firecrawl_scrape');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -775,6 +899,40 @@ describe('run', () => {
     expect(parsed.asyncExcluded[0]?.tool).toBe('brightdata_check_progress');
     // Only the catalog GET happened -- the async lifecycle method was never called.
     expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  // Deny-list enforcement, `run`'s half: "even when the caller names the tool
+  // exactly" (cli.ts's `exactExcludedToolMatch`) -- checked against the FULL
+  // catalog before `--allow-unhinted-auto-pick` or any hinted/unhinted
+  // selection rule gets a say.
+  it('refuses a deny-listed backend named exactly, exit 2, backend-excluded -- --allow-unhinted-auto-pick does not override it', async () => {
+    const catalog = [...SCRAPE_CATALOG, FALAI_BACKEND];
+    const fetchFn = multiRouteFetch(catalog);
+    const result = await runCli(
+      ['run', 'falai_generate', '--args-json', '{"prompt":"a cat"}', '--allow-unhinted-auto-pick', '--json'],
+      baseDeps({ fetchFn }),
+    );
+    expect(result.exitCode).toBe(2);
+    const parsed = JSON.parse(result.stdout) as { error: { kind: string; message: string } };
+    expect(parsed.error.kind).toBe('backend-excluded');
+    expect(parsed.error.message).toContain('falai');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a deny-listed backend never enters the ranked/hinted selection either -- it is filtered before selectForRun', async () => {
+    // `falai_generate` classifies as `other` (no keyword/category match), so
+    // it never competes with scrapingbee/firecrawl for "scrape this page"
+    // even when it is not excluded -- the point of this test is that adding
+    // it to the catalog changes nothing about which backend `run` picks.
+    const catalog = [...SCRAPE_CATALOG, FALAI_BACKEND];
+    const fetchFn = multiRouteFetch(catalog, { firecrawl: [okResponse('{"markdown":"hi"}')] });
+    const result = await runCli(
+      ['run', 'scrape this page', '--args-json', '{"url":"https://x.example"}', '--json'],
+      baseDeps({ fetchFn }),
+    );
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { chosen: { backendId: string } };
+    expect(parsed.chosen.backendId).toBe('firecrawl');
   });
 });
 
@@ -965,6 +1123,353 @@ describe('give-up wording is shared with retry.ts, not re-invented', () => {
 });
 
 // ---------------------------------------------------------------------------
+// web-search / scrape / crawl (one-step.ts's ranked walk, wired through
+// cli.ts). Built against the REAL declared `search`/`scrape`/`crawl` rosters
+// (providers.ts), same convention as the `providers`/`list-providers` tests
+// below: a synthetic roster would not exercise the policy this port carries.
+// ---------------------------------------------------------------------------
+
+describe('web-search / scrape / crawl (one-step commands)', () => {
+  const SEARCH_YOU_EXA: WireBackend[] = [
+    {
+      backend_id: 'you',
+      billing: { model: 'dynamic' },
+      methods: [
+        {
+          name: 'search',
+          path: '/search',
+          description: 'Search the web.',
+          input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+        },
+      ],
+    },
+    {
+      backend_id: 'exa',
+      billing: { model: 'per_call' },
+      methods: [
+        {
+          name: 'search',
+          path: '/search',
+          description: 'Neural search.',
+          input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+        },
+      ],
+    },
+  ];
+
+  it('requires a query/URL positional argument, exit 1, before any network call', async () => {
+    const webSearchFetch = vi.fn();
+    const webSearchResult = await runCli(['web-search'], baseDeps({ fetchFn: webSearchFetch as unknown as typeof fetch }));
+    expect(webSearchResult.exitCode).toBe(1);
+    expect(webSearchResult.stderr).toContain('requires a query');
+    expect(webSearchFetch).not.toHaveBeenCalled();
+
+    const scrapeFetch = vi.fn();
+    const scrapeResult = await runCli(['scrape'], baseDeps({ fetchFn: scrapeFetch as unknown as typeof fetch }));
+    expect(scrapeResult.exitCode).toBe(1);
+    expect(scrapeResult.stderr).toContain('requires a URL');
+    expect(scrapeFetch).not.toHaveBeenCalled();
+  });
+
+  it('an unparseable --extra-json exits 1 before any network call, exactly like --args-json', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(
+      ['web-search', 'weather today', '--extra-json', '{not valid json'],
+      baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }),
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('--extra-json');
+    expect(result.stderr).toContain('not valid JSON');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('a non-object --extra-json (e.g. an array) exits 1 before any network call', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(['web-search', 'weather today', '--extra-json', '[1,2,3]'], baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }));
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('--extra-json must be a JSON object');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('a non-integer/--max-attempts < 1 exits 1 before any network call', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(['scrape', 'https://x.example', '--max-attempts', '0'], baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }));
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('--max-attempts');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the next-ranked provider on a retryable failure, and reports who served it, its rank, and billing as fields under --json', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_YOU_EXA, {
+      you: [gatewayErrorResponse(503, 'backend_unavailable')],
+      exa: [okResponse('{"results":[]}')],
+    });
+
+    const result = await runCli(['web-search', 'weather today', '--json'], baseDeps({ fetchFn }));
+
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as {
+      command: string;
+      intent: string;
+      served: { backend_id: string; provider: string; rank: number; success: boolean };
+      arg_rejected: string[];
+      skipped: string[];
+      attempts: { backendId: string; status: string; billed: boolean }[];
+      billed_any_attempt: boolean;
+    };
+    expect(parsed.command).toBe('web-search');
+    expect(parsed.intent).toBe('search');
+    expect(parsed.served).toEqual({ backend_id: 'exa', provider: 'Exa', rank: 2, success: true });
+    expect(parsed.arg_rejected).toEqual([]);
+    expect(parsed.attempts).toHaveLength(2);
+    expect(parsed.attempts[0]).toMatchObject({ backendId: 'you', status: 'retry', billed: false });
+    expect(parsed.attempts[1]).toMatchObject({ backendId: 'exa', status: 'success', billed: true });
+    expect(parsed.billed_any_attempt).toBe(true);
+  });
+
+  it('the human-readable view names the serving provider and its rank via steering.ts\'s footer', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_YOU_EXA, { you: [okResponse('{"results":[]}')] });
+    const result = await runCli(['web-search', 'weather today'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Served by You.com (rank 1 of search)');
+  });
+
+  it('--extra-json merges into the resolved candidate\'s own arguments; a provider whose schema rejects the merged args is skipped and reported in arg_rejected even on success', async () => {
+    const catalog: WireBackend[] = [
+      {
+        backend_id: 'you',
+        billing: { model: 'dynamic' },
+        methods: [
+          {
+            name: 'search',
+            path: '/search',
+            description: 'Search the web.',
+            input_schema: {
+              type: 'object',
+              properties: { query: { type: 'string' }, safe_search: { type: 'boolean' } },
+              required: ['query', 'safe_search'],
+            },
+          },
+        ],
+      },
+      {
+        backend_id: 'exa',
+        billing: { model: 'per_call' },
+        methods: [
+          {
+            name: 'search',
+            path: '/search',
+            description: 'Neural search.',
+            input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+          },
+        ],
+      },
+    ];
+
+    // Without --extra-json, "you" locally rejects the args (missing
+    // safe_search) and the walk falls to "exa" -- reported in arg_rejected
+    // even though the overall run still succeeds.
+    const withoutExtra = multiRouteFetch(catalog, { exa: [okResponse('{"ok":true}')] });
+    const resultWithout = await runCli(['web-search', 'weather today', '--json'], baseDeps({ fetchFn: withoutExtra }));
+    expect(resultWithout.exitCode).toBe(0);
+    const parsedWithout = JSON.parse(resultWithout.stdout) as { served: { backend_id: string }; arg_rejected: string[] };
+    expect(parsedWithout.served.backend_id).toBe('exa');
+    expect(parsedWithout.arg_rejected).toEqual(['You.com']);
+
+    // With --extra-json supplying safe_search, "you" (rank 1) is called directly.
+    const withExtra = multiRouteFetch(catalog, { you: [okResponse('{"ok":true}')] });
+    const resultWith = await runCli(
+      ['web-search', 'weather today', '--extra-json', '{"safe_search":true}', '--json'],
+      baseDeps({ fetchFn: withExtra }),
+    );
+    expect(resultWith.exitCode).toBe(0);
+    const parsedWith = JSON.parse(resultWith.stdout) as { served: { backend_id: string }; arg_rejected: string[] };
+    expect(parsedWith.served.backend_id).toBe('you');
+    expect(parsedWith.arg_rejected).toEqual([]);
+  });
+
+  // The other local rejection, end to end and IN THE HUMAN VIEW. Asserting the
+  // engine field alone is what let this regress once already: a provider that
+  // dropped out because its own manifest needs an argument the command cannot
+  // supply was reported in `--json` but invisible without it, since the list it
+  // had been folded into is printed only when nothing serves the call. On a
+  // SUCCESSFUL run -- the case that matters, because the caller otherwise sees
+  // only who did serve them -- both views must name it.
+  it('a provider whose manifest needs an unsuppliable argument is named in both views, on a successful run', async () => {
+    const catalog: WireBackend[] = [
+      {
+        backend_id: 'you',
+        billing: { model: 'dynamic' },
+        methods: [
+          {
+            // Passes its own input_schema, then fails in bindArgs: nothing
+            // supplies the `{id}` path parameter.
+            name: 'search',
+            path: '/search/{id}',
+            description: 'Search the web.',
+            http: { method: 'POST', path_params: ['id'] },
+            input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+          },
+        ],
+      },
+      {
+        backend_id: 'exa',
+        billing: { model: 'per_call' },
+        methods: [
+          {
+            name: 'search',
+            path: '/search',
+            description: 'Neural search.',
+            input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+          },
+        ],
+      },
+    ];
+
+    const asJson = await runCli(
+      ['web-search', 'weather today', '--json'],
+      baseDeps({ fetchFn: multiRouteFetch(catalog, { exa: [okResponse('{"ok":true}')] }) }),
+    );
+    expect(asJson.exitCode).toBe(0);
+    const parsed = JSON.parse(asJson.stdout) as {
+      served: { backend_id: string };
+      arg_rejected: string[];
+      manifest_rejected: string[];
+    };
+    expect(parsed.served.backend_id).toBe('exa');
+    expect(parsed.manifest_rejected).toEqual(['You.com']);
+    // Never blamed on the caller, who passed no --extra-json at all.
+    expect(parsed.arg_rejected).toEqual([]);
+
+    const asText = await runCli(
+      ['web-search', 'weather today'],
+      baseDeps({ fetchFn: multiRouteFetch(catalog, { exa: [okResponse('{"ok":true}')] }) }),
+    );
+    expect(asText.exitCode).toBe(0);
+    expect(asText.stdout).toContain('Skipped You.com');
+    expect(asText.stdout).toContain("manifest requires an argument");
+    // The wording must not send the caller to an argument they never passed.
+    expect(asText.stdout).not.toContain('the --extra-json arguments did not match');
+  });
+
+  it('no provider could serve it: `served` is absent, skipped providers are named, exit 2', async () => {
+    const fetchFn = multiRouteFetch([]);
+    const result = await runCli(['scrape', 'https://x.example', '--json'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(2);
+    const parsed = JSON.parse(result.stdout) as { served?: unknown; skipped: string[] };
+    expect(parsed.served).toBeUndefined();
+    expect(parsed.skipped.length).toBeGreaterThan(0);
+    expect(parsed.skipped).toContain('scrapingdog (not in catalog)');
+  });
+
+  it('a deny-listed provider is never attempted, even ranked first, and FEZO_EXCLUDED_BACKENDS controls it', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_YOU_EXA, { exa: [okResponse('{"results":[]}')] });
+    const result = await runCli(
+      ['web-search', 'weather today', '--json'],
+      baseDeps({ fetchFn, env: { FEZO_URL: 'https://gw.example.com', FEZO_API_KEY: SECRET, FEZO_EXCLUDED_BACKENDS: 'you' } }),
+    );
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { served: { backend_id: string }; attempts: { backendId: string }[] };
+    expect(parsed.served.backend_id).toBe('exa');
+    expect(parsed.attempts.map((a) => a.backendId)).toEqual(['exa']);
+  });
+
+  it('--max-attempts defaults to 3 (MAX_PROVIDER_ATTEMPTS), not run\'s default of 2, and stopped_by/the cap note are reported when it is what stops the walk', async () => {
+    const catalog = ALL_SEARCH_PROVIDERS_CATALOG.map((backend) => ({
+      ...backend,
+      methods: backend.methods.map((m) => ({
+        ...m,
+        input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+      })),
+    }));
+    const fetchFn = multiRouteFetch(catalog, {
+      you: [gatewayErrorResponse(500, 'backend_error')],
+      exa: [gatewayErrorResponse(500, 'backend_error')],
+      brave: [gatewayErrorResponse(500, 'backend_error')],
+      // firecrawl/geonode deliberately have NO queued response: reaching
+      // either would throw inside `multiRouteFetch`, catching a cap that let
+      // the walk run one attempt too many.
+    });
+
+    const result = await runCli(['web-search', 'weather today', '--json'], baseDeps({ fetchFn }));
+
+    expect(result.exitCode).toBe(2);
+    const parsed = JSON.parse(result.stdout) as {
+      served: { backend_id: string; provider: string; rank: number; success: boolean };
+      stopped_by?: string;
+      attempts: unknown[];
+      max_attempts: number;
+    };
+    expect(parsed.max_attempts).toBe(3);
+    expect(parsed.attempts).toHaveLength(3);
+    expect(parsed.served).toEqual({ backend_id: 'brave', provider: 'Brave Search', rank: 3, success: false });
+    expect(parsed.stopped_by).toBe('max-attempts');
+    expect(result.stdout).not.toContain('Stopped on the time budget');
+
+    const textResult = await runCli(['web-search', 'weather today'], baseDeps({ fetchFn: multiRouteFetch(catalog, {
+      you: [gatewayErrorResponse(500, 'backend_error')],
+      exa: [gatewayErrorResponse(500, 'backend_error')],
+      brave: [gatewayErrorResponse(500, 'backend_error')],
+    }) }));
+    expect(textResult.stdout).toContain('Stopped after 3 provider(s)');
+  });
+
+  it('crawl walks the declared `crawl` roster with a url-kind argument', async () => {
+    const catalog: WireBackend[] = [
+      {
+        backend_id: 'firecrawl',
+        billing: { model: 'per_call' },
+        methods: [
+          {
+            name: 'crawl',
+            path: '/crawl',
+            description: 'Crawl a site.',
+            input_schema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
+          },
+        ],
+      },
+    ];
+    const fetchFn = multiRouteFetch(catalog, { firecrawl: [okResponse('{"job_id":"1"}')] });
+    const result = await runCli(['crawl', 'https://x.example', '--json'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { command: string; intent: string; served: { backend_id: string } };
+    expect(parsed.command).toBe('crawl');
+    expect(parsed.intent).toBe('crawl');
+    expect(parsed.served.backend_id).toBe('firecrawl');
+  });
+
+  it('HELP_TEXT documents the three one-step commands and --extra-json', async () => {
+    const result = await runCli(['--help'], {});
+    expect(result.stdout).toContain('web-search');
+    expect(result.stdout).toContain('fezoctl scrape');
+    expect(result.stdout).toContain('fezoctl crawl');
+    expect(result.stdout).toContain('--extra-json');
+  });
+
+  // The one-step descriptions are shared data (steering.ts, also rendered into
+  // SKILL.md), so HELP_TEXT cannot hand-wrap them and must not paste them raw
+  // either: they were once interpolated straight into the middle of the
+  // --max-attempts sentence, which printed three ~150-column lines inside a
+  // 78-column block and split that sentence in half. Both halves are asserted
+  // here — the wording survives, and the block stays hard-wrapped.
+  it('HELP_TEXT renders each one-step description as its own wrapped, labelled block', async () => {
+    const result = await runCli(['--help'], {});
+    const flat = result.stdout.replace(/\s+/g, ' ');
+    for (const command of ONE_STEP_COMMANDS) {
+      expect(flat, `--help does not carry the ${command} description`).toContain(ONE_STEP_DESCRIPTIONS[command]);
+    }
+    // The interrupted sentence, whole again.
+    expect(flat).toContain("NOT run's default of 2: run's budget is a RETRY budget");
+    // Everything after the usage block is hard-wrapped prose. The usage block
+    // itself is exempt: those lines are command signatures whose shape is the
+    // information, and wrapping one would misrepresent the grammar.
+    const prose = result.stdout.slice(result.stdout.indexOf('  fezoctl --help\n'));
+    const overlong = prose.split('\n').filter((line) => line.length > 78);
+    expect(overlong, `HELP_TEXT lines wider than 78 columns: ${overlong.join(' | ')}`).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // candidatesToRun — the one adapter every `run` call site must funnel
 // through (carry-forward #2). Tested directly, not just through the CLI, so
 // a regression here is caught even if a future command stops matching the
@@ -984,7 +1489,7 @@ describe('candidatesToRun', () => {
 
     const ambiguous: RunSelection = {
       outcome: 'refused-ambiguous-capability',
-      reason: { kind: 'ambiguous-capability', capabilities: ['scrape', 'serp'] },
+      reason: { kind: 'ambiguous-capability', capabilities: ['scrape', 'web-search'] },
       alternatives: [{ candidate: a, explanation: { tier: 'term-score', matchedTerms: [], termScore: 0, billingModel: 'per_call' } }],
     };
     // Even with the override flag true, ambiguous-capability is NOT overridable.
@@ -1025,6 +1530,316 @@ describe('catalog', () => {
     expect(parsed.totalMethods).toBe(2);
     expect(parsed.backends.map((b) => b.backendId).sort()).toEqual(['firecrawl', 'scrapingbee']);
   });
+
+  it('excludes a default-deny-listed backend, and honours FEZO_EXCLUDED_BACKENDS="" to include it again', async () => {
+    const catalog = [...SCRAPE_CATALOG, FALAI_BACKEND];
+
+    const withDefault = await runCli(['catalog', '--json'], baseDeps({ fetchFn: multiRouteFetch(catalog) }));
+    const withDefaultParsed = JSON.parse(withDefault.stdout) as { backends: { backendId: string }[] };
+    expect(withDefaultParsed.backends.map((b) => b.backendId).sort()).toEqual(['firecrawl', 'scrapingbee']);
+
+    const withOverride = await runCli(
+      ['catalog', '--json'],
+      baseDeps({ fetchFn: multiRouteFetch(catalog), env: { FEZO_URL: 'https://gw.example.com', FEZO_API_KEY: SECRET, FEZO_EXCLUDED_BACKENDS: '' } }),
+    );
+    const withOverrideParsed = JSON.parse(withOverride.stdout) as { backends: { backendId: string }[] };
+    expect(withOverrideParsed.backends.map((b) => b.backendId).sort()).toEqual(['falai', 'firecrawl', 'scrapingbee']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// providers
+// ---------------------------------------------------------------------------
+
+interface ProvidersJson {
+  recommendations: { doc: string; preparedAt: string };
+  note?: string;
+  groups?: { capability: string; best_value?: string; omitted: number; providers: Record<string, unknown>[] }[];
+  capability?: string;
+  best_value?: string;
+  omitted?: number;
+  providers?: Record<string, unknown>[];
+}
+
+describe('providers', () => {
+  it('with no --intent, returns every capability group in INTENTS order, with the NOT_SUBSTITUTES_NOTE', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['providers', '--json'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as ProvidersJson;
+    expect(parsed.groups?.map((g) => g.capability)).toEqual(['search', 'scrape', 'crawl', 'news', 'social', 'proxy', 'other']);
+    expect(parsed.note).toBeDefined();
+    expect(parsed.recommendations.doc).toBe('docs/providers-score.md');
+  });
+
+  it('with --intent, returns exactly that one group, no groups wrapper and no note', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['providers', '--intent', 'search', '--json'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as ProvidersJson;
+    expect(parsed.capability).toBe('search');
+    expect(parsed.groups).toBeUndefined();
+    expect(parsed.note).toBeUndefined();
+    // Declared order: you (rank 1) is present and is not on the deny-list, so
+    // it is the group's bestValue -- see provider-view.ts's groupByCapability.
+    expect(parsed.best_value).toBe('you');
+    expect(parsed.providers?.map((p) => p['backend_id'])).toEqual(['you', 'exa']);
+  });
+
+  it('unknown --intent is a usage error, exit 1, before any network call', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(
+      ['providers', '--intent', 'bogus-intent', '--json'],
+      baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }),
+    );
+    expect(result.exitCode).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { kind: string } };
+    expect(parsed.error.kind).toBe('usage');
+    expect(result.stderr).toContain('--intent');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('unknown --detail is a usage error, exit 1, before any network call', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(
+      ['providers', '--detail', 'verbose', '--json'],
+      baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }),
+    );
+    expect(result.exitCode).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { kind: string } };
+    expect(parsed.error.kind).toBe('usage');
+    expect(result.stderr).toContain('--detail');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('a non-numeric or <1 --limit is a usage error, exit 1, before any network call', async () => {
+    const fetchFn = vi.fn();
+    for (const badLimit of ['zero', '0', '-1']) {
+      const result = await runCli(
+        ['providers', '--limit', badLimit, '--json'],
+        baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }),
+      );
+      expect(result.exitCode).toBe(1);
+      const parsed = JSON.parse(result.stdout) as { error: { kind: string } };
+      expect(parsed.error.kind).toBe('usage');
+      expect(result.stderr).toContain('--limit');
+    }
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('--detail names (the default): a provider with no live entry method still shows a few callable methods, never nothing', async () => {
+    // `you` publishes no `you_search` (SEARCH_PROVIDERS_CATALOG), so its
+    // declared search entry method is absent from the live catalog.
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['providers', '--intent', 'search', '--json'], baseDeps({ fetchFn }));
+    const parsed = JSON.parse(result.stdout) as ProvidersJson;
+    const you = parsed.providers?.find((p) => p['backend_id'] === 'you') as { entry_methods: string[]; methods?: string[] } | undefined;
+    expect(you?.entry_methods).toEqual([]);
+    expect(you?.methods).toBeDefined();
+    expect(you?.methods?.length).toBeGreaterThan(0);
+    expect(you?.methods?.length).toBeLessThanOrEqual(3);
+
+    // exa DOES publish its declared entry method, so no fallback needed.
+    const exa = parsed.providers?.find((p) => p['backend_id'] === 'exa') as { entry_methods: string[]; methods?: string[] } | undefined;
+    expect(exa?.entry_methods).toEqual(['exa_search']);
+    expect(exa?.methods).toBeUndefined();
+  });
+
+  it('--detail descriptions: adds why/when and the FULL method list, uncapped', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['providers', '--intent', 'search', '--detail', 'descriptions', '--json'], baseDeps({ fetchFn }));
+    const parsed = JSON.parse(result.stdout) as ProvidersJson;
+    const you = parsed.providers?.find((p) => p['backend_id'] === 'you') as { why: string; methods: string[] } | undefined;
+    expect(you?.why).toBeDefined();
+    // `you`'s 4 live methods, none dropped -- distinct from the capped
+    // `--detail names` fallback above.
+    expect(you?.methods).toEqual(['you_contents', 'you_finance_research', 'you_research', 'you_research_start']);
+  });
+
+  it('--detail schema: adds method_schemas, keyed by tool name, for the provider\'s methods', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['providers', '--intent', 'search', '--detail', 'schema', '--json'], baseDeps({ fetchFn }));
+    const parsed = JSON.parse(result.stdout) as ProvidersJson;
+    const exa = parsed.providers?.find((p) => p['backend_id'] === 'exa') as { method_schemas: Record<string, unknown> } | undefined;
+    expect(exa?.method_schemas).toBeDefined();
+    expect(Object.keys(exa?.method_schemas ?? {})).toContain('exa_search');
+  });
+
+  // The `names`-level fallback method list is capped at three, and the cap has
+  // to be VISIBLE in both views. The human view prints `(+N more)`; the wire
+  // shape carries `methods_omitted`. Without the latter there is no way to
+  // tell three methods from three-of-nine in --json — which is this repo's
+  // stated `omitted` rule (render.ts), applied to the same cap it already
+  // applies to `--limit`. `you` publishes four methods here and none of them
+  // is its declared entry method `you_search`, so it takes the fallback path.
+  it('--detail names reports what the fallback method cap dropped, in both views', async () => {
+    const json = await runCli(
+      ['providers', '--intent', 'search', '--json'],
+      baseDeps({ fetchFn: multiRouteFetch(SEARCH_PROVIDERS_CATALOG) }),
+    );
+    const parsed = JSON.parse(json.stdout) as ProvidersJson;
+    const you = parsed.providers?.find((p) => p['backend_id'] === 'you') as
+      | { entry_methods: string[]; methods?: string[]; methods_omitted?: number }
+      | undefined;
+    expect(you?.entry_methods).toEqual([]);
+    expect(you?.methods).toHaveLength(3);
+    expect(you?.methods_omitted).toBe(1);
+
+    const text = await runCli(
+      ['providers', '--intent', 'search'],
+      baseDeps({ fetchFn: multiRouteFetch(SEARCH_PROVIDERS_CATALOG) }),
+    );
+    expect(text.stdout).toContain('(+1 more)');
+  });
+
+  it('omits methods_omitted entirely when the cap dropped nothing', async () => {
+    const result = await runCli(
+      ['providers', '--intent', 'search', '--json'],
+      baseDeps({ fetchFn: multiRouteFetch(ALL_SEARCH_PROVIDERS_CATALOG) }),
+    );
+    const parsed = JSON.parse(result.stdout) as ProvidersJson;
+    // Every provider here publishes its declared entry method, so no row takes
+    // the fallback path at all.
+    for (const row of parsed.providers ?? []) {
+      expect(Object.hasOwn(row, 'methods_omitted')).toBe(false);
+    }
+  });
+
+  // HELP_TEXT and README both promise `--explain` adds provenance to EVERY
+  // row. `names` is the DEFAULT detail level, so a `source` that attached only
+  // at `descriptions` made the flag a no-op on the most common --json path
+  // while the human view printed it -- documented behavior the code did not
+  // have. Pinned at the default level for that reason.
+  it('--explain adds the recommendation source citation at the DEFAULT detail level', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['providers', '--intent', 'search', '--explain', '--json'], baseDeps({ fetchFn }));
+    const parsed = JSON.parse(result.stdout) as ProvidersJson;
+    const you = parsed.providers?.find((p) => p['backend_id'] === 'you') as { source?: { doc: string; prepared: string } } | undefined;
+    expect(you?.source).toEqual({ doc: 'docs/providers-score.md', prepared: '2026-08-05' });
+
+    const without = await runCli(
+      ['providers', '--intent', 'search', '--json'],
+      baseDeps({ fetchFn: multiRouteFetch(SEARCH_PROVIDERS_CATALOG) }),
+    );
+    const withoutParsed = JSON.parse(without.stdout) as ProvidersJson;
+    const youNo = withoutParsed.providers?.find((p) => p['backend_id'] === 'you') as { source?: unknown } | undefined;
+    expect(Object.hasOwn(youNo ?? {}, 'source')).toBe(false);
+  });
+
+  it('--explain adds the recommendation source citation at descriptions detail too', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(
+      ['providers', '--intent', 'search', '--detail', 'descriptions', '--explain', '--json'],
+      baseDeps({ fetchFn }),
+    );
+    const parsed = JSON.parse(result.stdout) as ProvidersJson;
+    const you = parsed.providers?.find((p) => p['backend_id'] === 'you') as { source?: { doc: string; prepared: string } } | undefined;
+    expect(you?.source).toEqual({ doc: 'docs/providers-score.md', prepared: '2026-08-05' });
+
+    const withoutExplain = await runCli(
+      ['providers', '--intent', 'search', '--detail', 'descriptions', '--json'],
+      baseDeps({ fetchFn: multiRouteFetch(SEARCH_PROVIDERS_CATALOG) }),
+    );
+    const withoutExplainParsed = JSON.parse(withoutExplain.stdout) as ProvidersJson;
+    const youNoExplain = withoutExplainParsed.providers?.find((p) => p['backend_id'] === 'you') as { source?: unknown } | undefined;
+    expect(Object.hasOwn(youNoExplain ?? {}, 'source')).toBe(false);
+  });
+
+  it('--limit caps each group and reports what it dropped as "omitted", never silently', async () => {
+    const fetchFn = multiRouteFetch(ALL_SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['providers', '--intent', 'search', '--limit', '2', '--json'], baseDeps({ fetchFn }));
+    const parsed = JSON.parse(result.stdout) as ProvidersJson;
+    expect(parsed.providers).toHaveLength(2);
+    expect(parsed.providers?.map((p) => p['backend_id'])).toEqual(['you', 'exa']);
+    expect(parsed.omitted).toBe(3);
+
+    // Human output must surface the same count, not just the JSON shape.
+    const humanResult = await runCli(['providers', '--intent', 'search', '--limit', '2'], baseDeps({ fetchFn: multiRouteFetch(ALL_SEARCH_PROVIDERS_CATALOG) }));
+    expect(humanResult.stdout).toContain('omitted: 3');
+  });
+
+  it('the deny-list removes a backend from providers output, and FEZO_EXCLUDED_BACKENDS="" restores it', async () => {
+    const excludedResult = await runCli(
+      ['providers', '--intent', 'search', '--json'],
+      baseDeps({
+        fetchFn: multiRouteFetch(SEARCH_PROVIDERS_CATALOG),
+        env: { FEZO_URL: 'https://gw.example.com', FEZO_API_KEY: SECRET, FEZO_EXCLUDED_BACKENDS: 'exa' },
+      }),
+    );
+    const excludedParsed = JSON.parse(excludedResult.stdout) as ProvidersJson;
+    expect(excludedParsed.providers?.map((p) => p['backend_id'])).toEqual(['you']);
+
+    const restoredResult = await runCli(
+      ['providers', '--intent', 'search', '--json'],
+      baseDeps({
+        fetchFn: multiRouteFetch(SEARCH_PROVIDERS_CATALOG),
+        env: { FEZO_URL: 'https://gw.example.com', FEZO_API_KEY: SECRET, FEZO_EXCLUDED_BACKENDS: '' },
+      }),
+    );
+    const restoredParsed = JSON.parse(restoredResult.stdout) as ProvidersJson;
+    expect(restoredParsed.providers?.map((p) => p['backend_id'])).toEqual(['you', 'exa']);
+  });
+
+  it('without --json, prints a human-readable rank/tier/provider/why summary', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['providers', '--intent', 'search'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('[primary]');
+    expect(result.stdout).toContain('You.com');
+    expect(result.stdout).toContain('best_value: you');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// list-providers
+// ---------------------------------------------------------------------------
+
+interface ListProvidersJson {
+  recommendations: { doc: string; preparedAt: string };
+  providers: { backend_id: string; recommendations: { intent: string; rank: number }[] }[];
+}
+
+describe('list-providers', () => {
+  it('one row per non-excluded catalog backend, each carrying its declared standing per intent', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['list-providers', '--json'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as ListProvidersJson;
+    expect(parsed.recommendations.doc).toBe('docs/providers-score.md');
+    expect(parsed.providers.map((p) => p.backend_id).sort()).toEqual(['exa', 'you']);
+    const you = parsed.providers.find((p) => p.backend_id === 'you');
+    expect(you?.recommendations.some((r) => r.intent === 'search')).toBe(true);
+  });
+
+  it('the deny-list removes a backend entirely, and FEZO_EXCLUDED_BACKENDS="" restores it', async () => {
+    const excludedResult = await runCli(
+      ['list-providers', '--json'],
+      baseDeps({
+        fetchFn: multiRouteFetch(SEARCH_PROVIDERS_CATALOG),
+        env: { FEZO_URL: 'https://gw.example.com', FEZO_API_KEY: SECRET, FEZO_EXCLUDED_BACKENDS: 'exa' },
+      }),
+    );
+    const excludedParsed = JSON.parse(excludedResult.stdout) as ListProvidersJson;
+    expect(excludedParsed.providers.map((p) => p.backend_id)).toEqual(['you']);
+
+    const restoredResult = await runCli(
+      ['list-providers', '--json'],
+      baseDeps({
+        fetchFn: multiRouteFetch(SEARCH_PROVIDERS_CATALOG),
+        env: { FEZO_URL: 'https://gw.example.com', FEZO_API_KEY: SECRET, FEZO_EXCLUDED_BACKENDS: '' },
+      }),
+    );
+    const restoredParsed = JSON.parse(restoredResult.stdout) as ListProvidersJson;
+    expect(restoredParsed.providers.map((p) => p.backend_id).sort()).toEqual(['exa', 'you']);
+  });
+
+  it('without --json, prints a human-readable per-provider summary with declared-rank recommendations', async () => {
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['list-providers'], baseDeps({ fetchFn }));
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('You.com');
+    expect(result.stdout).toContain('declared rank');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1864,28 @@ describe('doctor', () => {
     const prefCheck = byName.get('preference-hints');
     expect(prefCheck?.status).toBe('warn');
     expect(prefCheck?.message).toContain('brightdata');
+  });
+
+  it('warns about a declared entry method missing from an otherwise-present backend, distinctly from an absent backend', async () => {
+    // SEARCH_PROVIDERS_CATALOG's `you` publishes `contents`/`research`/etc.
+    // but never `search` -- so `you` itself IS in the live catalog (as
+    // `you_contents` and friends), yet its declared `search` entry method
+    // (`you_search`) is not one of its published tool names. This is the
+    // case the pre-Phase-4 check could not see at all: it only compared
+    // backend ids, never entry-method names.
+    const fetchFn = multiRouteFetch(SEARCH_PROVIDERS_CATALOG);
+    const result = await runCli(['doctor', '--json'], baseDeps({ fetchFn }));
+    const parsed = JSON.parse(result.stdout) as {
+      checks: { name: string; status: string; details?: { missingBackends: string[]; missingEntryMethods: string[] } }[];
+    };
+    const prefCheck = parsed.checks.find((c) => c.name === 'preference-hints');
+    expect(prefCheck?.status).toBe('warn');
+    expect(prefCheck?.details?.missingBackends).not.toContain('you');
+    expect(prefCheck?.details?.missingEntryMethods).toContain('you_search');
+    // `exa` DOES publish its declared entry method (`exa_search`), so it must
+    // appear in neither list.
+    expect(prefCheck?.details?.missingBackends).not.toContain('exa');
+    expect(prefCheck?.details?.missingEntryMethods).not.toContain('exa_search');
   });
 
   it('reports missing credentials as a hard failure and skips the connectivity checks', async () => {

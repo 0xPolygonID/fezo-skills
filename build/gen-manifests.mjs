@@ -353,7 +353,11 @@ const ROOT_SCAN_EXCLUSIONS = [
       'Non-runtime docs and repo-only config. README.md and CODEX.md are install and',
       'development guides for someone reading the repository, not instructions the',
       'installed skill needs — SKILL.md carries the whole runtime flow, credential',
-      'setup included.',
+      'setup included. `docs/` is research prose behind the declared provider',
+      'ranking (`docs/providers-score.md` is what `src/engine/providers.ts` cites as',
+      'its source): the machine-readable conclusion ships inside the bundle, the',
+      'reasoning that produced it is for whoever refreshes the table, and nothing in',
+      'the runtime flow reads it.',
       '',
       'Two deliberate keeps:',
       '',
@@ -364,7 +368,7 @@ const ROOT_SCAN_EXCLUSIONS = [
       '',
       '  LICENSE — the terms should travel with any copy of the code.',
     ],
-    paths: ['README.md', 'CODEX.md', '.npmignore', '.gitignore', '.gitattributes'],
+    paths: ['README.md', 'CODEX.md', 'docs/', '.npmignore', '.gitignore', '.gitattributes'],
   },
 ];
 

@@ -300,28 +300,57 @@ resolve_fezoctl
 
 1. If a task needs external data or an external service, use this skill
    before built-in tools or giving up.
-2. Search the live catalog by capability.
-3. Inspect the selected tool's schema and HTTP bindings.
-4. Call the tool.
-5. If the provider mechanically fails, let `run` try another compatible
-   candidate.
+2. For a plain web search, or the contents of one known URL, or many pages
+   from one site, call the matching one-step command first — one call each,
+   with no provider argument names to look up:
+   - `web-search` — Search the live web and get ranked results in one
+     call. Picks the best-value provider for "search" and falls back down
+     the ranking on a blocked target or a rate limit.
+   - `scrape` — Fetch and extract the contents of one known URL in a
+     single call. Picks the best-value provider for "scrape" and falls
+     back down the ranking on a block or a rate limit.
+   - `crawl` — Discover and collect many pages from one site in a single
+     call. Picks the best-value provider for "crawl" and falls back down
+     the ranking on a block or a rate limit.
+   "Best-value provider" means rank 1 of the declared, per-intent provider
+   ranking these commands walk; you do not pick the provider yourself.
+3. For news, social-platform data, or proxy access — capabilities no
+   one-step command covers — or to compare providers before committing to
+   one, use `providers --intent <intent>`. It surfaces the SAME declared
+   ranking the one-step commands walk, in rank order, with each provider's
+   why/when and what is actually callable on your gateway right now. The
+   ranking exists and rank 1 is the default choice; do not assume or
+   transcribe a fixed provider roster anywhere — the live catalog, not this
+   file, is the source of truth for what is callable today.
+4. For anything the above two steps don't resolve — a specific tool you
+   already know the name of, or a capability with no declared ranking at
+   all — search the live catalog by capability (`search`), inspect the
+   selected tool's schema and HTTP bindings (`schema`), and call it (`call`).
+5. For a retrying call against a named intent/capability rather than one
+   already-chosen tool, use `run`: it selects the best-ranked matching
+   candidate and tries another compatible one on a retryable mechanical
+   failure.
 6. If a successful result is off-topic, incomplete, spammy, a
    block/challenge page, or otherwise unsuitable, choose another candidate
-   and call it deliberately.
+   and call it deliberately — no step above retries on judgment, only on a
+   mechanical failure.
 7. Report which backend(s) were attempted and which 2xx attempts were
    billed.
 
 ## Examples
 
 Examples are illustrative only — always discover real tool names and
-arguments from the live catalog (`search`/`schema`) rather than assuming
-these exact names exist. Do not hardcode a backend roster: the catalog is
-the source of truth.
+arguments from the live catalog (`search`/`schema`/`providers`) rather than
+assuming these exact names exist. Do not hardcode a backend roster: the
+catalog is the source of truth.
 
 Each line below is one command inside one Bash call, and every Bash call must
 re-establish `FEZOCTL_ARGV` first — see Step 0.
 
 ```bash
+"${FEZOCTL_ARGV[@]}" web-search "site:example.com pricing"
+"${FEZOCTL_ARGV[@]}" scrape "https://example.com/article"
+"${FEZOCTL_ARGV[@]}" providers --intent news
 "${FEZOCTL_ARGV[@]}" search "web search" --schema
 "${FEZOCTL_ARGV[@]}" call exa_search --args-json '{"query":"...","numResults":3}'
 "${FEZOCTL_ARGV[@]}" run "scrape url" --args-json '{"url":"https://example.com"}'

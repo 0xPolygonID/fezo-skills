@@ -17,6 +17,7 @@ function candidate(overrides: Partial<ToolCandidate> & Pick<ToolCandidate, 'tool
     inputSchema: {},
     userSettings: [],
     backendInfoText: '',
+    backendCategories: [],
     billingModel: 'per_call',
     ...overrides,
   };
@@ -156,6 +157,13 @@ describe('run — a per-candidate BindingError skips the candidate', () => {
         status: 'retry',
         reason: 'candidate rejected the supplied arguments: missing required path parameter(s): id',
         billed: false,
+        // `'binding'`, not `'schema'`: this candidate's args passed its own
+        // input_schema and were refused by `bindArgs`. The two share one
+        // reason string on purpose, so this field is the ONLY thing that
+        // separates "the provider's manifest could not take these arguments"
+        // from "the caller's arguments are wrong" — see one-step.ts's
+        // `isCallerFixableArgRejection`, which reports only the latter.
+        preflight: 'binding',
       },
       {
         tool: 'beta_scrape',
@@ -164,6 +172,7 @@ describe('run — a per-candidate BindingError skips the candidate', () => {
         httpStatus: 200,
         reason: '200 response',
         billed: true,
+        // Absent on any attempt that actually issued a request.
       },
     ]);
     // The skipped candidate issued no request: only the second one was called.
@@ -425,5 +434,141 @@ describe('run — no candidates', () => {
     expect(report.outcome).toEqual({ kind: 'give_up', reason: 'no candidates to try' });
     expect(report.attempts).toEqual([]);
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `argsFor` (Phase 3a): additive, per-candidate arguments for one-step.ts's
+// ranked walk. Two providers under the same "intent" name the caller's single
+// value differently (`q` vs. `keyword`), so this proves `run()` actually calls
+// `argsFor` per candidate rather than reusing one shared `args` object.
+// ---------------------------------------------------------------------------
+describe('run — argsFor (per-candidate arguments)', () => {
+  const alphaQ = candidate({
+    tool: 'alpha_search',
+    backendId: 'alpha',
+    path: '/search',
+    httpMethod: 'GET',
+    bindings: { query: ['q'] },
+    inputSchema: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] },
+  });
+  const betaKeyword = candidate({
+    tool: 'beta_search',
+    backendId: 'beta',
+    path: '/search',
+    httpMethod: 'GET',
+    bindings: { query: ['keyword'] },
+    inputSchema: { type: 'object', properties: { keyword: { type: 'string' } }, required: ['keyword'] },
+  });
+
+  it('calls each candidate with its OWN resolved argument name, falling back to the first candidate on a retryable failure', async () => {
+    const fetchFn = routedFetch({
+      alpha: [gatewayErrorResponse(503, 'backend_unavailable')],
+      beta: [okResponse('{"ok":true}')],
+    });
+
+    const report = await run({
+      ...baseOptions,
+      args: { q: 'unused-fallback' },
+      candidates: [alphaQ, betaKeyword],
+      argsFor: (c) => (c.backendId === 'alpha' ? { q: 'hello' } : { keyword: 'hello' }),
+      fetchFn,
+    });
+
+    expect(report.outcome.kind).toBe('success');
+    const calls = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls;
+    expect(String(calls[0]?.[0])).toContain('q=hello');
+    expect(String(calls[1]?.[0])).toContain('keyword=hello');
+  });
+
+  it('without argsFor, the shared `args` value is used for every candidate — unchanged, default behavior', async () => {
+    // beta requires `keyword`, not `q`, so the shared `args` (naming only `q`)
+    // fails beta's own schema and beta is skipped locally, never billed —
+    // exactly the cross-provider-naming problem `argsFor` exists to solve.
+    const fetchFn = routedFetch({ alpha: [okResponse('{"ok":true}')] });
+
+    const report = await run({ ...baseOptions, args: { q: 'hello' }, candidates: [alphaQ, betaKeyword], fetchFn });
+
+    expect(report.outcome).toEqual({ kind: 'success', candidate: alphaQ, result: { status: 200, bodyText: '{"ok":true}' } });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `deadline` (Phase 3a): additive wall-clock budget on the whole walk, checked
+// only before starting a NEW attempt, never before the first and never
+// mid-attempt. `stoppedBy` reports which cap (if any) actually stopped the
+// walk.
+// ---------------------------------------------------------------------------
+describe('run — deadline', () => {
+  it('never checks the deadline before the first attempt, even if it has already "expired" by the clock given', async () => {
+    const clock = () => 1_000;
+    const fetchFn = routedFetch({ alpha: [okResponse('{"ok":true}')] });
+
+    const report = await run({ ...baseOptions, candidates: [alpha], deadline: { clock, ms: -500 }, fetchFn });
+
+    expect(report.outcome.kind).toBe('success');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops STARTING new attempts once the deadline has passed, without aborting the attempt already in flight, and reports stoppedBy', async () => {
+    let time = 0;
+    const clock = (): number => time;
+    // Simulates the first attempt itself taking 10s of wall-clock time --
+    // i.e. the deadline expires DURING the first (already-completed) attempt,
+    // not before it, matching retry.ts's "never mid-attempt" rule: the check
+    // only ever runs between attempts.
+    const fetchFn = vi.fn(async (url: string | URL) => {
+      if (String(url).includes('/v1/alpha/')) {
+        time += 10_000;
+        return gatewayErrorResponse(503, 'backend_unavailable');
+      }
+      return okResponse('{"ok":true}');
+    }) as unknown as typeof fetch;
+
+    const report = await run({ ...baseOptions, candidates: [alpha, beta], deadline: { clock, ms: 5_000 }, fetchFn });
+
+    expect(report.outcome).toEqual({ kind: 'give_up', reason: 'wall-clock deadline (5000ms) reached with candidates remaining' });
+    expect(report.stoppedBy).toBe('deadline');
+    expect(report.attempts).toHaveLength(1);
+    // beta was never even attempted -- the deadline cut the walk short before it.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('stoppedBy is absent when no deadline was given (unchanged default behavior)', async () => {
+    const fetchFn = routedFetch({ alpha: [okResponse('{"ok":true}')] });
+    const report = await run({ ...baseOptions, candidates: [alpha], fetchFn });
+    expect(report.stoppedBy).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `stoppedBy` on the OTHER cap (`--max-attempts`), and its absence when the
+// run instead ended for an unrelated reason.
+// ---------------------------------------------------------------------------
+describe('run — stoppedBy: max-attempts', () => {
+  it('reports "max-attempts" when the attempt budget, not candidate exhaustion, is what stopped the walk', async () => {
+    const fetchFn = routedFetch({
+      alpha: [gatewayErrorResponse(500, 'backend_error')],
+      beta: [gatewayErrorResponse(500, 'backend_error')],
+      gamma: [okResponse('{"ok":true}')],
+    });
+
+    const report = await run({ ...baseOptions, candidates: [alpha, beta, gamma], fetchFn });
+
+    expect(report.outcome).toEqual({ kind: 'give_up', reason: 'max attempts (2) reached with candidates remaining' });
+    expect(report.stoppedBy).toBe('max-attempts');
+  });
+
+  it('is absent when the run ends by running out of candidates rather than by hitting a cap', async () => {
+    const fetchFn = routedFetch({
+      alpha: [gatewayErrorResponse(500, 'backend_error')],
+      beta: [gatewayErrorResponse(429, 'rate_limited')],
+    });
+
+    const report = await run({ ...baseOptions, candidates: [alpha, beta], maxAttempts: 5, fetchFn });
+
+    expect(report.outcome).toEqual({ kind: 'give_up', reason: 'no more candidates to try' });
+    expect(report.stoppedBy).toBeUndefined();
   });
 });

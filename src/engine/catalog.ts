@@ -92,6 +92,21 @@ export interface ToolCandidate {
    */
   backendInfoText: string;
   billingModel: 'per_call' | 'dynamic' | 'package';
+  /**
+   * The backend's declared `info.categories` (internal/gateway/manifest.go's
+   * three-value product taxonomy — "Search" / "Crawl" / others), carried as
+   * its own field rather than folded into `backendInfoText`. Empty array when
+   * the catalog declares none.
+   *
+   * This is deliberately NOT part of `backendInfoText`: that field's contents
+   * are fixed by the search-semantics rule documented on it above (title /
+   * summary / description, nothing else), and a category name is not a
+   * capability the backend has — a backend tagged "Crawl" would otherwise
+   * become substring-matchable by a `search` for "crawl" even when none of
+   * its methods do any such thing. `classifyMethod` (src/engine/intent.ts)
+   * reads this field directly as its category-fallback layer instead.
+   */
+  backendCategories: string[];
 }
 
 /**
@@ -356,6 +371,7 @@ export function normalizeCatalog(parsed: unknown): ToolCandidate[] {
     }
 
     const backendInfoText = formatBackendInfoText(backendRec.info);
+    const backendCategories = asStringArray(asRecord(backendRec.info)?.categories) ?? [];
     const billingModel = parseBillingModel(backendRec.billing);
     const userSettings = asStringArray(backendRec.user_settings) ?? [];
     const methodsRaw = asArray(backendRec.methods) ?? [];
@@ -403,6 +419,7 @@ export function normalizeCatalog(parsed: unknown): ToolCandidate[] {
         inputSchema,
         userSettings,
         backendInfoText,
+        backendCategories,
         billingModel,
         ...(title !== undefined ? { title } : {}),
         ...(outputSchema !== undefined ? { outputSchema } : {}),

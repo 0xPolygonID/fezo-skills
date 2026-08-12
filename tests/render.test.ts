@@ -31,6 +31,7 @@ function candidate(overrides: Partial<ToolCandidate> & Pick<ToolCandidate, 'tool
     inputSchema: {},
     userSettings: [],
     backendInfoText: '',
+    backendCategories: [],
     billingModel: 'per_call',
     ...overrides,
   };
@@ -296,12 +297,12 @@ describe('renderRun', () => {
     const ranked: RankedCandidate[] = [{ candidate: firecrawl, explanation: { tier: 'term-score', matchedTerms: [], termScore: 0, billingModel: 'per_call' } }];
     const selection: RunSelection = {
       outcome: 'refused-ambiguous-capability',
-      reason: { kind: 'ambiguous-capability', capabilities: ['scrape', 'serp'] },
+      reason: { kind: 'ambiguous-capability', capabilities: ['scrape', 'web-search'] },
       alternatives: ranked,
     };
-    const text = renderRun({ intent: 'scrape serp results', selection, allowUnhintedAutoPick: false }, false);
+    const text = renderRun({ intent: 'fetch page then web search', selection, allowUnhintedAutoPick: false }, false);
     expect(text).toContain('scrape');
-    expect(text).toContain('serp');
+    expect(text).toContain('web-search');
     expect(text).toContain('not overridable');
     expect(text).toContain('alternatives (not called)');
   });

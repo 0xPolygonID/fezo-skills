@@ -29,6 +29,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { runCli } from '../src/cli.js';
+import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS } from '../src/engine/steering.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..');
@@ -425,6 +426,39 @@ describe('skills/fezo/SKILL.md generated content', () => {
 
   it('does not enumerate a fixed backend/method roster', () => {
     expect(skillMd).not.toMatch(/methods:/);
+  });
+
+  // ---------------------------------------------------------------------------
+  // "These agree" as a test over data, which is the whole reason
+  // src/engine/steering.ts exists as a module. `--help` and SKILL.md describe
+  // the same three commands to two different readers; the sentences live once,
+  // in `src/engine/one-step-descriptions.json`, and both surfaces render them.
+  // This asserts the COMMITTED SKILL.md still carries the current text, so
+  // editing a description without regenerating fails here rather than shipping
+  // a skill that tells an agent something `--help` contradicts.
+  //
+  // Compared against `skillMdFlat` because the generator hard-wraps each
+  // sentence to SKILL.md's own column: the property under test is the wording,
+  // not where a line happens to break.
+  // ---------------------------------------------------------------------------
+
+  it("carries every ONE_STEP_DESCRIPTIONS sentence exactly as src/engine/steering.ts exports it", () => {
+    for (const command of ONE_STEP_COMMANDS) {
+      expect(skillMdFlat, `SKILL.md is stale for "${command}" — run \`pnpm gen-skill\``).toContain(
+        ONE_STEP_DESCRIPTIONS[command],
+      );
+    }
+  });
+
+  it('names all three one-step commands and the providers --intent escape hatch in its procedure', () => {
+    const procedure = skillMd.slice(skillMd.indexOf('## Procedure'), skillMd.indexOf('## Examples'));
+    expect(procedure).not.toBe('');
+    for (const command of ONE_STEP_COMMANDS) {
+      expect(procedure, `procedure never names \`${command}\``).toContain(`\`${command}\``);
+    }
+    // The capabilities no one-step command covers (news/social/proxy) are only
+    // reachable this way, so the step that routes there must name the command.
+    expect(procedure).toContain('`providers --intent <intent>`');
   });
 });
 

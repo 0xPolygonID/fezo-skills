@@ -302,6 +302,15 @@ user intent -> search live catalog -> inspect schema/bindings -> choose candidat
   (honoring provider preference hints — see
   ["Provider selection"](#provider-selection)), calls it, and on a *retryable
   mechanical* failure tries the next compatible candidate.
+- `fezoctl web-search "<query>"` / `scrape <url>` / `crawl <url>` skip search
+  and selection entirely: each walks the **declared** per-intent provider
+  ranking top-down (not a `search` match), trying one provider at a time and
+  falling back on a retryable failure — see ["One-step
+  commands"](#one-step-commands).
+- `fezoctl providers [--intent <intent>]` / `list-providers` surface that same
+  declared ranking directly, for comparing providers or reaching a capability
+  (news, social, proxy) no one-step command covers — see ["Provider
+  recommendations"](#provider-recommendations).
 
 Because every one of these commands fetches `/v1/catalog` fresh, a backend
 registering with the gateway today is discoverable by `search`/`schema`/`run`
@@ -318,7 +327,13 @@ fezoctl schema <tool> [--json]
 fezoctl call <tool> --args-json '<json>' [--body-json '<json>'] [--json]
 fezoctl run "<intent>" --args-json '<json>' [--body-json '<json>']
            [--max-attempts N] [--retry-empty-2xx] [--allow-unhinted-auto-pick] [--json]
+fezoctl web-search "<query>" [--extra-json '<json>'] [--max-attempts N] [--json]
+fezoctl scrape <url>         [--extra-json '<json>'] [--max-attempts N] [--json]
+fezoctl crawl <url>          [--extra-json '<json>'] [--max-attempts N] [--json]
 fezoctl catalog [--json]
+fezoctl providers [--intent <intent>] [--detail names|descriptions|schema]
+                   [--limit N] [--explain] [--json]
+fezoctl list-providers [--json]
 fezoctl setup --key-stdin [--url <url>] [--storage keychain|dotenv] [--json]
 fezoctl doctor [--json]
 fezoctl --version
@@ -334,6 +349,9 @@ source — run it yourself if this ever looks stale.)
 | `schema <tool>` | Print one tool's input/output schema, HTTP verb, binding map, backend id, method name, and call path. |
 | `call <tool> --args-json '<json>' [--body-json '<json>']` | Resolve exactly one named tool, validate, bind, and call it once. |
 | `run "<intent>" --args-json '<json>' [--body-json '<json>']` | Search, select the best candidate for the intent, call it, and retry a compatible alternative on a retryable mechanical failure. |
+| `web-search "<query>"` / `scrape <url>` / `crawl <url>` | One-step commands: walk `src/engine/providers.ts`'s declared ranking for `search`/`scrape`/`crawl` top-down, calling one provider at a time and falling back to the next on a retryable failure — no need to know any provider's argument name. See ["One-step commands"](#one-step-commands). |
+| `providers [--intent <intent>]` | Surface the declared, per-intent provider ranking, grouped by capability — every group by default, or exactly one with `--intent`. See ["Provider recommendations"](#provider-recommendations). |
+| `list-providers` | One row per live catalog backend, with its declared standing across every intent it appears in. See ["Provider recommendations"](#provider-recommendations). |
 | `catalog` | List every backend and method the gateway currently reports. |
 | `setup --key-stdin` | Store the gateway URL and API key without ever putting the key in argv or a transcript. Pass `--url` (or have `FEZO_URL` set): `fezoctl` needs both values, so a `setup` that leaves the URL unconfigured prints `configured url: (not configured — pass --url or set FEZO_URL)` and exits 2 rather than reporting a success that no other command can use. |
 | `doctor` | Diagnose configuration and connectivity — the first thing to run when something is wrong. See ["`doctor`"](#doctor). |
@@ -345,8 +363,8 @@ From `src/cli.ts`'s `HELP_TEXT` (and matching its `EXIT_OK`/`EXIT_USAGE`/`EXIT_O
 | Code | Meaning |
 | --- | --- |
 | `0` | Success. |
-| `1` | Usage error: a bad command/flag, or an unparseable `--args-json`/`--body-json` payload. Rejected while parsing argv, **before** any candidate is selected or called. |
-| `2` | Operational failure: credentials not configured, the gateway/catalog could not be reached or read, arguments failed schema validation, or a `call`/`run` that did not end in success (including a `run` refusal, an empty match, or `doctor` finding a hard failure). |
+| `1` | Usage error: a bad command/flag, or an unparseable `--args-json`/`--body-json`/`--extra-json` payload, or an unknown/invalid `providers` `--intent`/`--detail`/`--limit`. Rejected while parsing argv, **before** any candidate is selected or called. |
+| `2` | Operational failure: credentials not configured, the gateway/catalog could not be reached or read, arguments failed schema validation, a `schema`/`call`/`run` that named a deny-listed backend, or a `call`/`run`/`web-search`/`scrape`/`crawl` that did not end in success (including a `run` refusal, an empty match, a one-step walk with no provider left to serve it, or `doctor` finding a hard failure). |
 
 Verified: `--help`/no-args exit `0`; an unknown command, missing `--args-json`,
 invalid JSON, or `--max-attempts 0` exit `1`; missing credentials, an
@@ -483,20 +501,29 @@ fallback** when there is no code (`src/engine/retry.ts`):
   its parameters differently, or use a different HTTP verb) would also fail.
 
 Verified fallback example — a preferred backend fails with a code-less 503,
-and `run` advances to the next preferred candidate for the same capability:
+and `run` advances to the next preferred candidate for the same capability.
+(`position 2` is firecrawl's index in the declared `scrape` order, which
+begins `scrapingdog` → `brightdata` → `firecrawl`; neither of the first two is
+in this catalog, so firecrawl is the highest-ranked provider actually present.
+Before this CLI derived its preference from the declared table, the same run
+reported `position 0` against a hand-written list that began with firecrawl —
+so a `run` whose catalog *does* carry `scrapingdog` or `brightdata` will now
+pick one of those first.)
 
 ```
 $ node dist/fezoctl.mjs run "scrape url" --args-json '{"url":"https://example.com"}'
 run "scrape url"
 selected: firecrawl_scrape (firecrawl.scrape, POST /scrape, per_call)
-  why: exact-method; matched: scrape, url; termScore=4; preferred for "scrape" (position 0)
+  why: exact-method; matched: scrape, url; termScore=4; preferred for "scrape" (position 2)
 attempts:
   1. firecrawl_scrape (firecrawl) [retry] billed=false httpStatus=503 — code-less HTTP 503
   2. scrapingbee_scrape (scrapingbee) [success] billed=true httpStatus=200 — 200 response
   billing: every attempt that reached a 2xx response is billed by the provider (billed=true); attempts that failed or were skipped before a request was sent are not billed
 billed: true
 result (status 200):
-{ "markdown": "# Example\ncontent" }
+{
+  "markdown": "# Example\ncontent"
+}
 ```
 
 Verified give-up example — the same intent and the same candidate list, but
@@ -508,7 +535,7 @@ unknown code is not evidence that another provider would do better:
 $ node dist/fezoctl.mjs run "scrape url" --args-json '{"url":"https://example.com"}'
 run "scrape url"
 selected: firecrawl_scrape (firecrawl.scrape, POST /scrape, per_call)
-  why: exact-method; matched: scrape, url; termScore=4; preferred for "scrape" (position 0)
+  why: exact-method; matched: scrape, url; termScore=4; preferred for "scrape" (position 2)
 attempts:
   1. firecrawl_scrape (firecrawl) [give_up] billed=false httpStatus=400 gatewayCode=malformed_request — unrecognized gateway code "malformed_request"
   billing: every attempt that reached a 2xx response is billed by the provider (billed=true); attempts that failed or were skipped before a request was sent are not billed
@@ -530,27 +557,320 @@ charged.** This is a documented, accepted gap (`src/engine/retry.ts`'s
 `attemptCandidate` doc comment), not something `fezoctl` currently detects or
 corrects for.
 
+## Provider recommendations
+
+The per-capability ("intent") ordering `providers`/`list-providers` return,
+and that `web-search`/`scrape`/`crawl` walk, is declared by hand in
+[`src/engine/providers.ts`](src/engine/providers.ts)'s `RECOMMENDATIONS` —
+**array order is rank; nothing is scored or sorted at runtime.** It is the
+*conclusions* of [`docs/providers-score.md`](docs/providers-score.md) (the
+underlying five-criterion rubric, its weights, and its arithmetic) written
+down directly, ported verbatim from `zug/mcp-server`'s own declared table —
+including its rationale comments — because writing the order down removes
+float-rounding and tie-break machinery that exists only to reproduce twelve
+numbers whose gaps are false precision anyway (`brave` 80.6 vs `exa` 79.5 — a
+1.1-point gap from integer judgments on five axes). The rubric survives as an
+audit trail, not as the mechanism. **Provider policy is edited in
+`src/engine/providers.ts`, nowhere else** — see ["Provider
+selection"](#provider-selection) for how `run`'s legacy tie-break table is
+just a derived view of this same one.
+
+Current declared order per intent (`primary` → `secondary` → `fallback`; a
+`when` note tells you when to skip ahead a rank):
+
+| Intent | Order |
+| --- | --- |
+| `search` | `you` → `exa` (semantic/neural retrieval) → `brave` (independent index/data sovereignty) → `firecrawl` → `geonode` |
+| `scrape` | `scrapingdog` → `brightdata` (hard/anti-bot targets, or Scrapingdog success <~50%) → `firecrawl` → `geonode` → `apify` → `scraperapi` → `scrapingbee` |
+| `crawl` | `firecrawl` → `geonode` → `brightdata` → `apify` |
+| `news` | `newsapi` → `you` → `brave` |
+| `social` | `apify` and `brightdata` (both primary) → `xro` (not recommended: ~30–90× costlier than third-party alternatives, hard 2M-read cap, heaviest TOS/lock-in risk) |
+| `proxy` | `geonode` → `brightdata` |
+
+This table is a snapshot for orientation, not the thing to script against —
+`fezoctl providers`/`list-providers` read the live, canonical table and also
+tell you what is actually *callable on your gateway right now*, which this
+static list cannot.
+
+**Providers are not substitutes across these groups.** They span four
+functional categories (AI search, scraping, proxy infrastructure,
+specialized/social) — a global cross-capability ranking would put an AI-search
+provider above a proxy/unlocking provider and point you at the wrong tool for
+a Cloudflare-protected page. Always compare *within* one capability group:
+pass `--intent` to `providers` to get exactly one such group.
+
+Two cases that look similar but are not, both always surfaced (never
+dropped):
+
+- **Unrated** (`rated: false`) — a live catalog backend that no declared list
+  mentions at all, e.g. a newly onboarded backend. Appended after every
+  declared provider with a note that it is simply not yet assessed.
+- **Not recommended** (`not_recommended.reason` present) — assessed and
+  advised against; currently only `xro` for `social`. Placed last in its
+  declared list.
+
+An unrated backend therefore sorts ahead of a not-recommended one, and
+`best_value` (the group's top pick) is present only when rank 1 is a
+declared, not-advised-against recommendation — never for an unrated backend,
+and never for the `other` group (which has no declared recommendations at
+all).
+
+Verified — `providers --intent search` against a two-backend catalog (`you`
+publishes no live `search` method, so its row falls back to a few of its
+other catalog method names rather than showing nothing callable; `exa`
+publishes its declared entry method):
+
+```
+$ node dist/fezoctl.mjs providers --intent search
+recommendations: docs/providers-score.md (prepared 2026-08-05)
+
+search — best_value: you
+  1. [primary] You.com (you, dynamic)
+     methods: [you_contents, you_finance_research, you_research] (+1 more)
+  2. [secondary] Exa (exa, per_call)
+     entry_methods: [exa_search]
+```
+
+`list-providers` inverts the view — one row per live backend, every intent it
+has a declared standing in:
+
+```
+$ node dist/fezoctl.mjs list-providers
+recommendations: docs/providers-score.md (prepared 2026-08-05)
+providers — 2 backend(s)
+  You.com (you, dynamic)
+    why: cheapest quality AI search, clean data rights
+    categories: []
+    methods: [you_contents, you_finance_research, you_research, you_research_start]
+    recommendations:
+      search: declared rank 1 (primary) — cheapest quality AI search, clean data rights
+      news: declared rank 2 (secondary) — same clean, cheap index; freshness-filtered search stands in for a dedicated news endpoint
+  Exa (exa, per_call)
+    why: neural/semantic retrieval with deep research and monitors
+    when: semantic/neural retrieval quality matters most
+    categories: []
+    methods: [exa_search]
+    recommendations:
+      search: declared rank 2 (secondary) — neural/semantic retrieval with deep research and monitors
+```
+
+`providers` ranks by what your catalog **actually serves** — a provider's
+number moves up when a higher-ranked one is absent from your gateway's
+entitlement — while `list-providers` always reports the **declared** rank,
+the provider's fixed position in `RECOMMENDATIONS`. The two commands can
+therefore print different numbers for the same provider; neither is wrong,
+they answer different questions ("what should I call right now" vs. "where
+does this provider stand in the policy").
+
+`--detail` (on `providers`) defaults to `names` — a cheap sweep carrying each
+row's identity (rank, tier, provider, backend id, billing model, and the
+`rated` / `not_recommended` flags) plus what is callable; a provider with no
+live entry method for the intent still shows a few of its catalog method
+names rather than an empty row, exactly like the `you` example above, and
+reports what that cap dropped as `methods_omitted`. "Cheap" means this level
+omits the why/when prose, the complete method list and any inlined schema —
+**not** that it omits identity: the `--json` and human views carry the same
+fields at every level, so a script can see that a provider is advised against
+without having to ask for `descriptions`. `descriptions` adds the full
+why/when prose and the provider's complete method list; `schema` additionally
+inlines each surfaced method's input schema. `--explain` adds the
+`recommendations` provenance block to every row, at every detail level.
+`--limit` caps each group and always reports what it dropped as `omitted`,
+never silently.
+
+### Deny-listed backends (`falai`, `alpaca`)
+
+`falai` and `alpaca` never appear in `search`/`catalog`/`providers`/
+`list-providers`, and `schema`/`call`/`run` refuse them by name (exit `2`,
+`backend-excluded`) even when you already know the exact tool name.
+
+`schema` refuses rather than merely filtering, even though it calls nothing
+and bills nothing: handing back a full input schema and binding map for a
+backend this CLI will then refuse to call just costs you a second command to
+learn one fact. The message names the action you attempted — `cannot be
+inspected` for `schema`, `cannot be called` for `call`/`run` — and names
+`FEZO_EXCLUDED_BACKENDS`, which is the thing to change if you want it back.
+**This deny-list is currently the only thing disabling either backend** on
+this CLI's side — `fezoctl` only talks to the gateway over HTTP and cannot
+change what the gateway itself serves — so treat it as the switch, not as
+defence in depth.
+
+The default set (`['falai', 'alpaca']`) is overridden — **not extended** — by
+`FEZO_EXCLUDED_BACKENDS`: a comma-separated backend-id list. An explicitly
+empty string, `FEZO_EXCLUDED_BACKENDS=""`, is honoured as "exclude nothing" —
+an *absent* variable is what falls back to the default, so there is no way to
+ask for "the default plus one more" short of writing out the whole list
+yourself. This is what makes the falai/alpaca call reversible without a
+release, in both directions. `web-search`/`scrape`/`crawl`'s ranked walk also
+never attempts a deny-listed provider, silently skipping past it exactly like
+a `notRecommended` one (see ["One-step commands"](#one-step-commands)).
+
+### Refresh procedure
+
+Recommendations are prose-to-prose against the source doc; there is no
+arithmetic to reconcile until (or unless) a scoring rubric is ever wired up at
+runtime. To refresh:
+
+1. Re-read [`docs/providers-score.md`](docs/providers-score.md).
+2. Update `RECOMMENDATIONS` and `RECOMMENDATION_SOURCE.preparedAt` in
+   `src/engine/providers.ts` to match.
+3. Re-check the invariants `tests/providers.test.ts` pins by hand-editing a
+   fixture, or just re-run `pnpm test` — every intent needs a `primary`;
+   tiers must stay non-increasing down each list; no `backendId` may appear
+   twice within one intent; every `entryMethods` name must be tagged with (at
+   least) its own intent in `src/engine/intent.ts`'s `METHOD_INTENTS`. None of
+   that says the order is *right* — only a re-read of the source doc speaks to
+   that.
+4. Run `fezoctl doctor` against a real gateway afterward — its
+   `preference-hints` check (see ["`doctor`"](#doctor)) warns if the refreshed
+   table now names a backend or entry method your catalog doesn't actually
+   publish.
+
+## One-step commands
+
+`web-search "<query>"`, `scrape <url>`, and `crawl <url>` are one call each —
+no need to search first, pick a candidate, or know any provider's argument
+name. Each walks [`src/engine/providers.ts`](src/engine/providers.ts)'s
+declared ranking for its own intent (`search`/`scrape`/`crawl` respectively)
+**top-down**, in declared order — never re-sorted, never the `search` command's
+relevance ranking — trying one provider at a time and falling back to the
+next on a retryable mechanical failure, until one succeeds or the walk is
+exhausted.
+
+Verified fallback — `you` (rank 1 of `search`) fails with a code-less 503,
+and the walk advances to `exa` (rank 2), which succeeds:
+
+```
+$ node dist/fezoctl.mjs web-search "weather today"
+web-search "weather today"
+Served by Exa (rank 2 of search). For a different provider, more options, or a capability no one-step command covers (news, social, proxy), run `fezoctl providers --intent search`.
+attempts:
+  1. you_search (you) [retry] billed=false httpStatus=503 gatewayCode=backend_unavailable — gateway code "backend_unavailable"
+  2. exa_search (exa) [success] billed=true httpStatus=200 — 200 response
+  billing: every attempt that reached a 2xx response is billed by the provider (billed=true); attempts that failed or were skipped before a request was sent are not billed
+billed: true
+result (status 200):
+{
+  "results": []
+}
+```
+
+A few rules specific to these three commands:
+
+- **Argument-name resolution is automatic.** Each provider names the same
+  input differently (`query` vs `q` vs `keyword` for `web-search`; `url` vs
+  `target_url` vs `link` for `scrape`/`crawl`) — the walk reads each
+  candidate's own input schema and resolves which property carries your
+  value, preferring a *required* property over an optional one with the same
+  name. A provider whose schema names nothing plausible is skipped, never
+  called with a guessed argument name.
+- **`--extra-json` merges provider-specific options** into whichever
+  candidate the walk lands on (result counts, formats, timeouts — never the
+  query/URL itself, which is always the command's own positional argument).
+  A provider whose own schema rejects the merged arguments is skipped and
+  named under `arg_rejected` — reported **even on an otherwise successful
+  run**, so "rank 1 was blocked" and "your `--extra-json` disqualified rank 1"
+  never produce identical-looking output.
+- **`manifest_rejected` is the case that is *not* yours to fix.** A provider
+  whose arguments pass its schema but whose manifest then requires a value
+  the command never asks for (a path or query parameter, say) is named here
+  instead — also reported even on a successful run, and deliberately worded
+  to send you to `fezoctl schema <tool>` and `fezoctl call <tool>` rather
+  than to an `--extra-json` you may never have passed. The two are separate
+  fields because only one of them describes something you can change.
+- **`--max-attempts` defaults to 3 here, not `run`'s default of 2** — a
+  deliberately different budget, because the two numbers bound different
+  things: `run`'s budget is a *retry* budget for repeated failures on one
+  already-selected candidate; a one-step command's budget is a
+  *ranked-fallback* budget across several genuinely different,
+  separately-priced providers. Pass `--max-attempts` to override it.
+- **A 60-second wall-clock deadline** bounds the whole walk, not configurable
+  from the command line. It is checked only **before starting a new
+  attempt, never mid-attempt, and never before the first** — a client-side
+  timeout that aborted a call already in flight would discard a result
+  already billed. On expiry the walk stops starting new attempts and reports
+  whichever candidate answered last; the output says the cap stopped it,
+  which reads differently from "every provider failed" for exactly the reason
+  a caller needs to know which one happened.
+- **Deny-listed and `notRecommended` providers are never attempted**, and
+  never explain their own absence in the output — they are policy exclusions
+  decided ahead of time, not something this specific call discovered.
+- **No provider could serve the request at all** (every declared provider was
+  absent from your catalog, unranked, or had no resolvable argument) exits
+  `2` and names which providers were skipped and why, pointing you at
+  `fezoctl providers --intent <intent>` to see the full picture.
+- **Each command's one-line description exists once**, in
+  [`src/engine/one-step-descriptions.json`](src/engine/one-step-descriptions.json).
+  `fezoctl --help` renders it (through `src/engine/steering.ts`'s
+  `ONE_STEP_DESCRIPTIONS`) and so does the generated
+  [`skills/fezo/SKILL.md`](skills/fezo/SKILL.md) (through
+  `build/gen-skill.mjs`), each wrapping it to its own column — so the help
+  text an operator reads and the procedure an agent follows cannot end up
+  describing the same command differently. Edit the JSON, then run
+  `pnpm gen-skill`; `tests/skill_contract.test.ts` fails if the committed
+  SKILL.md no longer carries the current sentences.
+
 ## Provider selection
 
 When `run` has more than one compatible candidate, which one it tries first
 is **policy, not measurement**: `src/engine/preference.ts`'s
-`CAPABILITY_PREFERENCES` is a small, hand-curated ordering per capability
-(`scrape`, `serp`, `web-search`) — recorded human judgment about which
-provider to prefer, not a measured cost or latency ranking. `run` never falls
-back to alphabetical catalog order as a substitute policy.
+`CAPABILITY_PREFERENCES` is a per-capability backend ordering — recorded
+human judgment about which provider to prefer, not a measured cost or latency
+ranking. `run` never falls back to alphabetical catalog order as a substitute
+policy.
+
+Capabilities are **`scrape` and `web-search`** — that's the whole set.
+`serp` is not a capability: it used to be a third one, and was folded into
+`web-search` (its keyword phrases — `"serp"`, `"google search"`, etc. — moved
+there verbatim) rather than kept as a separate bucket sharing `web-search`'s
+ordering, because the declared table this repo derives from has no SERP-
+specific list to give it: a Google-SERP request and a general web-search
+request are both the `search` intent in `src/engine/providers.ts`, served by
+the same declared roster. Two capabilities aliased onto one ordering only
+bought a spurious `ambiguous-capability` refusal on "google search for X on
+the web" over a distinction this repo's provider policy does not draw.
+
+`CAPABILITY_PREFERENCES` is **derived, not authored**: it is a view of the
+declared per-intent provider table `RECOMMENDATIONS` in
+`src/engine/providers.ts` — see ["Provider
+recommendations"](#provider-recommendations) — with each capability taking
+its intent's declared backend order (`scrape` → `scrape`; `web-search` →
+`search`) and `notRecommended` entries dropped. **Provider policy is edited
+in `src/engine/providers.ts`**, the one authored table in the repo; editing
+`preference.ts` changes only how that table is reshaped into the two legacy
+buckets `rank.ts` reads.
 
 - A free-text intent is matched against a small keyword table
   (`CAPABILITY_KEYWORDS`) to infer which capability, if any, applies. If a
   capability is inferred, its preference ordering breaks ties among matching
   candidates.
-- If **no** capability hint applies (the intent's wording doesn't match any
-  known capability phrase) and the matching candidates span **two or more
-  backends**, `run` **refuses to auto-pick** rather than silently making
-  catalog/alphabetical order the policy. This refusal is overridable with
-  `--allow-unhinted-auto-pick`, which promotes **only the top-ranked
-  candidate** — there is no fallback to a second candidate under this
-  override, because the user only agreed to the one promotion, not to a
-  chain of un-hinted backends.
+- Each capability's ordering is **sparse** — a backend absent from it simply
+  gets no preference boost — so an inferred capability can name *none* of the
+  matched candidates' backends. This is exactly the SERP case above in a
+  different guise: a SERP-worded query (`"google search results"`) infers
+  `web-search`, but `web-search`'s declared `search` roster (`you` → `exa` →
+  `brave` → `firecrawl` → `geonode`) deliberately names no SERP specialist —
+  zug's provider policy prefers real search APIs over scraping a results
+  page. A hint that discriminates nothing among the actual candidates is
+  treated as **no hint at all** (`rank.ts`'s `selectForRun`, the
+  `discriminates` guard): ranking on it would decide a billed call by
+  input/catalog order while still reporting the result as a hinted `selected`
+  pick, with no `--allow-unhinted-auto-pick` gate in front of it — exactly
+  the "alphabetical order becomes the policy" outcome the unhinted rule below
+  exists to prevent.
+- If no usable capability hint applies — the intent's wording doesn't match
+  any known capability phrase, **or** the inferred capability's ordering
+  discriminates nothing among the matched candidates (the case just above) —
+  and the matching candidates span **two or more backends**, `run` **refuses
+  to auto-pick** rather than silently making catalog/alphabetical order the
+  policy. This refusal is overridable with `--allow-unhinted-auto-pick`,
+  which promotes **only the top-ranked candidate** — there is no fallback to
+  a second candidate under this override, because the user only agreed to
+  the one promotion, not to a chain of un-hinted backends. When every
+  matched candidate is from a *single* backend, there is no cross-provider
+  policy to get wrong, so `run` auto-picks even with a non-discriminating (or
+  absent) hint — the guard only ever turns a would-be `selected` into a
+  refusal when two or more backends are actually competing.
 - If two or more capabilities match ambiguously, `run` also refuses — with
   **no override** for that case.
 - **Async lifecycle methods are excluded from auto-selection by default.** A
@@ -567,7 +887,8 @@ back to alphabetical catalog order as a substitute policy.
      re-enabled). `fezoctl call <tool>` always works too, and never applies
      this filter at all.
 
-Verified refusal and override:
+Verified refusal and override, generic case (no capability wording matches
+at all):
 
 ```
 $ node dist/fezoctl.mjs run "search" --args-json '{"query":"x"}'
@@ -582,6 +903,31 @@ attempts:
   1. exa_search (exa) [success] billed=true httpStatus=200 — 200 response
 ...
 ```
+
+Verified refusal and override, the Amendment-A "hint discriminates nothing"
+case: `"google search results"` DOES infer `web-search`, but the two matching
+candidates (`scraperapi`/`brightdata` SERP endpoints) are both absent from
+`web-search`'s declared `search` roster, so the hint is treated as none and
+this still lands on the same overridable refusal as the unhinted case above —
+never on a silent `selected` decided by catalog order:
+
+```
+$ node dist/fezoctl.mjs run "google search results" --args-json '{"q":"widgets"}'
+run "google search results"
+refused: candidates span multiple backends with no capability preference (scraperapi, brightdata); use --allow-unhinted-auto-pick to pick the top-ranked one, or call a specific tool
+
+$ node dist/fezoctl.mjs run "google search results" --args-json '{"q":"widgets"}' --allow-unhinted-auto-pick
+run "google search results"
+refused: candidates span multiple backends with no capability preference (scraperapi, brightdata); use --allow-unhinted-auto-pick to pick the top-ranked one, or call a specific tool
+--allow-unhinted-auto-pick set: promoting scraperapi_serp (scraperapi.serp, GET /serp, per_call) — Google SERP
+attempts:
+  1. scraperapi_serp (scraperapi) [success] billed=true httpStatus=200 — 200 response
+...
+```
+
+Both exit `2` without the flag and `0` with it — identically to the generic
+case, which is the point: a non-discriminating hint and no hint at all are
+handled by the exact same rule.
 
 Verified async exclusion, the hint `run` prints, and the intent-word override:
 
@@ -614,28 +960,35 @@ possible shapes, and a consumer must handle both:
 
 1. **A failure that never reached the engine** (bad usage, no credentials,
    catalog unreachable, `schema` naming a tool that isn't in the catalog,
-   schema validation failed, or `--version` couldn't read its own version):
+   schema validation failed, `--version` couldn't read its own version, or
+   `call`/`run` refusing a deny-listed backend by name):
 
    ```json
    {"error": {"kind": "...", "message": "..."}}
    ```
 
-   `kind` is a **closed set of seven values** (from `src/engine/render.ts`'s
+   `kind` is a **closed set of eight values** (from `src/engine/render.ts`'s
    `CliErrorKind`, stable — values may be added in the future but never
    renamed or repurposed): `usage`, `credentials-not-configured`,
    `catalog-unavailable`, `tool-not-found`, `invalid-args`, `invalid-body`,
-   `version-unavailable`.
+   `version-unavailable`, `backend-excluded`.
 
-2. **A `call`/`run` that reached the engine** — even if the outcome was a
-   retry give-up, an abort, or a run refusal — emits its **full attempt-log
-   report** instead of an error envelope, because that document carries
-   strictly more information (the attempt log and what was billed). Look for
-   an `attempts` array and an `outcome`/`result` field, not an `error` key.
-   **This includes `call <tool>` where `<tool>` is not in the catalog**: `call`
-   synthesizes the one-entry attempt log `run` would have produced rather than
-   emitting a `tool-not-found` envelope, so the marker to test is
-   `resolved: false`, not `error`. Only `schema <tool>` produces the
+2. **A `call`/`run`/`web-search`/`scrape`/`crawl` that reached the engine** —
+   even if the outcome was a retry give-up, an abort, a run refusal, or a
+   one-step walk that never found a provider to serve it — emits its **full
+   attempt-log report** instead of an error envelope, because that document
+   carries strictly more information (the attempt log and what was billed).
+   Look for an `attempts` array and an `outcome`/`result` field, not an
+   `error` key. **This includes `call <tool>` where `<tool>` is not in the
+   catalog**: `call` synthesizes the one-entry attempt log `run` would have
+   produced rather than emitting a `tool-not-found` envelope, so the marker to
+   test is `resolved: false`, not `error`. Only `schema <tool>` produces the
    `tool-not-found` envelope (`src/cli.ts`'s `cmdSchema` vs. `cmdCall`).
+   **`backend-excluded` is the one exception in the other direction**: a
+   `call`/`run` that resolves to a deny-listed backend refuses BEFORE calling
+   anything, exactly like `tool-not-found`, so it is shape 1 above even though
+   `call`/`run` are otherwise shape-2 commands — see ["Deny-listed
+   backends"](#deny-listed-backends-falai-alpaca).
 
 The human-readable message always goes to **stderr**, in both cases, and the
 exit code does not change based on `--json`.
@@ -689,6 +1042,21 @@ $ node dist/fezoctl.mjs schema nope_tool --json
 }
 ```
 
+Verified — `call` naming a deny-listed backend's tool by its exact name. The
+tool genuinely exists in the live catalog (unlike the `nope_tool` case
+above), but `fezoctl` refuses to reach it regardless — shape 1, not shape 2,
+because no request is ever sent:
+
+```
+$ node dist/fezoctl.mjs call falai_generate --args-json '{"prompt":"a cat"}' --json
+{
+  "error": {
+    "kind": "backend-excluded",
+    "message": "backend \"falai\" is excluded (FEZO_EXCLUDED_BACKENDS); \"falai_generate\" cannot be called"
+  }
+}
+```
+
 [^help-json]: `fezoctl --help --json` (or `-h` anywhere in argv alongside
     `--json`) prints the **help text** on stdout and exits `0` — help is
     resolved before argv is parsed into a command, and it has no JSON form.
@@ -720,7 +1088,7 @@ can see exactly how far configuration and connectivity got:
 | `gateway-connectivity` | Whether the gateway responded at all to a catalog fetch. |
 | `auth` | Whether the gateway accepted the API key (distinguished from connectivity by a 401/403 status specifically). |
 | `catalog-readable` | Whether the response body actually parsed as a catalog document. |
-| `preference-hints` | Whether every backend named in the provider-preference tables is actually present in the live catalog (a `warn`, not a `fail` — a hint naming an absent backend just means that hint currently does nothing). |
+| `preference-hints` | Whether every backend AND declared entry method in `src/engine/providers.ts`'s `RECOMMENDATIONS` (all seven intents) is actually present in the live catalog (a `warn`, not a `fail` — a declared row naming a backend/method this gateway does not expose just means that row currently contributes no ranking signal). |
 
 **Known limitation: `doctor` probes connectivity via `GET /v1/catalog`, which
 requires authentication.** That means it cannot cleanly separate "the gateway
@@ -736,10 +1104,10 @@ unauthenticated `/healthz`; `fezoctl` does not call it today.)
 
 A check that has structured data to report also prints it as a
 pretty-printed `details` block on the line below — the resolved URL in full,
-the API key **masked** (never the raw key), and `preference-hints`' list of
-absent backends. Only the first line of that block carries the indent the
-renderer adds, so it looks ragged; that is the literal output, not a
-transcription slip.
+the API key **masked** (never the raw key), and `preference-hints`'
+`missingBackends`/`missingEntryMethods` lists. Only the first line of that
+block carries the indent the renderer adds, so it looks ragged; that is the
+literal output, not a transcription slip.
 
 Verified — a stored key that the gateway's `/v1/catalog` rejects with 401
 (run against a local test gateway with an isolated `HOME`, hence the

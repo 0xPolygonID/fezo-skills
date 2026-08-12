@@ -1,0 +1,5 @@
+{
+  "web-search": "Search the live web and get ranked results in one call. Picks the best-value provider for \"search\" and falls back down the ranking on a blocked target or a rate limit.",
+  "scrape": "Fetch and extract the contents of one known URL in a single call. Picks the best-value provider for \"scrape\" and falls back down the ranking on a block or a rate limit.",
+  "crawl": "Discover and collect many pages from one site in a single call. Picks the best-value provider for \"crawl\" and falls back down the ranking on a block or a rate limit."
+}

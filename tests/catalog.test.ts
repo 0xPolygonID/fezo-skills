@@ -201,6 +201,23 @@ describe('normalizeCatalog', () => {
     expect(googleSearch?.backendInfoText).not.toContain('2.1.0');
   });
 
+  it('carries backend.info.categories on the candidate as backendCategories, absent from backendInfoText', () => {
+    const candidates = normalizeCatalog(wellFormedCatalog);
+    const googleSearch = candidates.find((c) => c.method === 'google_search');
+    // The fixture's `info.categories` is ['Search & crawl'] (see wellFormedCatalog above).
+    expect(googleSearch?.backendCategories).toEqual(['Search & crawl']);
+    // backendInfoText's contents are fixed to title/summary/description only
+    // (see the earlier test); a category name must never leak into it.
+    expect(googleSearch?.backendInfoText).not.toContain('Search & crawl');
+  });
+
+  it('defaults backendCategories to [] when the catalog declares no categories', () => {
+    const candidates = normalizeCatalog({
+      backends: [{ backend_id: 'noinfo', methods: [{ name: 'm' }] }],
+    });
+    expect(candidates[0]?.backendCategories).toEqual([]);
+  });
+
   it('includes info.description in backendInfoText and omits absent parts without leaving separators', () => {
     const candidates = normalizeCatalog({
       backends: [

@@ -276,6 +276,38 @@ export interface AttemptLog {
    * exactly why this field cannot be derived from `status` alone.
    */
   billed: boolean;
+  /**
+   * Present iff this attempt was rejected LOCALLY, before any request was
+   * issued -- and which of the two local checks rejected it:
+   *
+   *   - `'schema'`: the arguments failed this candidate's own `input_schema`.
+   *     Caller-fixable: a different argument value would get past it.
+   *   - `'binding'`: `bindArgs` refused to build a request (a missing path/
+   *     query/header/body value this candidate's manifest requires, or a
+   *     disallowed header). NOT caller-fixable in the general case: the
+   *     candidate needs a value the caller was never asked for.
+   *
+   * Absent means a request actually went out (so the attempt may be billed) --
+   * for any log THIS module built. cli.ts's `unresolvedToolReport` synthesizes
+   * an attempt for a tool that is not in the catalog at all, which issued no
+   * request and carries no `preflight` either: it never went through
+   * `attemptCandidate`, and there was no candidate to run a local check
+   * against. That path is never reached by one-step.ts (a walk is built only
+   * from catalog candidates), so the field stays a safe test for "was this a
+   * real network call" for the consumer that asks.
+   *
+   * This distinction is carried as a FIELD rather than left to be recovered
+   * from `reason`, because both cases share one `MechanicalFailure` kind
+   * (`invalid-arguments`) and therefore one reason prefix -- deliberately, see
+   * `classifyFailure`. A consumer that needs to tell "your arguments are
+   * wrong" from "this provider's manifest could not take them" (one-step.ts's
+   * `argRejected` is the one in this repo) must not re-derive it by matching
+   * that prose: the string is worded to prevent exactly that misreading, and a
+   * future rewording would silently flip the consumer's answer with no test
+   * failing. `preflight` is also the honest test for "was this attempt a real
+   * network call", which is otherwise the same prose match.
+   */
+  preflight?: 'schema' | 'binding';
 }
 
 function buildLog(
@@ -285,6 +317,7 @@ function buildLog(
   billed: boolean,
   httpStatus?: number,
   gatewayCode?: string,
+  preflight?: AttemptLog['preflight'],
 ): AttemptLog {
   return {
     tool: candidate.tool,
@@ -294,6 +327,7 @@ function buildLog(
     billed,
     ...(httpStatus !== undefined ? { httpStatus } : {}),
     ...(gatewayCode !== undefined ? { gatewayCode } : {}),
+    ...(preflight !== undefined ? { preflight } : {}),
   };
 }
 
@@ -337,8 +371,30 @@ export interface RunOptions {
    * misuse unrepresentable is Task 8's job, not this module's.)
    */
   candidates: readonly ToolCandidate[];
-  /** Parsed `--args-json` value, tried against every candidate in turn. */
+  /**
+   * Parsed `--args-json` value, tried against every candidate in turn.
+   *
+   * This is the FALLBACK: when `argsFor` (below) is absent, every candidate is
+   * called with this exact value and behavior is exactly what it was before
+   * `argsFor` existed -- `call`/`run` (Task 8) never pass `argsFor` and are
+   * therefore untouched by its addition. `args` stays required (rather than
+   * becoming optional once `argsFor` exists) so those two existing callers need
+   * no change at all, and so a caller that forgets to pass `argsFor` still gets
+   * a well-defined, single-argument-object run instead of `undefined` reaching
+   * `callTool`.
+   */
   args: unknown;
+  /**
+   * Per-candidate arguments, for one-step.ts's ranked walk (search/scrape/crawl):
+   * each provider names the same single input differently (`query` vs `q` vs
+   * `keyword`), so one shared `args` object cannot serve a walk across several
+   * providers the way it can for `call`/`run`, which always target one
+   * already-resolved tool or one already-selected candidate list that agreed on
+   * argument names via `selectForRun`'s search match. When present, this
+   * REPLACES `args` for every candidate (`args` is not merged with it); when
+   * absent, `args` alone governs, exactly as before this field existed.
+   */
+  argsFor?: (candidate: ToolCandidate) => unknown;
   /** Parsed `--body-json` value, if the caller supplied one; see bindings.ts's body-source rule. */
   bodyJson?: unknown;
   /**
@@ -366,6 +422,25 @@ export interface RunOptions {
   retryEmpty2xx?: boolean;
   /** Injectable for tests; defaults to the global fetch. */
   fetchFn?: typeof fetch;
+  /**
+   * A wall-clock budget for the WHOLE walk, checked only before starting a new
+   * attempt -- never mid-attempt, and never before the first (a slow catalog
+   * fetch must not make `run` return "gave up" without ever having called
+   * anyone). Absent means no deadline, exactly today's behavior.
+   *
+   * Ported from mcp-server's one_step.ts `WALK_DEADLINE_MS` reasoning:
+   * attempts are sequential, so without a deadline several slow candidates can
+   * outlast the CALLER's own timeout -- and a client-side timeout at that point
+   * returns nothing, discarding a lower-ranked result this run had already paid
+   * for. On expiry, `run` stops starting new attempts and reports what it has;
+   * it never aborts an attempt already in flight, because doing so would throw
+   * away a response that may already have been billed.
+   *
+   * `clock` is a test seam (defaults to `Date.now`) so a test can advance
+   * fake time without sleeping or shrinking the real production budget; every
+   * production caller (one-step.ts) passes only `ms` and takes the default.
+   */
+  deadline?: { clock?: () => number; ms: number };
 }
 
 /** What `run` decided about the whole attempt sequence, once it stopped. */
@@ -378,6 +453,20 @@ export interface RunReport {
   outcome: RunOutcome;
   /** Every candidate actually attempted, in order, each with its own classification. */
   attempts: AttemptLog[];
+  /**
+   * Set only when a CAP -- not a per-candidate abort/give_up, and not simply
+   * running out of candidates -- is what stopped the walk while candidates
+   * remained untried: `maxAttempts` was reached (`'max-attempts'`) or
+   * `deadline` expired (`'deadline'`). Absent for every other ending,
+   * including the two existing `give_up` reasons this field does not change
+   * ("no more candidates to try", the all-preflight-skip summary).
+   *
+   * Exists because `outcome.reason`'s prose already says a cap was hit, but a
+   * caller rendering the human/`--json` output needs a stable field to key on
+   * rather than parsing that sentence -- "it failed" and "we stopped paying to
+   * find out" must not look identical in a document a caller scripts against.
+   */
+  stoppedBy?: 'max-attempts' | 'deadline';
 }
 
 /** True when `bodyText`, once trimmed, is empty -- the only "empty response" test this module makes. */
@@ -453,7 +542,7 @@ async function attemptCandidate(
     };
     const classified = classifyFailure(failure);
     return {
-      log: buildLog(candidate, classified.decision, classified.reason, false),
+      log: buildLog(candidate, classified.decision, classified.reason, false, undefined, undefined, 'schema'),
       preflightFailure: true,
     };
   }
@@ -511,6 +600,11 @@ async function attemptCandidate(
     // client.ts to report whether a response status was received at all, which
     // is out of scope here. Read an attempt log accordingly: a `transport`
     // failure with `billed: false` MAY still correspond to a charge.
+    // An `invalid-arguments` reaching THIS catch can only have come from a
+    // `BindingError` (`classifyThrown` is the only producer, and schema
+    // validation above returns before the try block) -- so it is the
+    // `'binding'` half of `preflight`, never the `'schema'` half.
+    const preflight = failure.kind === 'invalid-arguments' ? 'binding' : undefined;
     return {
       log: buildLog(
         candidate,
@@ -519,8 +613,9 @@ async function attemptCandidate(
         false,
         classified.httpStatus,
         classified.gatewayCode,
+        preflight,
       ),
-      preflightFailure: failure.kind === 'invalid-arguments',
+      preflightFailure: preflight !== undefined,
     };
   }
 }
@@ -578,6 +673,7 @@ export async function run(options: RunOptions): Promise<RunReport> {
   }
 
   let attemptBudgetExhausted = false;
+  let deadlineExceeded = false;
   // Counts only attempts that actually issued a request -- i.e. the ones that
   // could have been billed. See `RunOptions.maxAttempts`.
   let callsMade = 0;
@@ -585,13 +681,42 @@ export async function run(options: RunOptions): Promise<RunReport> {
   // One cache for the whole run: two candidates may share an `inputSchema`
   // object, and a retried candidate must not recompile its own.
   const validators = new SchemaValidatorCache();
+  // Captured once, before the loop, so every deadline check compares against
+  // the SAME instant rather than a moving target. `undefined` when the caller
+  // passed no `deadline` -- the check below is skipped entirely in that case,
+  // which is what makes this option additive (no `deadline` -> no new
+  // behavior at all). See `RunOptions.deadline`.
+  const clock = options.deadline?.clock ?? Date.now;
+  const deadlineAt = options.deadline !== undefined ? clock() + options.deadline.ms : undefined;
+
   for (const candidate of options.candidates) {
     if (callsMade >= maxAttempts) {
       attemptBudgetExhausted = true;
       break;
     }
+    // Never checked before the first attempt (`attempts.length === 0`): a slow
+    // catalog fetch or a slow caller must not make the very first candidate's
+    // attempt itself subject to the deadline -- see `RunOptions.deadline`.
+    if (attempts.length > 0 && deadlineAt !== undefined && clock() >= deadlineAt) {
+      deadlineExceeded = true;
+      break;
+    }
 
-    const { log, result, preflightFailure } = await attemptCandidate(candidate, options, retryEmpty2xx, validators);
+    // Per-candidate args when the caller supplied `argsFor` (one-step.ts's
+    // ranked walk); `options.args` otherwise -- see `RunOptions.argsFor`'s doc
+    // comment for why one shared `args` object cannot serve every candidate in
+    // that walk. Building a narrowed options object here (rather than
+    // `{...options, args: candidateArgs}`) keeps `attemptCandidate`'s
+    // signature exactly what it was before this field existed.
+    const candidateArgs = options.argsFor ? options.argsFor(candidate) : options.args;
+    const attemptOptions: Pick<RunOptions, 'baseUrl' | 'apiKey' | 'args' | 'bodyJson' | 'fetchFn'> = {
+      baseUrl: options.baseUrl,
+      apiKey: options.apiKey,
+      args: candidateArgs,
+      ...(options.bodyJson !== undefined ? { bodyJson: options.bodyJson } : {}),
+      ...(options.fetchFn !== undefined ? { fetchFn: options.fetchFn } : {}),
+    };
+    const { log, result, preflightFailure } = await attemptCandidate(candidate, attemptOptions, retryEmpty2xx, validators);
     attempts.push(log);
     if (preflightFailure) {
       preflightSkips += 1;
@@ -619,12 +744,34 @@ export async function run(options: RunOptions): Promise<RunReport> {
   // Every attempted candidate refused the arguments locally, so no request was
   // ever sent: say so, instead of implying the run ran out of providers to try.
   // (Unreachable via the budget branch by construction -- a pre-flight skip
-  // never decrements the budget -- but tested independently of that reasoning.)
+  // never decrements the budget -- but tested independently of that reasoning.
+  // Reachable together with `deadlineExceeded`, though: a deadline is wall-clock
+  // time, not request count, so a very short one can still expire while every
+  // attempt made so far was an instant local skip. The preflight-skip summary
+  // still wins in that case -- it is the more actionable diagnostic either way.)
   const everyAttemptWasAPreflightSkip = attempts.length > 0 && preflightSkips === attempts.length;
   const reason = everyAttemptWasAPreflightSkip
     ? `no candidate accepted the supplied arguments: all ${attempts.length} candidate(s) rejected them before any request was sent (see the attempt log for each candidate's reason)`
-    : attemptBudgetExhausted
-      ? `max attempts (${maxAttempts}) reached with candidates remaining`
-      : 'no more candidates to try';
-  return { outcome: { kind: 'give_up', reason }, attempts };
+    : deadlineExceeded
+      ? `wall-clock deadline (${String(options.deadline?.ms)}ms) reached with candidates remaining`
+      : attemptBudgetExhausted
+        ? `max attempts (${maxAttempts}) reached with candidates remaining`
+        : 'no more candidates to try';
+  // Independent of `reason`'s wording/precedence above: `stoppedBy` reports
+  // WHICH cap actually cut the loop short, even on the preflight-skip
+  // sentence, because "a cap was reached" and "nothing was ever callable" are
+  // both true statements a caller may want to distinguish. A typed local
+  // (rather than an inline `'deadline' as const`/`'max-attempts' as const` in
+  // the returned object) is what lets this stay assertion-free: TypeScript
+  // widens a bare string literal in an object-literal position, but not one
+  // assigned to an already-narrowly-typed `let`.
+  let stoppedBy: RunReport['stoppedBy'];
+  if (deadlineExceeded) stoppedBy = 'deadline';
+  else if (attemptBudgetExhausted) stoppedBy = 'max-attempts';
+
+  return {
+    outcome: { kind: 'give_up', reason },
+    attempts,
+    ...(stoppedBy !== undefined ? { stoppedBy } : {}),
+  };
 }
