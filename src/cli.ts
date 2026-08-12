@@ -412,13 +412,22 @@ Usage:
   fezoctl providers [--intent <intent>] [--detail names|descriptions|schema]
                      [--limit N] [--explain] [--json]
   fezoctl list-providers [--json]
-  fezoctl setup --key-stdin [--url <url>] [--storage keychain|dotenv] [--json]
+  fezoctl setup [--url <url>] [--storage keychain|dotenv] [--json]
   fezoctl doctor [--json]
   fezoctl --version
   fezoctl --help
 
-Credentials are never accepted as a command-line argument: setup --key-stdin
-reads the API key from stdin. Otherwise, set FEZO_URL and FEZO_API_KEY.
+setup takes one thing: the API key, on stdin.
+
+  printf '%s' "$YOUR_KEY" | fezoctl setup
+
+Everything else has a default. --storage defaults to dotenv
+(~/.config/fezo/.env, mode 0600); --url defaults to the built-in gateway, so
+pass it only to point somewhere else. --key-stdin is still accepted but is no
+longer needed — stdin is the only channel setup reads a key from, and there is
+no flag, argument, or prompt that accepts one, because a key in argv is
+readable by any local process via ps and lands in the shell history.
+Otherwise, set FEZO_URL and FEZO_API_KEY.
 
 providers/list-providers surface the declared, per-intent provider ranking
 (src/engine/providers.ts) instead of catalog/registration order: intents are
@@ -550,7 +559,7 @@ function requireCredentials(deps: CliDeps, emit: Emit): ResolvedGateway | undefi
     emitFailure(
       emit,
       'credentials-not-configured',
-      'the API key is not configured; run `fezoctl setup --key-stdin` or set FEZO_API_KEY',
+      'the API key is not configured; run `printf \'%s\' "$YOUR_KEY" | fezoctl setup` or set FEZO_API_KEY',
     );
     return undefined;
   }
@@ -1141,11 +1150,44 @@ function verifyStoredField(
   };
 }
 
+/**
+ * Whether `stream` is an interactive terminal, which `cmdSetup` warns about
+ * before it blocks on a read that prints no prompt of its own.
+ *
+ * `isTTY` is a property Node sets on `process.stdin` only; an injected
+ * `Readable` (every test, and any programmatic caller) simply does not have
+ * it, so this is `false` there without needing a separate code path.
+ */
+function isInteractiveStream(stream: Readable): boolean {
+  return 'isTTY' in stream && Boolean(Reflect.get(stream, 'isTTY'));
+}
+
 async function cmdSetup(flags: Flags, deps: CliDeps, emit: Emit): Promise<number> {
-  if (!flags.keyStdin) {
-    emitUsageError(emit, 'setup', 'requires --key-stdin (the API key is read from stdin; it must never be passed as a command-line argument)');
+  // `--key-stdin` is accepted but no longer required: stdin is the ONLY channel
+  // this command has ever read a key from, so demanding a flag to say so made
+  // the caller restate the only possibility. Dropping the requirement opens no
+  // new path for a key -- there is still no flag, argument, or prompt that
+  // accepts one, which is the property the threat model actually depends on
+  // (see credentials.ts's header). The flag stays valid so that every recipe
+  // already in circulation, including installed copies of SKILL.md, keeps
+  // working unchanged.
+  // A bare positional is almost certainly the key itself: "setup takes only the
+  // API key" invites exactly `fezoctl setup sk-live-...`, which is the one form
+  // this command must never make work. Silently ignoring it (what an unread
+  // `positionals` array amounts to) would fail with "no API key was provided"
+  // while the key sat in the user's shell history and in `ps` output for the
+  // life of the process -- a confusing failure AND a leak. Refuse, and say what
+  // to do about the value that has already leaked.
+  if (flags.positionals.length > 0) {
+    emitUsageError(
+      emit,
+      'setup',
+      'takes no positional arguments; the API key is read from stdin, never from argv (any local process can read argv via `ps`, and your shell has already recorded that line). ' +
+        'Run `printf \'%s\' "$YOUR_KEY" | fezoctl setup` instead — and if what you just typed was a live key, rotate it.',
+    );
     return EXIT_USAGE;
   }
+
   const storage = flags.storage ?? 'dotenv';
   if (storage !== 'dotenv' && storage !== 'keychain') {
     emitUsageError(emit, 'setup', '--storage must be "dotenv" or "keychain"');
@@ -1153,6 +1195,14 @@ async function cmdSetup(flags: Flags, deps: CliDeps, emit: Emit): Promise<number
   }
 
   const stdin = deps.stdin ?? process.stdin;
+  // The read below prints nothing and blocks until EOF. When `--key-stdin` was
+  // mandatory, a bare `fezoctl setup` at least failed loudly with a usage
+  // error; now it would sit there looking hung, with no way for the user to
+  // know it wants input. One line to stderr (never stdout, which stays
+  // machine-readable) is the difference between "hung" and "waiting for you".
+  if (isInteractiveStream(stdin)) {
+    emit.err('fezoctl: reading the API key from stdin — paste it, press Enter, then Ctrl-D. It WILL be visible on screen; pipe the key in instead to avoid that.\n');
+  }
   const apiKey = await readSecretFromStream(stdin);
 
   const stored = storeCredentials({

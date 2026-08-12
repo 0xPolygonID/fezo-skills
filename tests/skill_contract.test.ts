@@ -291,8 +291,8 @@ describe('skills/fezo/SKILL.md generated content', () => {
     expect(skillMdFlat).toContain('writes it into the shell history file');
   });
 
-  it('gives the correct third move: the user runs setup --key-stdin themselves', () => {
-    expect(skillMdFlat).toContain('stop and ask the user to run `setup --key-stdin` themselves, in their own terminal');
+  it('gives the correct third move: the user runs setup themselves', () => {
+    expect(skillMdFlat).toContain('stop and ask the user to run `setup` themselves, in their own terminal');
     expect(skillMd).toContain('it never reaches the conversation or an argv');
   });
 
@@ -314,14 +314,14 @@ describe('skills/fezo/SKILL.md generated content', () => {
   // exact pre-fix strings so neither wrong mechanism can come back.
   // -------------------------------------------------------------------------
 
-  it('says setup --key-stdin prints no prompt, and gives a form that works in a real terminal', () => {
-    expect(skillMd).toContain('`setup --key-stdin` **prints no prompt of any kind**');
+  it('says setup prints no prompt, and gives a form that works in a real terminal', () => {
+    expect(skillMd).toContain('`setup` **prints no prompt of any kind**');
     expect(skillMdFlat).toContain('Never tell the user to "paste the key at its prompt": there is no prompt');
     // The verified, non-echoing one-liner: prompt from the shell, key read with
     // `read -rs`, handed over through a builtin `printf` pipe so it is in
     // neither an argv nor the history line.
     expect(skillMd).toContain(
-      `printf 'Fezo API key: '; read -rs KEY; echo; printf '%s' "$KEY" | node /absolute/path/to/fezoctl.mjs setup --key-stdin --url https://gateway.example.com; unset KEY`,
+      `printf 'Fezo API key: '; read -rs KEY; echo; printf '%s' "$KEY" | node /absolute/path/to/fezoctl.mjs setup; unset KEY`,
     );
     expect(skillMdFlat).toContain('`printf` is a shell builtin in bash and zsh, so no separate process is spawned');
     // ...and it must say WHY that pipe is not the second bullet's forbidden
@@ -330,7 +330,7 @@ describe('skills/fezo/SKILL.md generated content', () => {
     expect(skillMdFlat).toContain('This is not the forbidden form from the second bullet: the key never appears as a literal anywhere');
     expect(skillMdFlat).toContain('The forbidden thing is a command in which YOU have written the key out');
     // ...and the bare form documented with the EOF step it actually needs.
-    expect(skillMdFlat).toContain('nothing is printed, so type or paste the key, press Enter, then press Ctrl-D');
+    expect(skillMdFlat).toContain('type or paste the key, press Enter, then press Ctrl-D');
     // The pre-fix promise of a prompt must be gone.
     expect(skillMdFlat).not.toContain('they paste the key at its prompt');
   });
@@ -343,20 +343,20 @@ describe('skills/fezo/SKILL.md generated content', () => {
     // The exact pre-fix instruction and its command line, both of which were
     // verified to fail with exit 2, must not reappear.
     expect(skillMd).not.toContain('typing `!` followed by the command');
-    expect(skillMd).not.toContain('! node /absolute/path/to/fezoctl.mjs setup --key-stdin --url https://gateway.example.com');
+    expect(skillMd).not.toContain('! node /absolute/path/to/fezoctl.mjs setup');
   });
 
   // The failure output SKILL.md quotes for that case is labelled "verified", so
   // pin it to what the engine actually prints rather than to a transcript
   // somebody pasted once. Stale-but-labelled-verified output is the exact defect
   // this pass exists to fix, in the file a model reads.
-  it('the failure output it quotes for the `!` case is what setup --key-stdin actually prints on an empty stdin', async () => {
+  it('the failure output it quotes for the `!` case is what setup actually prints on an empty stdin', async () => {
     const quoted = skillMd.match(/The whole output, verified:\n\n```\n([\s\S]*?)\n```\n/);
     expect(quoted?.[1], 'SKILL.md must quote the verified failure output in a fenced block').toBeTypeOf('string');
 
     const dir = mkdtempSync(join(tmpdir(), 'fezoctl-skillmd-nokey-'));
     try {
-      const result = await runCli(['setup', '--key-stdin', '--url', 'https://gateway.example.com'], {
+      const result = await runCli(['setup'], {
         // An empty stream is exactly what a `!` command's non-interactive stdin
         // delivers: readable, immediately at EOF.
         stdin: Readable.from([]),
@@ -371,7 +371,7 @@ describe('skills/fezo/SKILL.md generated content', () => {
     }
   });
 
-  it('ranks setup --key-stdin above an exported FEZO_API_KEY, with the reason', () => {
+  it('ranks setup above an exported FEZO_API_KEY, with the reason', () => {
     expect(skillMdFlat).toContain('An exported `FEZO_API_KEY` is **not** a shortcut around that');
     expect(skillMdFlat).toContain('invisible to this already-running session');
     expect(skillMdFlat).toContain('takes effect immediately, which is why it is the option to offer first');
@@ -383,14 +383,29 @@ describe('skills/fezo/SKILL.md generated content', () => {
     expect(skillMdFlat).toContain('Neither is a secret; the API key is the only value that is');
   });
 
-  // C1: the recipe the model follows must produce a USABLE configuration. With
-  // a built-in gateway URL, `--url` is no longer what decides that -- the key
-  // is -- so what the recipe has to say is which of the two is load-bearing.
-  it('the setup recipe shows --url, and says what is and is not optional', () => {
-    expect(skillMd).toContain('"${FEZOCTL_ARGV[@]}" setup --key-stdin --url <gateway url>');
-    expect(skillMd).toContain('`--url` is optional');
+  // C1: the recipe the model follows must produce a USABLE configuration. Every
+  // flag now has a default, so the recipe is the bare command -- and what the
+  // file has to say is which single input is still load-bearing.
+  it('the setup recipe is the bare command, and says what is and is not optional', () => {
+    expect(skillMd).toContain('"${FEZOCTL_ARGV[@]}" setup\n');
+    expect(skillMdFlat).toContain('Every flag is optional');
     expect(skillMdFlat).toContain('What is NOT optional is the key');
     expect(skillMdFlat).toContain('exits non-zero');
+  });
+
+  // The one form that must never work, and the one the request "setup should
+  // take only the API key" most invites someone to try.
+  it('forbids passing the key as an argument, and says to rotate one already typed', () => {
+    expect(skillMdFlat).toContain('**Never write the key as an argument.**');
+    expect(skillMdFlat).toContain('A `setup <key>` form is refused outright (exit 1)');
+    expect(skillMdFlat).toContain('tell them to rotate the key');
+  });
+
+  // Defaults are only a simplification if the file says they exist; otherwise
+  // the model keeps passing flags it does not need.
+  it('states that setup takes one input and everything else defaults', () => {
+    expect(skillMdFlat).toContain('`setup` takes exactly one input, the API key, and reads it from **stdin**');
+    expect(skillMdFlat).toContain('do not add flags the user does not need');
   });
 
   // The skill must not send the model hunting for a gateway URL that already
@@ -417,7 +432,7 @@ describe('skills/fezo/SKILL.md generated content', () => {
     // 5 resolve to a path, `node <path>`, or `npx ...`, so a bare
     // `fezoctl setup --key-stdin` in the instructions is a command not found
     // for the common cases.
-    expect(skillMd).toContain('"${FEZOCTL_ARGV[@]}" setup --key-stdin');
+    expect(skillMd).toContain('"${FEZOCTL_ARGV[@]}" setup');
     // No prose or example anywhere tells the agent to run a bare `fezoctl <cmd>`.
     // The invocation script's own comments legitimately discuss the literal
     // `fezoctl` binary and `fezoctl --version`, so comment lines are excluded.

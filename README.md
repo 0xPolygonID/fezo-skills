@@ -78,7 +78,7 @@ once, yourself, after installing by any route (see
 [`CONFIGURATION.md`](CONFIGURATION.md) for the full story):
 
 ```bash
-printf '%s' "$YOUR_FEZO_API_KEY" | node ~/.agents/skills/fezo/scripts/fezoctl.mjs setup --key-stdin
+printf '%s' "$YOUR_FEZO_API_KEY" | node ~/.agents/skills/fezo/scripts/fezoctl.mjs setup
 node ~/.agents/skills/fezo/scripts/fezoctl.mjs doctor
 ```
 
@@ -165,8 +165,8 @@ in that container, and none is under your control:
 3. **Credentials** — there is no way to inject `FEZO_API_KEY` into that
    container, and `~/.config/fezo/.env` does not persist between sessions, so
    `setup` has to be re-run each session. That means the key passes through the
-   conversation, which is exactly what `--key-stdin` exists to avoid
-   everywhere else.
+   conversation, which is exactly what the stdin-only key channel exists to
+   avoid everywhere else.
 
 Run `doctor` first; it names which of the three failed. Until egress and a
 credential path are settled, treat this lane as unsupported rather than
@@ -238,7 +238,7 @@ node dist/fezoctl.mjs --help
 # Configure the API key once — the gateway URL defaults to
 # https://zug-gateway.internal-iden3-dev.com, so --url is only for a different
 # gateway (see CONFIGURATION.md for the full story):
-printf '%s' "$YOUR_FEZO_API_KEY" | node dist/fezoctl.mjs setup --key-stdin
+printf '%s' "$YOUR_FEZO_API_KEY" | node dist/fezoctl.mjs setup
 
 # Confirm everything is wired up:
 node dist/fezoctl.mjs doctor
@@ -339,7 +339,7 @@ fezoctl catalog [--json]
 fezoctl providers [--intent <intent>] [--detail names|descriptions|schema]
                    [--limit N] [--explain] [--json]
 fezoctl list-providers [--json]
-fezoctl setup --key-stdin [--url <url>] [--storage keychain|dotenv] [--json]
+fezoctl setup [--url <url>] [--storage keychain|dotenv] [--json]
 fezoctl doctor [--json]
 fezoctl --version
 fezoctl --help
@@ -358,7 +358,7 @@ source — run it yourself if this ever looks stale.)
 | `providers [--intent <intent>]` | Surface the declared, per-intent provider ranking, grouped by capability — every group by default, or exactly one with `--intent`. See ["Provider recommendations"](#provider-recommendations). |
 | `list-providers` | One row per live catalog backend, with its declared standing across every intent it appears in. See ["Provider recommendations"](#provider-recommendations). |
 | `catalog` | List every backend and method the gateway currently reports. |
-| `setup --key-stdin` | Store the gateway URL and API key without ever putting the key in argv or a transcript. `--url` is optional — omit it and the gateway stays at the built-in default (`configured url: … (source: default)`), which is a complete configuration. A `setup` that stores no API key is not: it prints `this configuration is NOT usable yet: fezoctl needs an API key.` and exits 2 rather than reporting a success no other command can use. |
+| `setup` | Store the API key (and optionally the gateway URL) without ever putting the key in argv or a transcript. The key is read from stdin — `printf '%s' "$KEY" | fezoctl setup` is the whole command, and a key passed as an argument is refused with exit 1. `--url` is optional — omit it and the gateway stays at the built-in default (`configured url: … (source: default)`), which is a complete configuration. A `setup` that stores no API key is not: it prints `this configuration is NOT usable yet: fezoctl needs an API key.` and exits 2 rather than reporting a success no other command can use. |
 | `doctor` | Diagnose configuration and connectivity — the first thing to run when something is wrong. See ["`doctor`"](#doctor). |
 
 ### Exit codes
@@ -1081,10 +1081,10 @@ default and must not grow one.
 
 See **[CONFIGURATION.md](CONFIGURATION.md)** for the full credential model:
 the resolution order, the security reasoning behind
-`setup --key-stdin`, macOS Keychain details, `.env` file location and
+`setup`, macOS Keychain details, `.env` file location and
 permissions, and **how to rotate a key** —
 which differs between the two storage backends, because a second
-`setup --key-stdin` on the default `dotenv` storage is refused rather than
+`setup` on the default `dotenv` storage is refused rather than
 overwriting the file.
 
 ## `doctor`

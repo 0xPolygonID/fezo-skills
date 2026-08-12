@@ -10750,13 +10750,22 @@ Usage:
   fezoctl providers [--intent <intent>] [--detail names|descriptions|schema]
                      [--limit N] [--explain] [--json]
   fezoctl list-providers [--json]
-  fezoctl setup --key-stdin [--url <url>] [--storage keychain|dotenv] [--json]
+  fezoctl setup [--url <url>] [--storage keychain|dotenv] [--json]
   fezoctl doctor [--json]
   fezoctl --version
   fezoctl --help
 
-Credentials are never accepted as a command-line argument: setup --key-stdin
-reads the API key from stdin. Otherwise, set FEZO_URL and FEZO_API_KEY.
+setup takes one thing: the API key, on stdin.
+
+  printf '%s' "$YOUR_KEY" | fezoctl setup
+
+Everything else has a default. --storage defaults to dotenv
+(~/.config/fezo/.env, mode 0600); --url defaults to the built-in gateway, so
+pass it only to point somewhere else. --key-stdin is still accepted but is no
+longer needed \u2014 stdin is the only channel setup reads a key from, and there is
+no flag, argument, or prompt that accepts one, because a key in argv is
+readable by any local process via ps and lands in the shell history.
+Otherwise, set FEZO_URL and FEZO_API_KEY.
 
 providers/list-providers surface the declared, per-intent provider ranking
 (src/engine/providers.ts) instead of catalog/registration order: intents are
@@ -10855,7 +10864,7 @@ function requireCredentials(deps, emit) {
     emitFailure(
       emit,
       "credentials-not-configured",
-      "the API key is not configured; run `fezoctl setup --key-stdin` or set FEZO_API_KEY"
+      "the API key is not configured; run `printf '%s' \"$YOUR_KEY\" | fezoctl setup` or set FEZO_API_KEY"
     );
     return void 0;
   }
@@ -11196,9 +11205,16 @@ function verifyStoredField(outcome, expectedSource, resolved2, expectedValue) {
     message: "the value could not be read back and verified after storing it; the storage command may have reported success without actually persisting it"
   };
 }
+function isInteractiveStream(stream) {
+  return "isTTY" in stream && Boolean(Reflect.get(stream, "isTTY"));
+}
 async function cmdSetup(flags, deps, emit) {
-  if (!flags.keyStdin) {
-    emitUsageError(emit, "setup", "requires --key-stdin (the API key is read from stdin; it must never be passed as a command-line argument)");
+  if (flags.positionals.length > 0) {
+    emitUsageError(
+      emit,
+      "setup",
+      "takes no positional arguments; the API key is read from stdin, never from argv (any local process can read argv via `ps`, and your shell has already recorded that line). Run `printf '%s' \"$YOUR_KEY\" | fezoctl setup` instead \u2014 and if what you just typed was a live key, rotate it."
+    );
     return EXIT_USAGE;
   }
   const storage = flags.storage ?? "dotenv";
@@ -11207,6 +11223,9 @@ async function cmdSetup(flags, deps, emit) {
     return EXIT_USAGE;
   }
   const stdin = deps.stdin ?? process.stdin;
+  if (isInteractiveStream(stdin)) {
+    emit.err("fezoctl: reading the API key from stdin \u2014 paste it, press Enter, then Ctrl-D. It WILL be visible on screen; pipe the key in instead to avoid that.\n");
+  }
   const apiKey = await readSecretFromStream(stdin);
   const stored = storeCredentials({
     storage,

@@ -24,14 +24,14 @@ boilerplate. Concretely:
 
 - `fezoctl` never has a `--api-key` flag, and never accepts a key as a
   command-line argument anywhere. The only way to hand it a key is
-  `fezoctl setup --key-stdin`, which reads the key from **stdin**.
+  `fezoctl setup`, which reads the key from **stdin**.
 - There is no interactive "ask the agent to collect a key" flow; nothing in
   this CLI is designed to be driven by an `AskUserQuestion`-style prompt for a
   secret. That rule has to be stated where a *model* will read it, not only
   here: `skills/fezo/SKILL.md` (generated from `build/step0.md`) forbids
   collecting the key through `AskUserQuestion` **and** forbids putting it in a
   Bash command the model constructs, and tells the model to stop and have the
-  user run `setup --key-stdin` in their own terminal instead. The gateway URL
+  user run `setup` in their own terminal instead. The gateway URL
   and the storage choice are the only things a modal may collect — neither is
   a secret.
 - Writes to macOS Keychain pipe the secret through the write process's
@@ -80,7 +80,7 @@ either be a live credential committed to the repository or a placeholder that
 turns "you configured nothing" into a 401 from the gateway. A default URL has
 neither property: it is not a secret, and a wrong gateway fails loudly at the
 first catalog fetch. So the only credential `setup` genuinely has to supply is
-the key — `setup --key-stdin` with no `--url` now produces a complete, usable
+the key — `setup` with no `--url` now produces a complete, usable
 configuration and exits `0`.
 
 ## `FEZO_EXCLUDED_BACKENDS` (not a credential)
@@ -213,14 +213,14 @@ FEZO_API_KEY=your-key-here
 FEZO_URL=https://your-gateway.example.com
 ```
 
-`fezoctl setup --key-stdin --storage dotenv` (the default storage) writes
+`fezoctl setup --storage dotenv` (the default storage) writes
 this file for you, atomically, refusing to clobber an existing one — if
 `.env` already exists, `setup` reports that instead of overwriting it
 silently, so you don't lose a credential you didn't intend to replace. That
 refusal is also what makes a second `setup` fail rather than rotate the key;
 see ["Rotating a key"](#rotating-a-key) for what to do instead.
 
-Verified file mode after `setup --key-stdin`:
+Verified file mode after `setup`:
 
 ```
 $ ls -la ~/.config/fezo/
@@ -230,7 +230,7 @@ drwx------  .
 
 ## macOS Keychain
 
-`fezoctl setup --key-stdin --storage keychain` stores the URL and API key as
+`fezoctl setup --storage keychain` stores the URL and API key as
 two Keychain items instead of a file. Both live under the **same fixed
 identifiers**, which are effectively a storage format — do not expect them to
 ever change:
@@ -247,35 +247,49 @@ ever change:
 keychain` is *attempted* and reports an ordinary failure rather than crashing,
 and the default storage, `dotenv`, is what you want.
 
-## `setup --key-stdin` usage
+## `setup` usage
 
-The key is never a command-line argument. Pipe it in:
+`setup` takes one input — the API key, on stdin. Everything else has a default,
+so the whole command is:
 
 ```bash
-# .env storage (default):
-printf '%s' "$YOUR_KEY" | fezoctl setup --key-stdin --url https://your-gateway.example.com
-
-# macOS Keychain storage:
-printf '%s' "$YOUR_KEY" | fezoctl setup --key-stdin --storage keychain --url https://your-gateway.example.com
+printf '%s' "$YOUR_KEY" | fezoctl setup
 ```
 
-**There is no prompt.** `setup --key-stdin` prints nothing before reading; it
-drains standard input to end-of-file and only then reports. So if you run it
-without a pipe, you get a blank line and no instructions: type or paste the key,
-press Enter, then press **Ctrl-D** to signal end-of-file. The key is echoed on
-screen in that form. To type it without echo, and without ever putting it in a
-command line or the history file:
+| Flag | Default | Pass it when |
+| --- | --- | --- |
+| `--storage` | `dotenv` (`~/.config/fezo/.env`, mode 0600) | you want the macOS Keychain: `--storage keychain` |
+| `--url` | the built-in gateway | you are on a different gateway |
+| `--key-stdin` | implied | never — it is accepted for compatibility and says nothing `setup` does not already do |
+
+```bash
+# macOS Keychain storage, custom gateway — both flags optional:
+printf '%s' "$YOUR_KEY" | fezoctl setup --storage keychain --url https://your-gateway.example.com
+```
+
+**The key is never a command-line argument, and cannot be made into one.** No
+flag accepts it, and a positional (`fezoctl setup sk-live-…`) is refused with
+exit `1` rather than quietly ignored — by the time such a command runs, the key
+is already in `ps` output and your shell history. If you have typed one, rotate
+it.
+
+**There is no prompt when reading from a pipe.** `setup` prints nothing before
+reading; it drains standard input to end-of-file and only then reports. Run it
+without a pipe and it detects the terminal and says on stderr that it is
+waiting: type or paste the key, press Enter, then press **Ctrl-D**. The key is
+echoed on screen in that form. To type it without echo, and without ever putting
+it in a command line or the history file:
 
 ```bash
 printf 'Fezo API key: '; read -rs KEY; echo
-printf '%s' "$KEY" | fezoctl setup --key-stdin --url https://your-gateway.example.com
+printf '%s' "$KEY" | fezoctl setup
 unset KEY
 ```
 
 `printf` is a builtin in both bash and zsh, so the key never becomes a separate
 process's argv. Note that this needs a real terminal: with stdin closed or
 redirected from `/dev/null` — an agent's shell, a CI step, a Claude Code `!`
-command — `setup --key-stdin` reads immediate end-of-file, stores nothing, and
+command — `setup` reads immediate end-of-file, stores nothing, and
 exits **2** with `api key: failed (no API key was provided; nothing was
 stored)`.
 
@@ -320,7 +334,7 @@ idempotent, and the URL and the key are two independent Keychain items. `--url`
 really is optional on a re-run:
 
 ```bash
-printf '%s' "$NEW_KEY" | fezoctl setup --key-stdin --storage keychain
+printf '%s' "$NEW_KEY" | fezoctl setup --storage keychain
 ```
 
 The previously stored URL survives, and the new key takes effect immediately.
@@ -331,7 +345,7 @@ means "create, or fail if it already exists", so a second `setup` is refused
 with exit code `2`:
 
 ```
-$ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup --key-stdin
+$ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup
 setup — storage: dotenv
   api key: failed (/Users/you/.config/fezo/.env already exists; refusing to overwrite it)
   configured url: https://your-gateway.example.com (source: dotenv)
@@ -364,7 +378,7 @@ Two ways to rotate a `dotenv`-stored credential:
 
    ```bash
    rm ~/.config/fezo/.env
-   printf '%s' "$NEW_KEY" | fezoctl setup --key-stdin --url https://your-gateway.example.com
+   printf '%s' "$NEW_KEY" | fezoctl setup --url https://your-gateway.example.com
    ```
 
    `setup` writes the whole file, not a patch, so a re-run without `--url`
@@ -376,7 +390,7 @@ Two ways to rotate a `dotenv`-stored credential:
 
    ```
    $ rm ~/.config/fezo/.env
-   $ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup --key-stdin
+   $ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup
    setup — storage: dotenv
      api key: stored
      configured url: https://zug-gateway.internal-iden3-dev.com (source: default)
@@ -418,7 +432,7 @@ write back to prove it. Verified (`FEZO_URL`/`FEZO_API_KEY` exported in the
 shell, `setup` writing to `dotenv`):
 
 ```
-$ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup --key-stdin --url http://localhost:8899
+$ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup --url http://localhost:8899
 setup — storage: dotenv
   api key: stored, but NOT verified — the write reported success but could not be verified: resolution now answers from "env", which takes priority over "dotenv", so the stored value could not be read back. Unset the higher-priority source and re-run `fezoctl doctor` to confirm what was stored.
   url: stored, but NOT verified — the write reported success but could not be verified: resolution now answers from "env", which takes priority over "dotenv", so the stored value could not be read back. Unset the higher-priority source and re-run `fezoctl doctor` to confirm what was stored.

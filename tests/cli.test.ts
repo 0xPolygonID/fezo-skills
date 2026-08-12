@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -2282,10 +2282,79 @@ describe('setup', () => {
     }
   });
 
-  it('requires --key-stdin and never accepts a key via a CLI flag', async () => {
-    const result = await runCli(['setup'], { env: {} });
+  // ---------------------------------------------------------------------------
+  // `setup` takes one input: the key, on stdin. `--key-stdin` used to be
+  // mandatory, which made every caller restate the only channel the command has
+  // ever read from. Dropping the requirement removes a word, not a safeguard --
+  // the property that matters is that NO flag, argument, or prompt accepts a
+  // key, and that is what these pin.
+  // ---------------------------------------------------------------------------
+  it('reads the key from stdin with no flags at all, defaulting to dotenv storage', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-setup-bare-'));
+    try {
+      const dotEnvPath = join(dir, '.env');
+      const result = await runCli(['setup'], {
+        stdin: Readable.from([Buffer.from(`${SECRET}\n`)]),
+        dotEnvPath,
+        env: {},
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('setup — storage: dotenv');
+      expect(result.stdout).toContain('api key: stored');
+      expect(readFileSync(dotEnvPath, 'utf8')).toContain(`FEZO_API_KEY=${SECRET}`);
+      expect(result.stdout).not.toContain(SECRET);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Every recipe in circulation -- including installed copies of SKILL.md that
+  // this repo cannot update -- passes `--key-stdin`. It must stay a no-op, not
+  // become an unknown flag.
+  it('still accepts an explicit --key-stdin, with an identical result', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-setup-explicit-'));
+    try {
+      const dotEnvPath = join(dir, '.env');
+      const result = await runCli(['setup', '--key-stdin'], {
+        stdin: Readable.from([Buffer.from(`${SECRET}\n`)]),
+        dotEnvPath,
+        env: {},
+      });
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(dotEnvPath, 'utf8')).toContain(`FEZO_API_KEY=${SECRET}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('never accepts a key via a CLI flag', async () => {
+    const result = await runCli(['setup', '--api-key', SECRET], { env: {} });
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain('--key-stdin');
+    expect(result.stderr).toContain('unknown flag: --api-key');
+  });
+
+  // The failure mode "setup takes only the API key" invites: typing the key as
+  // an argument. Silently ignoring it would fail with "no API key was provided"
+  // while the key sat in shell history and `ps`.
+  it('refuses a positional argument, and says the leaked value should be rotated', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-setup-positional-'));
+    try {
+      const dotEnvPath = join(dir, '.env');
+      const result = await runCli(['setup', SECRET], {
+        stdin: Readable.from([Buffer.from(`${SECRET}\n`)]),
+        dotEnvPath,
+        env: {},
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('takes no positional arguments');
+      expect(result.stderr).toContain('rotate it');
+      // Refused BEFORE any write -- a key that arrived through argv is never
+      // stored, however convenient that would be.
+      expect(existsSync(dotEnvPath)).toBe(false);
+      expect(result.stderr).not.toContain(SECRET);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

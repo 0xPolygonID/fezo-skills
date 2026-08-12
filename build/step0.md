@@ -92,17 +92,27 @@ are forbidden, and exactly one is correct:
   into stdin. A command line such as `printf '%s' 'sk-live-…' | ...` places
   the key in that process's argv, where any local process can read it with
   `ps`, and writes it into the shell history file.
-- **The one correct move: stop and ask the user to run `setup --key-stdin`
+- **The one correct move: stop and ask the user to run `setup`
   themselves, in their own terminal** — a real interactive terminal, outside
   this agent session — so the key goes straight from their keyboard into the
   engine's stdin and it never reaches the conversation or an argv.
 
 #### The command to hand the user
 
-`setup --key-stdin` **prints no prompt of any kind**. It reads standard input
-to end-of-file and only then reports. Never tell the user to "paste the key at
-its prompt": there is no prompt, and a user who is told to expect one sits in
-front of a blank terminal with nothing to go on.
+`setup` takes exactly one input, the API key, and reads it from **stdin**.
+Everything else defaults: `dotenv` storage, and the built-in gateway URL. So
+the whole command is a pipe into `setup` — do not add flags the user does not
+need.
+
+**Never write the key as an argument.** A `setup <key>` form is refused
+outright (exit 1), because by the time it runs the key is already in `ps`
+output and the shell history. If a user reports having typed that, tell them to
+rotate the key.
+
+When reading from a pipe, `setup` **prints no prompt of any kind**. It reads
+standard input to end-of-file and only then reports. Never tell the user to
+"paste the key at its prompt": there is no prompt, and a user who is told to
+expect one sits in front of a blank terminal with nothing to go on.
 
 Hand them this one-liner, which supplies its own prompt, does not echo the key
 as they type it, and still keeps the key out of both argv and the shell history
@@ -110,34 +120,34 @@ as they type it, and still keeps the key out of both argv and the shell history
 for it, and the history line holds `"$KEY"`, not the secret):
 
 ```
-printf 'Fezo API key: '; read -rs KEY; echo; printf '%s' "$KEY" | node /absolute/path/to/fezoctl.mjs setup --key-stdin --url https://gateway.example.com; unset KEY
+printf 'Fezo API key: '; read -rs KEY; echo; printf '%s' "$KEY" | node /absolute/path/to/fezoctl.mjs setup; unset KEY
 ```
 
 Substitute the invocation step 0 resolved for `node
-/absolute/path/to/fezoctl.mjs`, and the real gateway URL for the example one.
-Add `--storage keychain` if the user chose Keychain storage.
+/absolute/path/to/fezoctl.mjs`. Add `--url <gateway url>` only if the user is
+on a gateway other than the default, and `--storage keychain` only if they
+chose Keychain storage.
 
 This is not the forbidden form from the second bullet: the key never appears as
 a literal anywhere. What gets typed, recorded in history, and visible to `ps` is
 `"$KEY"` — the variable's name, not its value — and you never learn the value
 at all. The forbidden thing is a command in which YOU have written the key out.
 
-The bare command works too, but only if you tell the user the part `setup` does
-not tell them: **nothing is printed, so type or paste the key, press Enter,
-then press Ctrl-D** to signal end-of-file. In that form the key is echoed on
+Running `setup` with no pipe works too: it notices it is
+attached to a terminal and says on stderr that it is waiting — **type or paste
+the key, press Enter, then press Ctrl-D**. In that form the key is echoed on
 screen, which the one-liner above avoids — prefer the one-liner.
 
 #### There is no `!` shortcut for this: it has to be the user's own terminal
 
 Do NOT hand the user a `! ...` command for this. A Claude Code `!` command runs
 with non-interactive stdin and no controlling terminal (opening `/dev/tty`
-fails with `ENXIO`), so `setup --key-stdin` reads end-of-file immediately,
+fails with `ENXIO`), so `setup` reads end-of-file immediately,
 stores nothing, and exits 2. The whole output, verified:
 
 ```
 setup — storage: dotenv
   api key: failed (no API key was provided; nothing was stored)
-  url: failed (no API key was provided; nothing was stored)
   configured url: https://zug-gateway.internal-iden3-dev.com (source: default)
   configured api key: (not configured)
   this configuration is NOT usable yet: fezoctl needs an API key.
@@ -158,7 +168,7 @@ the resolution order, but a variable the user exports in some other terminal is
 invisible to this already-running session: environment variables are inherited
 at process start, so only processes launched afterwards from that shell would
 see it. Suggest it only if the user is willing to restart the agent session
-with it exported. `setup --key-stdin` writes a file (or a Keychain item) that
+with it exported. `setup` writes a file (or a Keychain item) that
 takes effect immediately, which is why it is the option to offer first.
 
 What you MAY collect through `AskUserQuestion`: the **gateway URL** and the
@@ -171,7 +181,7 @@ user saying so. Otherwise omit `--url` and let the default stand.
 In this file's own notation, the command is:
 
 ```bash
-"${FEZOCTL_ARGV[@]}" setup --key-stdin --url <gateway url>
+"${FEZOCTL_ARGV[@]}" setup
 ```
 
 That is the form YOU would use — like every other command here, it goes
@@ -181,9 +191,11 @@ would expand to `setup: command not found`. Expand it to the literal
 invocation step 0 resolved, as in the one-liner above, before handing anything
 over.
 
-`--url` is optional: dropping it stores only the key and leaves the gateway at
-the built-in default, which is a complete, working configuration — `setup`
-exits 0 and prints `configured url: https://zug-gateway.internal-iden3-dev.com
-(source: default)`. Pass `--url` only to point at a different gateway. What is
-NOT optional is the key: a `setup` that stores no key exits non-zero, and every
+Every flag is optional. `--url` points at a gateway other than the built-in
+default; `--storage keychain` switches storage; `--key-stdin` is accepted for
+compatibility but says nothing `setup` does not already do. Omitting all three
+stores the key under `dotenv` against the default gateway, which is a complete,
+working configuration — `setup` exits 0 and prints `configured url:
+https://zug-gateway.internal-iden3-dev.com (source: default)`. What is NOT
+optional is the key: a `setup` that stores no key exits non-zero, and every
 other command then fails with `the API key is not configured`.
