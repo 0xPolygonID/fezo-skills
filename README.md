@@ -396,7 +396,7 @@ Binding rules, in brief (see `src/engine/bindings.ts` for the exact logic):
 - **Query parameters** come from the catalog's `http.query` list.
 - **Header parameters** come from `http.header` — and only from that list:
   `fezoctl` refuses (throws a local error) to let a tool call set
-  `Authorization` or any `X-Zug-*` header, even if a manifest names one.
+  `Authorization` or any `X-Fezo-*` header, even if a manifest names one.
 - **Body** comes from whatever isn't claimed by path/query/header (for a
   POST-like method), or from `--body-json` when you supply it.
 - If a method's catalog entry has no `http` block at all, `fezoctl` falls

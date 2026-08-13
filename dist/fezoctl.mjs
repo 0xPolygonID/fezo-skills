@@ -8289,7 +8289,7 @@ function formatBindingError(reason, names) {
   const list = names.join(", ");
   switch (reason) {
     case "disallowed-header":
-      return `refusing to bind reserved header name(s): ${list} (Authorization and X-Zug-* headers may never be set by a tool call)`;
+      return `refusing to bind reserved header name(s): ${list} (Authorization and X-Fezo-* headers may never be set by a tool call)`;
     case "body-not-allowed":
       return "refusing to send a request body on a GET method (the Fetch API rejects a body on GET/HEAD); drop --body-json, or call a method whose binding declares a request body";
     case "missing-path-param":
@@ -8325,7 +8325,7 @@ function requiredPropertyNames(schema) {
   return required.filter((name) => typeof name === "string");
 }
 var DISALLOWED_HEADER_EXACT = "authorization";
-var DISALLOWED_HEADER_PREFIX = "x-zug-";
+var DISALLOWED_HEADER_PREFIX = "x-fezo-";
 function isDisallowedHeaderName(name) {
   const lower = name.toLowerCase();
   return lower === DISALLOWED_HEADER_EXACT || lower.startsWith(DISALLOWED_HEADER_PREFIX);
