@@ -40,7 +40,7 @@ export interface BoundRequest {
   query: Record<string, string>;
   /**
    * Allow-listed request headers to send. Never contains `Authorization` or
-   * an `X-Zug-*` name -- `bindArgs` refuses (throws) rather than let either
+   * an `X-Fezo-*` name -- `bindArgs` refuses (throws) rather than let either
    * through, even if the catalog's own `http.header` list names one.
    */
   headers: Record<string, string>;
@@ -90,7 +90,7 @@ function formatBindingError(reason: BindingErrorReason, names: string[]): string
   const list = names.join(', ');
   switch (reason) {
     case 'disallowed-header':
-      return `refusing to bind reserved header name(s): ${list} (Authorization and X-Zug-* headers may never be set by a tool call)`;
+      return `refusing to bind reserved header name(s): ${list} (Authorization and X-Fezo-* headers may never be set by a tool call)`;
     case 'body-not-allowed':
       return 'refusing to send a request body on a GET method (the Fetch API rejects a body on GET/HEAD); drop --body-json, or call a method whose binding declares a request body';
     case 'missing-path-param':
@@ -164,11 +164,11 @@ function requiredPropertyNames(schema: object): string[] {
 }
 
 const DISALLOWED_HEADER_EXACT = 'authorization';
-const DISALLOWED_HEADER_PREFIX = 'x-zug-';
+const DISALLOWED_HEADER_PREFIX = 'x-fezo-';
 
 /**
- * True for `Authorization` or any `X-Zug-*` header name, case-insensitively.
- * The gateway strips inbound `X-Zug-*` headers on its own, in its
+ * True for `Authorization` or any `X-Fezo-*` header name, case-insensitively.
+ * The gateway strips inbound `X-Fezo-*` headers on its own, in its
  * passthrough-header validation, but `bindArgs` refuses locally rather than
  * rely on that: a header a tool call never sends cannot be a live attack
  * surface regardless of what the gateway would have done with it.

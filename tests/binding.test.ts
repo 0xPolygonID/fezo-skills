@@ -219,19 +219,19 @@ describe('bindArgs — header binding', () => {
     }
   });
 
-  it('refuses to bind any X-Zug-* header via a manifest-declared header binding, case-insensitively', () => {
-    const method = candidate({ path: '/whatever', httpMethod: 'POST', bindings: { header: ['x-zug-gw-user-id'] } });
+  it('refuses to bind any X-Fezo-* header via a manifest-declared header binding, case-insensitively', () => {
+    const method = candidate({ path: '/whatever', httpMethod: 'POST', bindings: { header: ['x-fezo-gw-user-id'] } });
     try {
-      bindArgs(method, { 'x-zug-gw-user-id': 'user-42' });
+      bindArgs(method, { 'x-fezo-gw-user-id': 'user-42' });
       expect.unreachable('bindArgs should have thrown');
     } catch (err) {
       expect((err as BindingError).reason).toBe('disallowed-header');
-      expect((err as BindingError).names).toEqual(['x-zug-gw-user-id']);
+      expect((err as BindingError).names).toEqual(['x-fezo-gw-user-id']);
     }
   });
 
   it('refuses before touching args at all -- even when args supplies no value for the reserved header', () => {
-    const method = candidate({ path: '/whatever', httpMethod: 'POST', bindings: { header: ['X-Zug-Trace'] } });
+    const method = candidate({ path: '/whatever', httpMethod: 'POST', bindings: { header: ['X-Fezo-Trace'] } });
     expect(() => bindArgs(method, {})).toThrow(BindingError);
   });
 
