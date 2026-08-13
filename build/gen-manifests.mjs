@@ -274,7 +274,7 @@ function geminiExtensionJson() {
       {
         name: 'Fezo Gateway URL',
         description:
-          'Base URL of your Fezo API gateway. Optional — defaults to https://zug-gateway.internal-iden3-dev.com; set this only for a different gateway.',
+          'Base URL of your Fezo API gateway. Optional — defaults to https://fezo.ai; set this only for a different gateway.',
         envVar: 'FEZO_URL',
         sensitive: false,
       },

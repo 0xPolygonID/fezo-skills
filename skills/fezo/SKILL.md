@@ -90,7 +90,7 @@ variable is set).
 
 **The gateway URL has a fourth, last-resort source the API key does not: a
 built-in default.** When none of the three above names one, `fezoctl` uses
-`https://zug-gateway.internal-iden3-dev.com` and reports the source as
+`https://fezo.ai` and reports the source as
 `default`. So the only credential that can be missing is the API key — never
 assume a URL needs configuring, and never ask the user for one just because
 `doctor` says "not configured; using the built-in default". A user on a
@@ -170,7 +170,7 @@ stores nothing, and exits 2. The whole output, verified:
 ```
 setup — storage: dotenv
   api key: failed (no API key was provided; nothing was stored)
-  configured url: https://zug-gateway.internal-iden3-dev.com (source: default)
+  configured url: https://fezo.ai (source: default)
   configured api key: (not configured)
   this configuration is NOT usable yet: fezoctl needs an API key.
 ```
@@ -218,7 +218,7 @@ default; `--storage keychain` switches storage; `--key-stdin` is accepted for
 compatibility but says nothing `setup` does not already do. Omitting all three
 stores the key under `dotenv` against the default gateway, which is a complete,
 working configuration — `setup` exits 0 and prints `configured url:
-https://zug-gateway.internal-iden3-dev.com (source: default)`. What is NOT
+https://fezo.ai (source: default)`. What is NOT
 optional is the key: a `setup` that stores no key exits non-zero, and every
 other command then fails with `the API key is not configured`.
 

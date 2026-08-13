@@ -411,7 +411,7 @@ describe('skills/fezo/SKILL.md generated content', () => {
   // The skill must not send the model hunting for a gateway URL that already
   // resolves: "not configured" for the URL is a normal, working state.
   it('states the built-in default gateway URL and that only the API key can be missing', () => {
-    expect(skillMd).toContain('https://zug-gateway.internal-iden3-dev.com');
+    expect(skillMd).toContain('https://fezo.ai');
     expect(skillMdFlat).toContain('the only credential that can be missing is the API key');
     expect(skillMdFlat).toContain('never ask the user for one just because');
   });

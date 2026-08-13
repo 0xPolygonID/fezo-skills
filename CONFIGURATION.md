@@ -57,7 +57,7 @@ boilerplate. Concretely:
 
 | Variable | Purpose |
 | --- | --- |
-| `FEZO_URL` | The gateway's base URL. Optional — defaults to `https://zug-gateway.internal-iden3-dev.com`. |
+| `FEZO_URL` | The gateway's base URL. Optional — defaults to `https://fezo.ai`. |
 | `FEZO_API_KEY` | Your gateway API key. Required; there is no default. |
 
 These are the only two environment variables `fezoctl` reads for
@@ -68,7 +68,7 @@ anything else; `fezoctl doctor` reports what actually resolved.
 ### The default gateway URL
 
 `fezoctl` ships with a built-in gateway URL
-(`https://zug-gateway.internal-iden3-dev.com`, `credentials.ts`'s
+(`https://fezo.ai`, `credentials.ts`'s
 `DEFAULT_GATEWAY_URL`). It is the **last** source consulted for the URL, below
 all three below — so configuring `FEZO_URL`, a Keychain item, or a `.env` entry
 always wins, and pointing `fezoctl` at a different gateway needs no code
@@ -300,7 +300,7 @@ explicitly and exits **0**:
 ```
 setup — storage: dotenv
   api key: stored
-  configured url: https://zug-gateway.internal-iden3-dev.com (source: default)
+  configured url: https://fezo.ai (source: default)
   configured api key: sk-l… (source: dotenv)
 ```
 
@@ -393,7 +393,7 @@ Two ways to rotate a `dotenv`-stored credential:
    $ printf '%s' "$NEW_KEY" | node dist/fezoctl.mjs setup
    setup — storage: dotenv
      api key: stored
-     configured url: https://zug-gateway.internal-iden3-dev.com (source: default)
+     configured url: https://fezo.ai (source: default)
      configured api key: sk-l… (source: dotenv)
    $ echo $?
    0

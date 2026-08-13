@@ -169,7 +169,7 @@ describe('resolveCredentials — the default gateway URL', () => {
     // Pinned as a literal, not derived: the value is the point of the default,
     // and a typo in it is a wrong gateway rather than a test failure everywhere
     // else. Changing it is a deliberate act that should update this line too.
-    expect(DEFAULT_GATEWAY_URL).toBe('https://zug-gateway.internal-iden3-dev.com');
+    expect(DEFAULT_GATEWAY_URL).toBe('https://fezo.ai');
   });
 
   it('loses to every configured source: env, Keychain, and .env each win', () => {

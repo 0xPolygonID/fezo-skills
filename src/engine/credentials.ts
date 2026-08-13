@@ -486,7 +486,7 @@ export function writeDotEnvFile(path: string, values: Readonly<Record<string, st
  * other source: `FEZO_URL`, a Keychain item, or `~/.config/fezo/.env`. All
  * three win, because this is the LAST source consulted, not the first.
  */
-export const DEFAULT_GATEWAY_URL = 'https://zug-gateway.internal-iden3-dev.com';
+export const DEFAULT_GATEWAY_URL = 'https://fezo.ai';
 
 /**
  * Where a resolved credential came from. `'default'` is reachable for the

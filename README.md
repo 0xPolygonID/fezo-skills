@@ -83,7 +83,7 @@ node ~/.agents/skills/fezo/scripts/fezoctl.mjs doctor
 ```
 
 Only the API key is required. The gateway URL defaults to
-`https://zug-gateway.internal-iden3-dev.com`; add
+`https://fezo.ai`; add
 `--url https://your-gateway.example.com` if you are on a different one.
 
 Credentials live outside the skill directory (`~/.config/fezo/.env` at mode
@@ -236,7 +236,7 @@ are re-run and the results committed.
 node dist/fezoctl.mjs --help
 
 # Configure the API key once — the gateway URL defaults to
-# https://zug-gateway.internal-iden3-dev.com, so --url is only for a different
+# https://fezo.ai, so --url is only for a different
 # gateway (see CONFIGURATION.md for the full story):
 printf '%s' "$YOUR_FEZO_API_KEY" | node dist/fezoctl.mjs setup
 
@@ -1073,7 +1073,7 @@ $ node dist/fezoctl.mjs call falai_generate --args-json '{"prompt":"a cat"}' --j
 ## Credentials
 
 Only the **API key** has to be configured. The gateway URL falls back to a
-built-in default, `https://zug-gateway.internal-iden3-dev.com`, as the last
+built-in default, `https://fezo.ai`, as the last
 rung of its resolution chain — `FEZO_URL`, a Keychain item, and `~/.config/fezo/.env`
 all outrank it, and `doctor`/`setup` report a defaulted URL as `source: default`
 so a gateway nobody chose never looks like one somebody did. The API key has no

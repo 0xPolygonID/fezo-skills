@@ -8575,7 +8575,7 @@ function writeDotEnvFile(path, values) {
   }
   return { ok: true };
 }
-var DEFAULT_GATEWAY_URL = "https://zug-gateway.internal-iden3-dev.com";
+var DEFAULT_GATEWAY_URL = "https://fezo.ai";
 function credentialDisplay(resolution) {
   return {
     url: { value: resolution.url.value, source: resolution.url.source },
