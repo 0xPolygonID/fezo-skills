@@ -88,7 +88,7 @@ export async function callTool(options: CallToolOptions): Promise<CallToolResult
   // with one (case-insensitively -- HTTP header names are case-insensitive, and
   // a plain-object `HeadersInit` would otherwise reach `fetch` carrying both
   // spellings) is dropped with a diagnostic. `bindArgs` already refuses to bind
-  // `Authorization` or `X-Zug-*` at all, so this is defense in depth rather
+  // `Authorization` or `X-Fezo-*` at all, so this is defense in depth rather
   // than the only barrier: the credential this client sends must not be
   // overridable by catalog data, and neither must the content type of a body
   // this client is the one serializing.

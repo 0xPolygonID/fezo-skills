@@ -383,7 +383,7 @@ export function annotate(row: ProviderRow, options: { explain?: boolean } = {}):
 // ---------------------------------------------------------------------------
 // Cross-intent view: listProviders / annotateListed (the `list-providers`
 // command's data). Not named in this phase's provider-view.ts bullet list --
-// in mcp-server the equivalent (`zug_list_providers`/`buildListBackendsTool`)
+// in mcp-server the equivalent (`fezo_list_providers`/`buildListBackendsTool`)
 // lives in helper_tools.ts, not provider_view.ts, because mcp-server's
 // provider_view.ts only ever grew the per-intent view. It is placed here
 // instead of in cli.ts (which would otherwise have to reimplement the
