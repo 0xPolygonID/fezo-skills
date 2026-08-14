@@ -501,6 +501,51 @@ git add src/engine/plan.ts tests/plan.test.ts
 git commit -m "feat: add the routing plan contract"
 ```
 
+**Deviations recorded during implementation.**
+
+1. *The spec's precedence chain is inverted: explicit flags beat `--plan-json`,
+   not the other way round.* Step 3's `mergePlan` applies `overrides.plan`
+   first and then lets the individual flags overwrite fields on top of it, which
+   is the opposite of the spec's original `--plan-json (whole plan) > explicit
+   flags > planner output`. The code is kept and the spec paragraph amended,
+   because a flag is the more specific instruction typed on the same command
+   line: under the spec's order, `--plan-json '{"fanout":2}' --depth research`
+   would silently ignore `--depth`, and there would be no way to correct one
+   field of a stored plan without editing the JSON. The amended paragraph is in
+   the spec under `RoutingPlan`; `mergePlan`'s docstring and
+   `PlanOverrides`'s state the direction unambiguously, and
+   `tests/plan.test.ts`'s 'applies flags on top of a whole-plan override' pins
+   it.
+2. *`--plan-json` replaces the plan wholesale, and a fragment with nothing to do
+   is now rejected.* The spec says overrides are "merged field-wise so a caller
+   can correct one field and inherit the rest"; that holds for the flags, but
+   not for `--plan-json`, because `parsePlanJson` fills every absent field from
+   defaults and `mergePlan` substitutes the completed object for the whole base
+   plan. `--plan-json '{"depth":"research"}'` would therefore wipe the
+   heuristic's queries and yield zero lanes, an empty document and exit 0 --
+   a round the caller did not ask for, which is the same failure the closed
+   schema exists to prevent, only quieter. Step 3's `parsePlanJson` gains a
+   final check: a plan with neither `queries` nor `targets` throws, and the
+   message names the replace-not-merge semantics because that is the
+   misunderstanding it catches. Exit 1 during argv parsing, as before, so
+   nothing is billed. Making `--plan-json` genuinely field-wise instead would
+   mean carrying a `Partial<RoutingPlan>` through the merge and was rejected as
+   out of scope for this task.
+3. *Four hardening fixes on top of Step 3's block, all keeping its behaviour on
+   the paths that already worked.* (a) `parsePlanJson` renders errors with
+   `schema.ts`'s exported `ajvErrorsToText` instead of hand-rolling the first
+   error, so the `allErrors: true` that `ajv-instance.ts` argues for actually
+   reaches the caller. (b) `PLAN_SCHEMA` is frozen down to its nested property
+   schemas, matching `providers.ts` and `intent.ts`: the validator is compiled
+   once at module load, so a mutation would leave the exported constant
+   advertising a contract nothing enforces. (c) `clampPlan` falls back to the
+   depth's declared width for a non-finite fanout -- `Math.trunc(NaN)` survives
+   both bounds, and a NaN fanout would make `queries.length * fanout` NaN and
+   defeat Task 9's `MAX_RESEARCH_CALLS` accounting. (d) `mergePlan` and
+   `clampPlan` never return an object (or a `signals` array) aliased to their
+   input, so downstream rendering can annotate the plan it is handed without
+   reaching back into the planner's own.
+
 ---
 
 ### Task 3: The heuristic planner

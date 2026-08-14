@@ -101,9 +101,15 @@ export interface RoutingPlan {
 `intents` and `targets` coexist, so "search or scraping or both" needs no mode
 switch: one round can fan out search providers and fetch known URLs at once.
 
-**Precedence:** `--plan-json` (whole plan) > explicit flags > planner output,
-merged field-wise so a caller can correct one field and inherit the rest.
-`source` records who won and is echoed in the output.
+**Precedence:** explicit flags > `--plan-json` (whole plan) > planner output.
+A flag beats the `--plan-json` it accompanies because it is the more specific
+instruction typed on the same command line; under the reverse order every flag
+next to a `--plan-json` would be silently ignored. Flags merge field-wise, so a
+caller can correct one field and inherit the rest. `--plan-json` does not: it
+replaces the plan wholesale, which is why `parsePlanJson` rejects a fragment
+carrying neither `queries` nor `targets` instead of quietly wiping the
+planner's queries and producing an empty round. `source` records who won and is
+echoed in the output. Recorded as a deviation under the plan's Task 2.
 
 **Validation:** caller-supplied plans validate against `PLAN_SCHEMA` using the
 existing `ajv-instance.ts` compiler. A malformed plan fails during argv
