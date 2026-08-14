@@ -390,6 +390,18 @@ describe('mergeItems', () => {
     expect(suppressed).toBe(1);
   });
 
+  // The URLs travel with the count so a caller that merges several times (the
+  // executor merges once per sub-query) can union the sets: adding the counts
+  // up would report one already-seen page as several withheld pages.
+  it('reports which canonical URLs were suppressed, not just how many', () => {
+    const { suppressed, suppressedUrls } = mergeItems(
+      [lane('you', 1, [['https://www.old.example/?utm_source=z'], ['https://new.example']])],
+      new Set(['https://old.example']),
+    );
+    expect([...suppressedUrls]).toEqual(['https://old.example']);
+    expect(suppressed).toBe(suppressedUrls.size);
+  });
+
   // `providers` carries one entry per backend, and RRF depends on it: the
   // spec's ordering rationale is "appearing high on several lists beats
   // appearing first on one", so a backend counted twice reads as agreement

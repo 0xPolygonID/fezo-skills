@@ -297,8 +297,13 @@ export interface ProviderHit {
  * (`MAX_FANOUT = 10`), so the scan is cheaper than the Map it would replace and
  * keeps the array's order -- first-contributing backend first -- which is what
  * makes the emitted document byte-stable for a given lane order.
+ *
+ * Exported because a fourth site appeared, exactly as the note on `ProviderHit`
+ * anticipated: the executor unions one document's hits across sub-queries, and
+ * a hand-copied version of this rule living there would let the invariant drift
+ * out of the module that declares it.
  */
-function recordHit(providers: ProviderHit[], hit: ProviderHit): void {
+export function recordHit(providers: ProviderHit[], hit: ProviderHit): void {
   const existing = providers.find((p) => p.backendId === hit.backendId);
   if (existing === undefined) {
     providers.push(hit);
@@ -462,7 +467,7 @@ function sanitizeRow(entry: unknown): RawItem | undefined {
 export function mergeItems(
   lanes: readonly LaneItems[],
   seenUrls: ReadonlySet<string> = new Set(),
-): { items: ResearchItem[]; suppressed: number } {
+): { items: ResearchItem[]; suppressed: number; suppressedUrls: Set<string> } {
   const byCanonical = new Map<string, ResearchItem>();
   // A set, not a counter: the figure the caller reads is "pages you already had
   // and so did not get again", which is per-document. Counting lane hits instead
@@ -576,7 +581,15 @@ export function mergeItems(
     item.score = item.providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0);
   }
   merged.sort((a, b) => (b.score - a.score) || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
-  return { items: merged, suppressed: suppressedUrls.size };
+  // The SET travels alongside the count, because the per-document figure this
+  // function is careful to compute is only per-document within ONE call: a
+  // caller that merges per sub-query and adds the counts up reintroduces the
+  // multiplication the comment on `suppressedUrls` rejects, on the query axis
+  // instead of the lane axis. One already-seen page returned under three
+  // sub-queries is still one page the round withheld, and unioning the sets is
+  // the only way a multi-call caller can say so. Fresh per call, so handing it
+  // out aliases nothing this function still holds.
+  return { items: merged, suppressed: suppressedUrls.size, suppressedUrls };
 }
 
 /** Below this many unique URLs, a query is reported as thin. */
