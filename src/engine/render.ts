@@ -1029,8 +1029,39 @@ export function renderResearch(outcome: ResearchOutcome, sessionId: string | und
         duplicates: item.duplicates,
       })),
       documents: outcome.documents.map((doc) => ({ url: doc.url, backend_id: doc.backendId, content: doc.content })),
-      coverage: outcome.coverage,
-      next_actions: outcome.nextActions.map((a) => ({ why: a.why, cmd: a.cmd })),
+      // Mapped, not emitted raw. Every other section of this document is
+      // snake_case (`calls_billed`, `backend_id`, `result_rank`), and
+      // `coverage` was the one place the engine's internal camelCase reached
+      // the wire -- `droppedQueries` sitting next to `calls_billed` in the same
+      // object. SKILL.md teaches agents to read `gaps`, so this is a public
+      // contract from the moment anything depends on it; it is cheaper to make
+      // it consistent now than to keep both spellings forever.
+      coverage: {
+        queries: outcome.coverage.queries.map((q) => ({
+          query: q.query,
+          unique_urls: q.uniqueUrls,
+          agreement_median: q.agreementMedian,
+        })),
+        served: outcome.coverage.served,
+        failed: outcome.coverage.failed.map((f) => ({ backend_id: f.backendId, reason: f.reason })),
+        skipped: outcome.coverage.skipped,
+        ...(outcome.coverage.domainConcentration !== undefined
+          ? { domain_concentration: outcome.coverage.domainConcentration }
+          : {}),
+        dropped_queries: outcome.coverage.droppedQueries,
+        unfetched_targets: outcome.coverage.unfetchedTargets,
+        narrowed_queries: outcome.coverage.narrowedQueries,
+        suppressed: outcome.coverage.suppressed,
+        gaps: outcome.coverage.gaps,
+      },
+      next_actions: outcome.nextActions.map((a) => ({
+        why: a.why,
+        // Omitted rather than emitted as null when an action carries no
+        // command: a consumer testing `if (action.cmd)` and one testing
+        // `'cmd' in action` must agree, and `null` in a field documented as a
+        // runnable command invites being coerced to the string "null".
+        ...(a.cmd !== undefined ? { cmd: a.cmd } : {}),
+      })),
       billing: { calls_billed: outcome.billing.callsBilled, attempts: outcome.billing.attempts },
       session: sessionId !== undefined ? { id: sessionId } : null,
     });

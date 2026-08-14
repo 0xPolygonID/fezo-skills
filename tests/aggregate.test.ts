@@ -835,3 +835,96 @@ describe('nextActions: an account-scoped abort', () => {
     expect(actions.some((a) => a.cmd?.includes('fezoctl research') === true)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Final-review minors and round-1 leftovers.
+// ---------------------------------------------------------------------------
+
+describe('canonicalizeUrl: userinfo', () => {
+  it('strips credentials rather than carrying them into the session file', () => {
+    expect(canonicalizeUrl('https://user:pw@example.com/a')).toBe('https://example.com/a');
+  });
+
+  it('merges a credentialed and a bare URL as one document', () => {
+    const { items } = mergeItems([
+      { backendId: 'you', rank: 1, items: [{ url: 'https://user:pw@example.com/a' }] },
+      { backendId: 'exa', rank: 2, items: [{ url: 'https://example.com/a' }] },
+    ]);
+    expect(items).toHaveLength(1);
+    expect(JSON.stringify(items)).not.toMatch(/pw@/);
+  });
+});
+
+describe('title is capped like snippet', () => {
+  it('caps a sniffed title', () => {
+    const items = sniffItems({ results: [{ url: 'https://a.example', title: 'T'.repeat(200_000) }] });
+    expect(items[0]?.title?.length).toBeLessThanOrEqual(300);
+  });
+
+  it('caps an adapter-supplied title', () => {
+    const original = RESPONSE_ADAPTERS['big_title'];
+    RESPONSE_ADAPTERS['big_title'] = () => [{ url: 'https://a.example', title: 'T'.repeat(200_000) }];
+    try {
+      const { items } = mergeItems([{ backendId: 'b', rank: 1, items: extractItems('big_title', {}) }]);
+      expect(items[0]?.title.length).toBeLessThanOrEqual(300);
+    } finally {
+      if (original === undefined) delete RESPONSE_ADAPTERS['big_title'];
+      else RESPONSE_ADAPTERS['big_title'] = original;
+    }
+  });
+
+  it('never truncates in the middle of a surrogate pair', () => {
+    // '𝄞' is one astral character, two UTF-16 code units. A boundary landing
+    // between them emits a lone high surrogate -- a string that is not
+    // well-formed UTF-16.
+    const items = sniffItems({ results: [{ url: 'https://a.example', snippet: '𝄞'.repeat(2000) }] });
+    const snippet = items[0]?.snippet ?? '';
+    // `String.prototype.isWellFormed` is ES2024 and above this project's lib
+    // target, so the check is written out: no code unit may be a high surrogate
+    // without a low surrogate following it.
+    const hasLoneSurrogate = [...snippet].some((_ch, i) => {
+      const code = snippet.charCodeAt(i);
+      if (code < 0xd800 || code > 0xdbff) return false;
+      const next = snippet.charCodeAt(i + 1);
+      return Number.isNaN(next) || next < 0xdc00 || next > 0xdfff;
+    });
+    expect(hasLoneSurrogate).toBe(false);
+    expect(snippet.length).toBeLessThanOrEqual(SNIPPET_MAX_CHARS);
+  });
+});
+
+describe('sniffItems: an array of bare URL strings', () => {
+  it('reads it when no object-shaped rows were found', () => {
+    const items = sniffItems({ links: ['https://a.example', 'https://b.example'] });
+    expect(items.map((i) => i.url)).toEqual(['https://a.example', 'https://b.example']);
+  });
+
+  it('ignores strings that are not absolute http(s) URLs', () => {
+    expect(sniffItems({ tags: ['climate', '/relative/path', 'doc:1234'] })).toEqual([]);
+  });
+
+  it('never outranks object-shaped results, however long the string array is', () => {
+    // A tag cloud is longer than the results list in plenty of real bodies.
+    const items = sniffItems({
+      results: [{ url: 'https://real.example', title: 'Real' }],
+      related: Array.from({ length: 50 }, (_u, i) => `https://noise${String(i)}.example`),
+    });
+    expect(items.map((i) => i.url)).toEqual(['https://real.example']);
+  });
+});
+
+describe('nextActions: no repeated commands', () => {
+  it('emits one providers command however many backends failed', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [] }],
+      served: [], skipped: [], droppedQueries: [], unfetchedTargets: [], narrowedQueries: [], suppressed: 0,
+      failed: [
+        { backendId: 'you', reason: 'rate_limited' },
+        { backendId: 'exa', reason: 'rate_limited' },
+        { backendId: 'brave', reason: 'rate_limited' },
+      ],
+    });
+    const providerActions = nextActions(coverage, undefined).filter((a) => a.cmd === 'fezoctl providers --intent search');
+    expect(providerActions).toHaveLength(1);
+  });
+});

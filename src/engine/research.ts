@@ -86,7 +86,7 @@ function lanesForQuery(
   plan: RoutingPlan,
   candidates: readonly ToolCandidate[],
   excluded: readonly string[],
-): Lane[] {
+): { lanes: Lane[]; skipped: string[] } {
   const byTool = new Map(candidates.map((c) => [c.tool, c]));
   // Every search-shaped intent contributes providers; a `news` plan should
   // reach news providers as well as general search ones.
@@ -123,6 +123,7 @@ function lanesForQuery(
     }
   }
   const lanes: Lane[] = [];
+  const skipped: string[] = [];
   // The one width bound in this function, which is why the old
   // `fanout * intents.length` break is gone: it could never change the outcome
   // (a trailing `slice(0, fanout)` decided the width regardless), so it only
@@ -130,16 +131,25 @@ function lanesForQuery(
   // guard. A row this catalog cannot reach still costs its slot -- it is a
   // provider the round declined to call, not one it may replace.
   for (const rec of orderByIndexDiversity(eligible, plan.fanout)) {
+    let resolved = false;
     for (const entry of rec.entryMethods) {
       const candidate = byTool.get(entry);
       if (candidate === undefined) continue;
       const argName = resolveArgName(candidate.inputSchema, 'query');
       if (argName === undefined) continue;
       lanes.push({ query, backendId: rec.backendId, rank: lanes.length + 1, candidate, argName });
+      resolved = true;
       break;
     }
+    // A ranked provider this caller's catalog cannot reach is REPORTED, not
+    // silently absent. Without it a fanout-4 round against a catalog holding
+    // one provider bills once, says nothing, and its thin-coverage gap reads as
+    // "the web is sparse" when the truth is "three of the four providers you
+    // budgeted for are not on your gateway". Same vocabulary as one-step.ts's
+    // `buildWalk`, so the two report an unreachable provider identically.
+    if (!resolved) skipped.push(`${rec.backendId} (not in catalog)`);
   }
-  return lanes;
+  return { lanes, skipped };
 }
 
 /**
@@ -265,6 +275,10 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   const planned: Array<{ query: string; lanes: Lane[] }> = [];
   const droppedQueries: DroppedQuery[] = [];
   const narrowedQueries: NarrowedQuery[] = [];
+  /** Ranked providers no lane could be built for, gathered while planning.
+   * Deduped at the end: with several queries the same absent provider is
+   * reported once per query, and a list repeating one fact reads as many. */
+  const planSkipped: string[] = [];
   // Targets are reserved BEFORE queries take what is left, which is the order
   // `clampPlan` states ("Targets are bounded first and keep their budget;
   // queries then take what is left"). Letting the query loop spend first
@@ -275,9 +289,28 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   // three-places-must-agree hazard the review flagged.
   const targetReserve = Math.min(plan.targets.length, maxCalls);
   let budget = maxCalls - targetReserve;
+  // A caller who declared intents, none of which a query can be served by
+  // (`--intents scrape` with a query and no target), gets NO search fan-out.
+  // The `['search']` fallback below exists for a plan that declared nothing at
+  // all; applying it here billed search providers against an explicit
+  // instruction not to search. Reported, never silent, so the caller can see
+  // their own flag caused it.
+  const searchShaped = plan.intents.filter((intent) => intent !== 'scrape' && intent !== 'crawl');
+  const noSearchIntent = plan.intents.length > 0 && searchShaped.length === 0;
   for (const query of plan.queries) {
-    const lanes = lanesForQuery(query, plan, candidates, excluded);
-    if (lanes.length === 0) { planned.push({ query, lanes: [] }); continue; }
+    if (noSearchIntent) {
+      droppedQueries.push({ query, reason: `no search-shaped intent declared (intents: ${plan.intents.join(', ')})` });
+      continue;
+    }
+    const { lanes, skipped: unreachable } = lanesForQuery(query, plan, candidates, excluded);
+    planSkipped.push(...unreachable);
+    // Zero lanes is not "the web returned nothing" -- nothing was asked. Left
+    // in `planned` it would earn a `"…" returned no results` gap, the same
+    // false claim the abort path used to make.
+    if (lanes.length === 0) {
+      droppedQueries.push({ query, reason: 'no provider in the catalog can serve it' });
+      continue;
+    }
     if (budget <= 0) { droppedQueries.push({ query }); continue; }
     // A budget smaller than the width NARROWS the query rather than cancelling
     // it: `--max-calls 4` on a fanout-5 round used to bill nothing and exit 2,
@@ -435,7 +468,7 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     ...documents.map((d) => d.backendId),
   ]);
   const failed = ran.flatMap((r) => (r.failed !== undefined ? [r.failed] : []));
-  const skipped = ran.flatMap((r) => (r.skipped !== undefined ? [r.skipped] : []));
+  const skipped = [...new Set([...planSkipped, ...ran.flatMap((r) => (r.skipped !== undefined ? [r.skipped] : []))])];
   const aborted = ran.find((r) => r.aborted !== undefined)?.aborted ?? targetsRan.find((r) => r.aborted !== undefined)?.aborted;
 
   // Work the pool never started, recovered by diffing the plan against the

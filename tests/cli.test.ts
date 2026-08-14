@@ -2663,3 +2663,22 @@ describe('fezoctl research (the billed path)', () => {
     }
   });
 });
+
+describe('fezoctl research: a plan with nothing to do is a usage error', () => {
+  it('rejects a whitespace-only --queries before any call', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(
+      ['research', 'hello', '--queries', '   '],
+      baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }),
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toMatch(/no queries and no targets/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('says so on stdout under --json, like every other usage error', async () => {
+    const result = await runCli(['research', 'hello', '--queries', '   ', '--json'], baseDeps());
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stdout).error.kind).toBe('usage');
+  });
+});

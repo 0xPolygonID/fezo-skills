@@ -1,4 +1,4 @@
-import { mkdtempSync, statSync } from 'node:fs';
+import { mkdtempSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -55,7 +55,6 @@ describe('load/save', () => {
   it('returns an empty state rather than throwing on a corrupt file', () => {
     const { env, home } = scratch();
     saveSession({ id: 'r-1', seenUrls: ['https://a.example'], queries: [], callsBilled: 0 }, env, home);
-    const { writeFileSync } = require('node:fs') as typeof import('node:fs');
     writeFileSync(sessionPath('r-1', env, home), '{not json');
     expect(loadSession('r-1', env, home).seenUrls).toEqual([]);
   });

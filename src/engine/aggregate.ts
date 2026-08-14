@@ -121,6 +121,15 @@ export function canonicalizeUrl(url: string): string {
   // Providers hand us whatever string they stored, schemes included.
   parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
   parsed.hash = '';
+  // Userinfo is stripped, not carried. It is not part of the DOCUMENT's
+  // identity -- `https://user:pw@example.com/a` and `https://example.com/a` are
+  // the same page -- so keeping it both defeats the dedup this function exists
+  // for and writes a credential into places that outlive the round: the
+  // canonical key, `duplicates`, stdout, and the session cache on disk. A
+  // provider echoing such a URL back is uncommon but not rare, and nothing
+  // downstream would ever remove it.
+  parsed.username = '';
+  parsed.password = '';
   const params = [...parsed.searchParams.entries()]
     .filter(([key]) => !key.toLowerCase().startsWith('utm_') && !TRACKING_PARAMS.includes(key.toLowerCase()))
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
@@ -183,15 +192,50 @@ function collectArrays(value: unknown, depth = 0, found: unknown[][] = []): unkn
  * left the adapter path uncapped; a cap that only one of two producers applies
  * is not a bound on anything.
  */
+function capText(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  let end = limit - 1;
+  // Never cut between a surrogate pair. `String.prototype.slice` counts UTF-16
+  // code units, so a boundary landing inside an astral character (emoji, most
+  // CJK extensions, mathematical alphanumerics) emits a lone high surrogate --
+  // a string that is not well-formed UTF-16 and renders as a replacement
+  // character wherever it lands. Backing off one unit costs one character and
+  // makes the cap safe for every script rather than for Latin-1 only.
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${text.slice(0, end)}…`;
+}
+
 function capSnippet(text: string): string {
-  return text.length > SNIPPET_MAX_CHARS ? `${text.slice(0, SNIPPET_MAX_CHARS - 1)}…` : text;
+  return capText(text, SNIPPET_MAX_CHARS);
+}
+
+/**
+ * `title` is capped for the same reason `snippet` is, and on both the same
+ * paths.
+ *
+ * A provider that puts whole-page text where a title belongs is not
+ * hypothetical -- it is the same Firecrawl-family shape that motivated the
+ * snippet cap -- and an uncapped title is worse, because `mergeItems` uses the
+ * title as a dedup KEY: a 200,000-character key is hashed and compared on every
+ * cross-host pass, and the merged item carries it into the JSON document, the
+ * human render, and the RRF-ordered list a caller reads first.
+ *
+ * Larger than the snippet cap because a title is the field a reader scans, and
+ * truncating a long-but-legitimate headline hurts more than carrying it.
+ */
+const TITLE_MAX_CHARS = 300;
+
+function capTitle(text: string): string {
+  return capText(text, TITLE_MAX_CHARS);
 }
 
 function toRawItem(entry: unknown): RawItem | undefined {
   if (!isRecord(entry)) return undefined;
   const url = firstString(entry, FIELD_CANDIDATES.url);
   if (url === undefined) return undefined;
-  const title = firstString(entry, FIELD_CANDIDATES.title);
+  const rawTitle = firstString(entry, FIELD_CANDIDATES.title);
+  const title = rawTitle !== undefined ? capTitle(rawTitle) : undefined;
   const full = firstString(entry, FIELD_CANDIDATES.snippet);
   const snippet = full !== undefined ? capSnippet(full) : undefined;
   const publishedAt = firstString(entry, FIELD_CANDIDATES.publishedAt);
@@ -218,6 +262,50 @@ export function sniffItems(body: unknown): RawItem[] {
     for (const entry of array) {
       const item = toRawItem(entry);
       if (item !== undefined) items.push(item);
+    }
+    if (items.length > best.length) best = items;
+  }
+  // Only when the object sweep found nothing: see `sniffUrlStrings`. Folded in
+  // here rather than layered over this function by its callers, so every
+  // consumer -- `extractItems` and any direct caller -- reads the same shapes.
+  return best.length > 0 ? best : sniffUrlStrings(body);
+}
+
+/**
+ * Absolute http(s) URLs, for reading an array of bare strings.
+ *
+ * Deliberately stricter than `canonicalizeUrl`'s "try to parse it": that
+ * function is forgiving because it is handed a value a provider already
+ * NOMINATED as a URL (it sat under a `url`/`link` key). Here there is no such
+ * nomination -- the only evidence is the shape of the string itself -- so a
+ * relative path, a doc id or a sentence must not be promoted into a result.
+ */
+const BARE_URL = /^https?:\/\/\S+$/;
+
+/**
+ * Reads an array of bare URL strings, the commonest non-object result shape.
+ *
+ * Separate from `toRawItem` and applied only as a FALLBACK, after the
+ * object-shaped sweep found nothing: a body that carries real result objects
+ * must never be out-scored by some longer array of strings elsewhere in it (a
+ * list of related queries, a tag cloud, a set of image URLs on one article).
+ * The object sweep is the higher-confidence signal and keeps its precedence.
+ *
+ * A result read this way has a URL and nothing else -- no title, no snippet --
+ * which is exactly what such a provider gave us. Round-1's review left this
+ * shape unread and asked for the decision to be taken on paper rather than
+ * discovered against a billed capture; this is that decision. Reading it costs
+ * nothing when it is absent and turns a billed-but-empty provider into a
+ * contributing one when it is present.
+ */
+function sniffUrlStrings(body: unknown): RawItem[] {
+  let best: RawItem[] = [];
+  for (const array of collectArrays(body)) {
+    const items: RawItem[] = [];
+    for (const entry of array) {
+      if (typeof entry !== 'string') continue;
+      const trimmed = entry.trim();
+      if (BARE_URL.test(trimmed)) items.push({ url: trimmed });
     }
     if (items.length > best.length) best = items;
   }
@@ -434,7 +522,7 @@ function sanitizeRow(entry: unknown): RawItem | undefined {
   if (typeof url !== 'string' || url.trim() === '') return undefined;
   return {
     url,
-    ...(typeof title === 'string' ? { title } : {}),
+    ...(typeof title === 'string' ? { title: capTitle(title) } : {}),
     // Capped here as well as in `toRawItem`, so the bound is a property of
     // every item entering `mergeItems` rather than of one of its two
     // producers. This is the ADAPTER path, and adapters are hand-transcribed
@@ -519,7 +607,7 @@ export function mergeItems(
           ...(raw.publishedAt !== undefined ? { publishedAt: raw.publishedAt } : {}),
           providers: [hit],
           score: 0,
-          duplicates: raw.url === canonical ? [] : [raw.url],
+          duplicates: raw.url === canonical ? [] : [redactUserinfo(raw.url)],
         });
         return;
       }
@@ -527,7 +615,8 @@ export function mergeItems(
       // document twice (pagination, a decorated duplicate), and a backend
       // counted twice reads downstream as two providers agreeing.
       recordHit(existing.providers, hit);
-      if (raw.url !== canonical && !existing.duplicates.includes(raw.url)) existing.duplicates.push(raw.url);
+      const original = redactUserinfo(raw.url);
+      if (original !== canonical && !existing.duplicates.includes(original)) existing.duplicates.push(original);
       // Keep the richest text: a provider that returned a snippet is more
       // useful than one that returned only a link, whichever arrived first.
       //
@@ -689,6 +778,28 @@ export interface Coverage {
   suppressed: number;
   /** Machine-computed, human-readable. The agent's cue to spend another round. */
   gaps: string[];
+}
+
+/**
+ * `url` with any userinfo removed, for recording an ORIGINAL on `duplicates`.
+ *
+ * `duplicates` exists to show what was collapsed into an item, and the original
+ * spelling is the useful part of that -- but a password is not part of a
+ * spelling, and `duplicates` is printed to stdout and serialized into the
+ * `--json` document. Redacting keeps the record and drops the secret.
+ * Unparseable values (a doc id, a relative path) pass through unchanged, the
+ * same forgiving contract `canonicalizeUrl` states.
+ */
+function redactUserinfo(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.username === '' && parsed.password === '') return url;
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.toString();
+  } catch {
+    return url;
+  }
 }
 
 /** Dropped queries that carry a reason, grouped by it, in first-seen order —
@@ -921,5 +1032,16 @@ export function nextActions(coverage: Coverage, sessionId: string | undefined, a
       cmd: `fezoctl scrape ${shellQuote(target.url)}`,
     });
   }
-  return actions;
+  // Deduped by `cmd`: every failed backend produces the identical
+  // `fezoctl providers --intent search`, so an all-lanes-failed round emitted
+  // it once per provider. A list of next actions with the same line three times
+  // reads as three things to do.  The FIRST occurrence is kept, so the `why`
+  // the caller sees is the first cause that produced it.
+  const seenCmd = new Set<string>();
+  return actions.filter((action) => {
+    if (action.cmd === undefined) return true;
+    if (seenCmd.has(action.cmd)) return false;
+    seenCmd.add(action.cmd);
+    return true;
+  });
 }

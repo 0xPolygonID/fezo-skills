@@ -10375,6 +10375,8 @@ function canonicalizeUrl(url) {
   }
   parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
   parsed.hash = "";
+  parsed.username = "";
+  parsed.password = "";
   const params = [...parsed.searchParams.entries()].filter(([key]) => !key.toLowerCase().startsWith("utm_") && !TRACKING_PARAMS.includes(key.toLowerCase())).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
   parsed.search = "";
   for (const [key, value] of params) parsed.searchParams.append(key, value);
@@ -10397,14 +10399,26 @@ function collectArrays(value, depth = 0, found = []) {
   }
   return found;
 }
+function capText(text, limit) {
+  if (text.length <= limit) return text;
+  let end = limit - 1;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 55296 && last <= 56319) end -= 1;
+  return `${text.slice(0, end)}\u2026`;
+}
 function capSnippet(text) {
-  return text.length > SNIPPET_MAX_CHARS ? `${text.slice(0, SNIPPET_MAX_CHARS - 1)}\u2026` : text;
+  return capText(text, SNIPPET_MAX_CHARS);
+}
+var TITLE_MAX_CHARS = 300;
+function capTitle(text) {
+  return capText(text, TITLE_MAX_CHARS);
 }
 function toRawItem(entry) {
   if (!isRecord4(entry)) return void 0;
   const url = firstString(entry, FIELD_CANDIDATES.url);
   if (url === void 0) return void 0;
-  const title = firstString(entry, FIELD_CANDIDATES.title);
+  const rawTitle = firstString(entry, FIELD_CANDIDATES.title);
+  const title = rawTitle !== void 0 ? capTitle(rawTitle) : void 0;
   const full = firstString(entry, FIELD_CANDIDATES.snippet);
   const snippet = full !== void 0 ? capSnippet(full) : void 0;
   const publishedAt = firstString(entry, FIELD_CANDIDATES.publishedAt);
@@ -10422,6 +10436,20 @@ function sniffItems(body) {
     for (const entry of array) {
       const item = toRawItem(entry);
       if (item !== void 0) items.push(item);
+    }
+    if (items.length > best.length) best = items;
+  }
+  return best.length > 0 ? best : sniffUrlStrings(body);
+}
+var BARE_URL = /^https?:\/\/\S+$/;
+function sniffUrlStrings(body) {
+  let best = [];
+  for (const array of collectArrays(body)) {
+    const items = [];
+    for (const entry of array) {
+      if (typeof entry !== "string") continue;
+      const trimmed = entry.trim();
+      if (BARE_URL.test(trimmed)) items.push({ url: trimmed });
     }
     if (items.length > best.length) best = items;
   }
@@ -10470,7 +10498,7 @@ function sanitizeRow(entry) {
   if (typeof url !== "string" || url.trim() === "") return void 0;
   return {
     url,
-    ...typeof title === "string" ? { title } : {},
+    ...typeof title === "string" ? { title: capTitle(title) } : {},
     // Capped here as well as in `toRawItem`, so the bound is a property of
     // every item entering `mergeItems` rather than of one of its two
     // producers. This is the ADAPTER path, and adapters are hand-transcribed
@@ -10505,12 +10533,13 @@ function mergeItems(lanes, seenUrls = /* @__PURE__ */ new Set()) {
           ...raw.publishedAt !== void 0 ? { publishedAt: raw.publishedAt } : {},
           providers: [hit],
           score: 0,
-          duplicates: raw.url === canonical ? [] : [raw.url]
+          duplicates: raw.url === canonical ? [] : [redactUserinfo(raw.url)]
         });
         return;
       }
       recordHit(existing.providers, hit);
-      if (raw.url !== canonical && !existing.duplicates.includes(raw.url)) existing.duplicates.push(raw.url);
+      const original = redactUserinfo(raw.url);
+      if (original !== canonical && !existing.duplicates.includes(original)) existing.duplicates.push(original);
       if (existing.title === existing.url && raw.title !== void 0) existing.title = raw.title;
       if (existing.snippet === void 0 && raw.snippet !== void 0) existing.snippet = raw.snippet;
       if (existing.publishedAt === void 0 && raw.publishedAt !== void 0) existing.publishedAt = raw.publishedAt;
@@ -10541,6 +10570,17 @@ function mergeItems(lanes, seenUrls = /* @__PURE__ */ new Set()) {
   return { items: merged, suppressed: suppressedUrls.size, suppressedUrls };
 }
 var THIN_QUERY_THRESHOLD = 3;
+function redactUserinfo(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.username === "" && parsed.password === "") return url;
+    parsed.username = "";
+    parsed.password = "";
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
 function groupByReason(dropped) {
   const byReason = /* @__PURE__ */ new Map();
   for (const entry of dropped) {
@@ -10657,7 +10697,13 @@ function nextActions(coverage, sessionId, aborted) {
       cmd: `fezoctl scrape ${shellQuote(target.url)}`
     });
   }
-  return actions;
+  const seenCmd = /* @__PURE__ */ new Set();
+  return actions.filter((action) => {
+    if (action.cmd === void 0) return true;
+    if (seenCmd.has(action.cmd)) return false;
+    seenCmd.add(action.cmd);
+    return true;
+  });
 }
 
 // src/engine/research.ts
@@ -10675,17 +10721,21 @@ function lanesForQuery(query, plan, candidates, excluded) {
     }
   }
   const lanes = [];
+  const skipped = [];
   for (const rec of orderByIndexDiversity(eligible, plan.fanout)) {
+    let resolved2 = false;
     for (const entry of rec.entryMethods) {
       const candidate = byTool.get(entry);
       if (candidate === void 0) continue;
       const argName = resolveArgName(candidate.inputSchema, "query");
       if (argName === void 0) continue;
       lanes.push({ query, backendId: rec.backendId, rank: lanes.length + 1, candidate, argName });
+      resolved2 = true;
       break;
     }
+    if (!resolved2) skipped.push(`${rec.backendId} (not in catalog)`);
   }
-  return lanes;
+  return { lanes, skipped };
 }
 async function pool(tasks, limit, shouldStop) {
   const out = [];
@@ -10727,12 +10777,20 @@ async function runResearch(options) {
   const planned = [];
   const droppedQueries = [];
   const narrowedQueries = [];
+  const planSkipped = [];
   const targetReserve = Math.min(plan.targets.length, maxCalls);
   let budget = maxCalls - targetReserve;
+  const searchShaped = plan.intents.filter((intent) => intent !== "scrape" && intent !== "crawl");
+  const noSearchIntent = plan.intents.length > 0 && searchShaped.length === 0;
   for (const query of plan.queries) {
-    const lanes = lanesForQuery(query, plan, candidates, excluded);
+    if (noSearchIntent) {
+      droppedQueries.push({ query, reason: `no search-shaped intent declared (intents: ${plan.intents.join(", ")})` });
+      continue;
+    }
+    const { lanes, skipped: unreachable } = lanesForQuery(query, plan, candidates, excluded);
+    planSkipped.push(...unreachable);
     if (lanes.length === 0) {
-      planned.push({ query, lanes: [] });
+      droppedQueries.push({ query, reason: "no provider in the catalog can serve it" });
       continue;
     }
     if (budget <= 0) {
@@ -10828,7 +10886,7 @@ async function runResearch(options) {
     ...documents.map((d) => d.backendId)
   ]);
   const failed = ran.flatMap((r) => r.failed !== void 0 ? [r.failed] : []);
-  const skipped = ran.flatMap((r) => r.skipped !== void 0 ? [r.skipped] : []);
+  const skipped = [.../* @__PURE__ */ new Set([...planSkipped, ...ran.flatMap((r) => r.skipped !== void 0 ? [r.skipped] : [])])];
   const aborted = ran.find((r) => r.aborted !== void 0)?.aborted ?? targetsRan.find((r) => r.aborted !== void 0)?.aborted;
   const unstartedQueryIndexes = /* @__PURE__ */ new Set();
   const unstartedQueries = /* @__PURE__ */ new Set();
@@ -11554,8 +11612,37 @@ function renderResearch(outcome, sessionId, json) {
         duplicates: item.duplicates
       })),
       documents: outcome.documents.map((doc) => ({ url: doc.url, backend_id: doc.backendId, content: doc.content })),
-      coverage: outcome.coverage,
-      next_actions: outcome.nextActions.map((a) => ({ why: a.why, cmd: a.cmd })),
+      // Mapped, not emitted raw. Every other section of this document is
+      // snake_case (`calls_billed`, `backend_id`, `result_rank`), and
+      // `coverage` was the one place the engine's internal camelCase reached
+      // the wire -- `droppedQueries` sitting next to `calls_billed` in the same
+      // object. SKILL.md teaches agents to read `gaps`, so this is a public
+      // contract from the moment anything depends on it; it is cheaper to make
+      // it consistent now than to keep both spellings forever.
+      coverage: {
+        queries: outcome.coverage.queries.map((q) => ({
+          query: q.query,
+          unique_urls: q.uniqueUrls,
+          agreement_median: q.agreementMedian
+        })),
+        served: outcome.coverage.served,
+        failed: outcome.coverage.failed.map((f) => ({ backend_id: f.backendId, reason: f.reason })),
+        skipped: outcome.coverage.skipped,
+        ...outcome.coverage.domainConcentration !== void 0 ? { domain_concentration: outcome.coverage.domainConcentration } : {},
+        dropped_queries: outcome.coverage.droppedQueries,
+        unfetched_targets: outcome.coverage.unfetchedTargets,
+        narrowed_queries: outcome.coverage.narrowedQueries,
+        suppressed: outcome.coverage.suppressed,
+        gaps: outcome.coverage.gaps
+      },
+      next_actions: outcome.nextActions.map((a) => ({
+        why: a.why,
+        // Omitted rather than emitted as null when an action carries no
+        // command: a consumer testing `if (action.cmd)` and one testing
+        // `'cmd' in action` must agree, and `null` in a field documented as a
+        // runnable command invites being coerced to the string "null".
+        ...a.cmd !== void 0 ? { cmd: a.cmd } : {}
+      })),
       billing: { calls_billed: outcome.billing.callsBilled, attempts: outcome.billing.attempts },
       session: sessionId !== void 0 ? { id: sessionId } : null
     });
@@ -11599,6 +11686,8 @@ function renderResearch(outcome, sessionId, json) {
 // src/engine/session.ts
 import { mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync } from "node:fs";
 import { dirname as dirname2, join as join2 } from "node:path";
+var SESSION_MAX_SEEN_URLS = 2e3;
+var SESSION_MAX_QUERIES = 500;
 var SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 function validateSessionId(id) {
   if (!SESSION_ID_PATTERN.test(id) || id === "." || id === "..") {
@@ -12213,7 +12302,13 @@ function planFromFlags(prompt, flags) {
     if (!Number.isInteger(fanout) || fanout < 1) throw new Error("--fanout must be a positive integer");
     overrides.fanout = fanout;
   }
-  return clampPlan(mergePlan(planner.plan(prompt), overrides));
+  const plan = clampPlan(mergePlan(planner.plan(prompt), overrides));
+  if (plan.queries.length === 0 && plan.targets.length === 0) {
+    throw new Error(
+      "this plan has no queries and no targets, so the round would do nothing: give a prompt with something to search for or a URL to fetch, or pass --queries/--targets"
+    );
+  }
+  return plan;
 }
 async function cmdPlan(flags, emit) {
   const prompt = flags.positionals.join(" ");
@@ -12275,8 +12370,15 @@ async function cmdResearch(flags, deps, emit, excluded) {
       saveSession(
         {
           id: active.id,
-          seenUrls: [.../* @__PURE__ */ new Set([...active.state.seenUrls, ...seenUrlsFrom(outcome)])],
-          queries: [.../* @__PURE__ */ new Set([...active.state.queries, ...plan.queries])],
+          // Bounded, newest-last. The file is read and rewritten on every
+          // round, so an unbounded union makes a long investigation pay a
+          // growing I/O and parse cost for suppression value that decays: the
+          // oldest URLs are the ones the agent has most likely finished with,
+          // and re-seeing one costs a single duplicate row, not a wrong answer.
+          // `slice(-N)` keeps the most recent, which are the ones a follow-up
+          // round is actually about to re-encounter.
+          seenUrls: [.../* @__PURE__ */ new Set([...active.state.seenUrls, ...seenUrlsFrom(outcome)])].slice(-SESSION_MAX_SEEN_URLS),
+          queries: [.../* @__PURE__ */ new Set([...active.state.queries, ...plan.queries])].slice(-SESSION_MAX_QUERIES),
           callsBilled: active.state.callsBilled + outcome.billing.callsBilled
         },
         env,

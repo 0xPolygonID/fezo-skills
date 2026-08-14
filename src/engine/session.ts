@@ -13,6 +13,22 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
+/**
+ * Bounds on what one session file retains.
+ *
+ * A research session is read and rewritten on every round, so an unbounded
+ * history makes each round pay a growing parse-and-write cost. The value of an
+ * old entry decays too: suppression exists so a follow-up round does not
+ * re-return what the agent has just read, and the oldest URLs are the ones it
+ * has most likely finished with. Exceeding the bound costs at worst one
+ * duplicate row, never a wrong answer -- which is why bounding is safe here and
+ * would not be in, say, a billing ledger.
+ *
+ * 2000 URLs is roughly 80 full research rounds at 24 calls each.
+ */
+export const SESSION_MAX_SEEN_URLS = 2000;
+export const SESSION_MAX_QUERIES = 500;
+
 export interface SessionState {
   id: string;
   /** Canonical URLs (aggregate.ts's `canonicalizeUrl` form) already returned. */

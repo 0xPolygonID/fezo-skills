@@ -324,6 +324,51 @@ fezoctl research "<prompt>" [--intents a,b] [--queries "q1" --queries "q2"]
 
 `plan` performs no network I/O and needs no credentials.
 
+## Decisions taken during review
+
+Recorded here because each settles a question the original spec left open or
+answered inconsistently, and each is now enforced by code and a test:
+
+- **Budget order: targets first, queries take what is left.** `clampPlan`
+  always documented this; the executor spent on queries first, so a named URL
+  could go unfetched while a fan-out widened. An explicit target is an
+  instruction and a fan-out width is a preference, so the executor now matches
+  the documented order.
+- **A short budget narrows a query rather than cancelling it.** Lanes are
+  dropped from the tail of the diversity order — by construction the
+  lowest-diversity provider — and the narrowing is reported. A query is dropped
+  only when the budget leaves it no lane at all.
+- **An account-scoped abort emits no spend-again actions.** `unauthorized`,
+  `limit_exceeded` and `insufficient_balance` describe the account, so every
+  follow-up would spend into whatever tripped. The round returns one action
+  naming the blocker and carrying no command, since none of this CLI's commands
+  fixes a spend limit. `NextAction.cmd` is therefore optional, and never prose.
+- **Unstarted work is reported as unstarted.** A query the abort stopped before
+  any lane started, and a query no catalog provider can serve, are reported as
+  not-run with a reason — never as a query that "returned no results", which is
+  a claim about the web made on a request never sent.
+- **A residual with no content word is not a query**, but only when URLs were
+  actually stripped from the prompt. For a URL-free prompt the residual is the
+  whole prompt, and suppressing it would turn an ordinary search into a
+  do-nothing round.
+- **An array of bare URL strings is read**, as a fallback that never competes
+  with the object-shaped sweep on length. Round-1 left this shape unread and
+  asked for the decision to be taken on paper rather than against a billed
+  capture; this is that decision.
+- **Userinfo is stripped from canonical URLs and redacted on `duplicates`.** It
+  is not part of a document's identity, and it otherwise reached stdout, the
+  `--json` document, and the session cache on disk.
+- **`title` is capped like `snippet`** (300 vs 500 characters), on both the
+  sniffer and adapter paths, and truncation never splits a surrogate pair. An
+  uncapped title is worse than an uncapped snippet: `mergeItems` uses the title
+  as a dedup key.
+- **The `coverage` section of the `--json` document is snake_case**, like every
+  other section. SKILL.md teaches agents to read `gaps`, so this is a public
+  contract from the moment anything depends on it.
+- **Session history is bounded** (2000 URLs, 500 queries, newest kept). The
+  file is read and rewritten every round, and the oldest entries are the ones a
+  follow-up is least likely to re-encounter.
+
 ## Testing
 
 - `plan.test.ts` — merge precedence, schema rejection, cap enforcement,

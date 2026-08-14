@@ -86,7 +86,7 @@ import type { AttemptLog, MechanicalFailure, RunReport } from './engine/retry.js
 import { classifyFailure, run } from './engine/retry.js';
 import type { ValidationResult } from './engine/schema.js';
 import { SchemaValidatorCache, validateArgs } from './engine/schema.js';
-import { loadSession, saveSession, validateSessionId } from './engine/session.js';
+import { SESSION_MAX_QUERIES, SESSION_MAX_SEEN_URLS, loadSession, saveSession, validateSessionId } from './engine/session.js';
 import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS, RESEARCH_COMMANDS, RESEARCH_DESCRIPTIONS } from './engine/steering.js';
 import { findCandidateByToolName } from './engine/tool-name.js';
 
@@ -1081,7 +1081,21 @@ function planFromFlags(prompt: string, flags: Flags): RoutingPlan {
     if (!Number.isInteger(fanout) || fanout < 1) throw new Error('--fanout must be a positive integer');
     overrides.fanout = fanout;
   }
-  return clampPlan(mergePlan(planner.plan(prompt), overrides));
+  const plan = clampPlan(mergePlan(planner.plan(prompt), overrides));
+  // The same emptiness check `parsePlanJson` applies to `--plan-json`, applied
+  // to the MERGED plan so every path to a do-nothing round fails the same way.
+  // Without it `research "hello" --queries "   "` reached the executor with
+  // nothing to run and exited 2 with a blank report -- no results, no gaps, no
+  // next actions, and no statement of what went wrong. A round that cannot do
+  // anything is a usage error, and a usage error is caught here, during argv
+  // handling, before a candidate is selected or a call is billed.
+  if (plan.queries.length === 0 && plan.targets.length === 0) {
+    throw new Error(
+      'this plan has no queries and no targets, so the round would do nothing: '
+        + 'give a prompt with something to search for or a URL to fetch, or pass --queries/--targets',
+    );
+  }
+  return plan;
 }
 
 async function cmdPlan(flags: Flags, emit: Emit): Promise<number> {
@@ -1169,8 +1183,15 @@ async function cmdResearch(flags: Flags, deps: CliDeps, emit: Emit, excluded: re
       saveSession(
         {
           id: active.id,
-          seenUrls: [...new Set([...active.state.seenUrls, ...seenUrlsFrom(outcome)])],
-          queries: [...new Set([...active.state.queries, ...plan.queries])],
+          // Bounded, newest-last. The file is read and rewritten on every
+          // round, so an unbounded union makes a long investigation pay a
+          // growing I/O and parse cost for suppression value that decays: the
+          // oldest URLs are the ones the agent has most likely finished with,
+          // and re-seeing one costs a single duplicate row, not a wrong answer.
+          // `slice(-N)` keeps the most recent, which are the ones a follow-up
+          // round is actually about to re-encounter.
+          seenUrls: [...new Set([...active.state.seenUrls, ...seenUrlsFrom(outcome)])].slice(-SESSION_MAX_SEEN_URLS),
+          queries: [...new Set([...active.state.queries, ...plan.queries])].slice(-SESSION_MAX_QUERIES),
           callsBilled: active.state.callsBilled + outcome.billing.callsBilled,
         },
         env,

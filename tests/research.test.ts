@@ -635,3 +635,79 @@ describe('runResearch: budget ordering and fractional budgets', () => {
     expect(outcome.coverage.narrowedQueries.map((n) => n.query)).not.toContain('beta');
   });
 });
+
+describe('runResearch: reporting a query nothing could serve', () => {
+  it('names the ranked providers this catalog cannot reach', async () => {
+    const fetchFn = routedFetch({ you: [results(['https://a.example'])] });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['coffee'], fanout: 4 }),
+      candidates: [candidate('you', 'search')], excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    // One provider served; the other three budgeted lanes were unreachable and
+    // must be said so, or the thin gap reads as "the web is sparse".
+    expect(outcome.coverage.skipped.length).toBeGreaterThan(0);
+    for (const entry of outcome.coverage.skipped) expect(entry).toMatch(/not in catalog/);
+  });
+
+  it('reports a query with no reachable provider as not run, not as empty', async () => {
+    const fetchFn = routedFetch({});
+    const outcome = await runResearch({
+      plan: plan({ queries: ['coffee'] }), candidates: [], excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.coverage.droppedQueries).toEqual([
+      { query: 'coffee', reason: 'no provider in the catalog can serve it' },
+    ]);
+    expect(outcome.coverage.gaps.join(' ')).not.toMatch(/returned no results/);
+    expect(outcome.billing.attempts).toHaveLength(0);
+  });
+
+  it('does not fan out searches when the caller declared only scrape', async () => {
+    const fetchFn = routedFetch({});
+    const outcome = await runResearch({
+      plan: plan({ intents: ['scrape'], queries: ['coffee'], targets: [] }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.billing.attempts).toHaveLength(0);
+    expect(outcome.coverage.droppedQueries[0]?.reason).toMatch(/no search-shaped intent/);
+  });
+});
+
+describe('runResearch: the call budget holds across every shape', () => {
+  // The three places that must agree — clampPlan's formula, the executor's
+  // budget loop, and the target reservation — have no test pinning them
+  // together. This is that test: whatever the shape, the round may never issue
+  // more calls than the budget it was given.
+  const shapes: Array<{ queries: number; targets: number; fanout: number; maxCalls?: number }> = [
+    { queries: 1, targets: 0, fanout: 1 },
+    { queries: 3, targets: 0, fanout: 5 },
+    { queries: 1, targets: 3, fanout: 5, maxCalls: 4 },
+    { queries: 5, targets: 5, fanout: 4 },
+    { queries: 12, targets: 0, fanout: 3 },
+    { queries: 0, targets: 10, fanout: 8 },
+    { queries: 2, targets: 2, fanout: 10, maxCalls: 6 },
+    { queries: 8, targets: 8, fanout: 8, maxCalls: 1 },
+  ];
+
+  it.each(shapes)('never exceeds min(maxCalls, MAX_RESEARCH_CALLS) for %o', async (shape) => {
+    let calls = 0;
+    const fetchFn = (async (url: string | URL) => {
+      calls += 1;
+      return String(url).includes('/scrape')
+        ? new Response('{"content":"body"}', { status: 200 })
+        : results([`https://r${String(calls)}.example`]);
+    }) as unknown as typeof fetch;
+    const outcome = await runResearch({
+      plan: plan({
+        intents: ['search', 'scrape'],
+        queries: Array.from({ length: shape.queries }, (_u, i) => `q${String(i)}`),
+        targets: Array.from({ length: shape.targets }, (_u, i) => `https://t${String(i)}.example`),
+        fanout: shape.fanout,
+      }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+      ...(shape.maxCalls !== undefined ? { maxCalls: shape.maxCalls } : {}),
+    });
+    const ceiling = Math.min(shape.maxCalls ?? MAX_RESEARCH_CALLS, MAX_RESEARCH_CALLS);
+    expect(calls).toBeLessThanOrEqual(ceiling);
+    expect(outcome.billing.attempts.length).toBeLessThanOrEqual(ceiling);
+  });
+});
