@@ -672,3 +672,20 @@ describe('renderResearch', () => {
     expect(JSON.parse(renderResearch(OUTCOME, 'r-1', true)).session.id).toBe('r-1');
   });
 });
+
+describe('renderResearch caps the title', () => {
+  const longTitled: ResearchOutcome = {
+    ...OUTCOME,
+    items: [{ ...OUTCOME.items[0]!, title: 'T'.repeat(200_000) }],
+  };
+
+  it('in the JSON document', () => {
+    const doc = JSON.parse(renderResearch(longTitled, undefined, true));
+    expect(doc.items[0].title.length).toBe(300);
+  });
+
+  it('in the human render', () => {
+    const text = renderResearch(longTitled, undefined, false);
+    expect(text).not.toContain('T'.repeat(400));
+  });
+});

@@ -1,3 +1,11 @@
+// WARNING TO ANYONE RUNNING A MUTATION SWEEP: exclude this file. Two tests
+// below rebuild the bundle and byte-compare it against the committed
+// `dist/fezoctl.mjs`, so they fail on ANY edit to `src/` — which makes every
+// mutant look "killed" and a coverage sweep look total. A reviewer was misled
+// by exactly this and had to re-run the sweep per-file; five live guards turned
+// out to be unguarded underneath. Run `vitest run tests/<the-file>.test.ts` for
+// the module you are mutating instead.
+//
 // Contract tests for the generated `skills/fezo/SKILL.md` and the two
 // artifacts its packaging story depends on: `dist/fezoctl.mjs` (the
 // committed, deterministic bundle) and `skills/fezo/scripts/fezoctl.mjs`

@@ -22,6 +22,30 @@ const here = dirname(fileURLToPath(import.meta.url));
 const fixtureDir = join(here, 'fixtures', 'responses');
 const files = readdirSync(fixtureDir).filter((f) => f.endsWith('.json'));
 
+/**
+ * What each captured body actually contains, transcribed from the capture run.
+ *
+ * Exact counts, not `> 0`: an assertion that merely wants "some items" cannot
+ * tell a healthy fixture from a degraded one. Replacing a 19-result body with
+ * a one-result error envelope -- exactly what a re-capture against a rate
+ * limited or out-of-credit account produces -- passed the earlier version of
+ * this suite unnoticed, which would have made the calibration a rubber stamp.
+ *
+ * `dated` is here because the first calibration shipped these fixtures while
+ * silently dropping every date on three of the six providers: the sniffer read
+ * their URLs and titles, nobody checked their dates, and the spec then claimed
+ * it "read every captured body". A count assertion would not have caught that
+ * either -- only asserting the FIELDS does.
+ */
+const EXPECTED: Record<string, { items: number; dated: boolean }> = {
+  brave_news: { items: 20, dated: true },
+  brave_search: { items: 19, dated: true },
+  exa_search: { items: 10, dated: true },
+  firecrawl_search: { items: 10, dated: false },
+  geonode_search: { items: 19, dated: false },
+  you_search: { items: 10, dated: true },
+};
+
 describe('extractItems against captured provider responses', () => {
   it('has fixtures to check', () => {
     expect(files.length).toBeGreaterThan(0);
@@ -34,6 +58,23 @@ describe('extractItems against captured provider responses', () => {
     it(`reads results from ${tool}`, () => {
       const items = extractItems(tool, body);
       expect(items.length, `${tool} yielded no items — write an adapter for it`).toBeGreaterThan(0);
+      const expected = EXPECTED[tool];
+      expect(expected, `${tool} has no entry in EXPECTED — add one when adding a fixture`).toBeDefined();
+      // Exact: a fixture re-captured against an error or a rate limit shrinks,
+      // and a shrunken fixture must fail rather than quietly weaken this suite.
+      expect(items.length, `${tool} yielded ${String(items.length)} items, expected ${String(expected?.items)}`)
+        .toBe(expected?.items);
+    });
+
+    it(`reads publication dates from ${tool} when the provider sends them`, () => {
+      const items = extractItems(tool, body);
+      const dated = items.filter((i) => i.publishedAt !== undefined).length;
+      if (EXPECTED[tool]?.dated === true) {
+        // Most results, not all: a provider legitimately omits a date for a
+        // page it could not date. Zero means the field name is missing from
+        // FIELD_CANDIDATES, which is the defect this pins.
+        expect(dated, `${tool} dropped every date — check FIELD_CANDIDATES.publishedAt`).toBeGreaterThan(0);
+      }
     });
 
     it(`reads well-formed URLs from ${tool}`, () => {

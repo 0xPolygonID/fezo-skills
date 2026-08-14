@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { RRF_K, SNIPPET_MAX_CHARS, canonicalizeUrl, mergeItems, sniffItems } from '../src/engine/aggregate.js';
+import { RRF_K, SNIPPET_MAX_CHARS, canonicalizeUrl, capTitle, mergeItems, sniffItems } from '../src/engine/aggregate.js';
 import { RESPONSE_ADAPTERS, extractItems } from '../src/engine/aggregate.js';
 import { computeCoverage, nextActions } from '../src/engine/aggregate.js';
 import type { LaneItems, RawItem } from '../src/engine/aggregate.js';
@@ -856,13 +856,15 @@ describe('canonicalizeUrl: userinfo', () => {
 });
 
 describe('title is capped like snippet', () => {
-  it('caps a sniffed title in the merged output, not on the way in', () => {
-    // The cap belongs AFTER dedup: `sniffItems` keeps the full title because
-    // identity is decided on it. Only the emitted item is bounded.
+  it('does not cap anywhere identity is decided', () => {
+    // Neither the sniffer nor `mergeItems` may cap: `research.ts` merges per
+    // query and then merges those merges, so a title capped at the end of one
+    // merge is a capped title entering the next merge's dedup key. The cap
+    // lives at the render boundary; `renderResearch` is where it is asserted.
     const raw = sniffItems({ results: [{ url: 'https://a.example', title: 'T'.repeat(200_000) }] });
     expect(raw[0]?.title?.length).toBe(200_000);
     const { items } = mergeItems([{ backendId: 'b', rank: 1, items: raw }]);
-    expect(items[0]?.title.length).toBeLessThanOrEqual(300);
+    expect(items[0]?.title.length).toBe(200_000);
   });
 
   it('does not merge distinct documents whose long titles share a boilerplate prefix', () => {
@@ -877,10 +879,7 @@ describe('title is capped like snippet', () => {
       { backendId: 'exa', rank: 2, items: [{ url: 'https://site-b.example/other', title: `${boiler}Completely different article` }] },
     ]);
     expect(items).toHaveLength(2);
-    for (const item of items) {
-      expect(item.providers).toHaveLength(1);
-      expect(item.title.length).toBeLessThanOrEqual(300);
-    }
+    for (const item of items) expect(item.providers).toHaveLength(1);
   });
 
   it('still collapses a genuine cross-host twin whose full titles match', () => {
@@ -893,16 +892,21 @@ describe('title is capped like snippet', () => {
     expect(items[0]?.providers).toHaveLength(2);
   });
 
-  it('caps an adapter-supplied title', () => {
+  it('leaves an adapter-supplied title uncapped through the merge, for the same reason', () => {
     const original = RESPONSE_ADAPTERS['big_title'];
     RESPONSE_ADAPTERS['big_title'] = () => [{ url: 'https://a.example', title: 'T'.repeat(200_000) }];
     try {
       const { items } = mergeItems([{ backendId: 'b', rank: 1, items: extractItems('big_title', {}) }]);
-      expect(items[0]?.title.length).toBeLessThanOrEqual(300);
+      expect(items[0]?.title.length).toBe(200_000);
     } finally {
       if (original === undefined) delete RESPONSE_ADAPTERS['big_title'];
       else RESPONSE_ADAPTERS['big_title'] = original;
     }
+  });
+
+  it('caps the title at the render boundary, which is where text stops being identity', () => {
+    expect(capTitle('T'.repeat(200_000)).length).toBe(300);
+    expect(capTitle('short')).toBe('short');
   });
 
   it('never truncates in the middle of a surrogate pair', () => {
@@ -1030,4 +1034,20 @@ describe('duplicates never records an item as its own duplicate', () => {
     // This one IS a genuine rewrite, so the original is worth recording.
     expect(items[0]?.duplicates).toEqual(['https://www.a.example/p?utm_source=x']);
   });
+});
+
+describe('sniffUrlStrings: the allow-list entries each work', () => {
+  it.each(['results', 'organic_results', 'items', 'hits', 'records', 'entries', 'urls', 'data'])(
+    'reads a URL-string array under %s',
+    (key) => {
+      expect(sniffItems({ [key]: ['https://a.example', 'https://b.example'] })).toHaveLength(2);
+    },
+  );
+
+  it.each(['related_searches', 'pagination', 'images', 'sitelinks', 'next', 'tags', 'docs', 'links'])(
+    'reads nothing under %s',
+    (key) => {
+      expect(sniffItems({ [key]: ['https://a.example', 'https://b.example'] })).toEqual([]);
+    },
+  );
 });

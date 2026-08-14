@@ -358,13 +358,24 @@ answered inconsistently, and each is now enforced by code and a test:
 - **Userinfo is stripped from canonical URLs and redacted on `duplicates`.** It
   is not part of a document's identity, and it otherwise reached stdout, the
   `--json` document, and the session cache on disk.
-- **`title` is capped like `snippet`** (300 vs 500 characters), on both the
-  sniffer and adapter paths, and truncation never splits a surrogate pair. An
-  uncapped title is worse than an uncapped snippet: `mergeItems` uses the title
-  as a dedup key.
+- **`title` is capped at the RENDER boundary** (300 chars vs `snippet`'s 500),
+  never anywhere identity is decided, and truncation never splits a surrogate
+  pair. The cap cannot live in the sniffer, the adapter path, or even at the end
+  of `mergeItems`: `titleKey` strips the ellipsis, so a capped title is a lossy
+  dedup key — and because `runResearch` merges per query and then merges those
+  merges, "the end of `mergeItems`" is the *input* of the next merge. Two
+  distinct documents sharing 299 characters of cookie banner then collapse,
+  deleting a real result and fabricating cross-provider agreement. `snippet` is
+  capped at both producers instead, because nothing keys on it.
 - **The `coverage` section of the `--json` document is snake_case**, like every
   other section. SKILL.md teaches agents to read `gaps`, so this is a public
   contract from the moment anything depends on it.
+- **The target refusal is narrow.** `--intents` suppresses a target fetch only
+  when every declared intent is a "find pages for me" one (`search`, `news`),
+  which is the case where naming a URL up front contradicts the instruction. It
+  does not fire for `social`, `proxy`, `other` or `crawl`: an intent that says
+  nothing about fetching is not an instruction against it, and `social` is the
+  intent most likely to accompany a social-media URL.
 - **Session history is bounded** (2000 URLs, 500 queries, newest kept). The
   file is read and rewritten every round, and the oldest entries are the ones a
   follow-up is least likely to re-encounter.

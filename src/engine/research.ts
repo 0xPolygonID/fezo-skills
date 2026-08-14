@@ -342,10 +342,19 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   //
   // The ordinary path is unaffected: the heuristic emits `['scrape','search']`
   // whenever a prompt carries a URL, so only an explicit narrowing reaches this.
-  const scrapeShaped = plan.intents.some((intent) => intent === 'scrape' || intent === 'crawl');
-  const noScrapeIntent = plan.intents.length > 0 && !scrapeShaped;
+  // NARROW on purpose. The refusal fires only when every declared intent is a
+  // "go find pages for me" one (`search`, `news`) -- the case the review
+  // actually raised, where naming a URL up front contradicts the instruction.
+  //
+  // An earlier version fired for ANY non-scrape intent, which over-reached:
+  // `social` is the intent most likely to accompany a social-media URL and
+  // `other` is a catch-all, so refusing there answered a question nobody asked
+  // and silently dropped a fetch the caller plainly wanted. An intent that says
+  // nothing about fetching is not an instruction against it.
+  const FIND_INTENTS = new Set(['search', 'news']);
+  const noScrapeIntent = plan.intents.length > 0 && plan.intents.every((intent) => FIND_INTENTS.has(intent));
   const refusedTargets: UnfetchedTarget[] = noScrapeIntent
-    ? plan.targets.map((url) => ({ url, reason: `no scrape-shaped intent declared (intents: ${plan.intents.join(', ')})` }))
+    ? plan.targets.map((url) => ({ url, reason: `intents are search-only (${plan.intents.join(', ')})` }))
     : [];
   const fetchableTargets = noScrapeIntent ? [] : plan.targets;
   const targetReserve = Math.min(fetchableTargets.length, Math.max(0, maxCalls));

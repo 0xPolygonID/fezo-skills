@@ -768,7 +768,7 @@ describe('runResearch: declared intents are honoured in both directions', () => 
       candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
     });
     expect(outcome.documents).toHaveLength(0);
-    expect(outcome.coverage.unfetchedTargets[0]?.reason).toMatch(/no scrape-shaped intent/);
+    expect(outcome.coverage.unfetchedTargets[0]?.reason).toMatch(/search-only/);
     // The searches still ran: refusing one half of a plan must not cancel the other.
     expect(outcome.coverage.served).toContain('you');
   });
@@ -785,5 +785,163 @@ describe('runResearch: declared intents are honoured in both directions', () => 
       candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
     });
     expect(outcome.documents).toHaveLength(1);
+  });
+});
+
+describe('runResearch: a long shared title prefix does not merge distinct documents', () => {
+  // The regression MAJOR 1 of the Task-14 review found: capping the title at
+  // the end of `mergeItems` looked correct in a unit test and still failed
+  // here, because this function merges per query and then merges THOSE merges
+  // -- so the first call's capped titles became the second call's dedup key.
+  // Asserted at the executor level for exactly that reason: a `mergeItems`
+  // test cannot see a defect that only exists in the composition.
+  const boiler = 'Cookie notice. We and our partners use cookies to store and access information on a device. '.repeat(4);
+
+  it('keeps both documents, with one provider each', async () => {
+    const fetchFn = routedFetch({
+      you: [new Response(JSON.stringify({ results: [{ url: 'https://site-a.example/story', title: `${boiler}Story A headline` }] }), { status: 200 })],
+      exa: [new Response(JSON.stringify({ results: [{ url: 'https://site-b.example/other', title: `${boiler}Completely different article` }] }), { status: 200 })],
+      brave: [results([])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['storage'], fanout: 3 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.items).toHaveLength(2);
+    for (const item of outcome.items) expect(item.providers).toHaveLength(1);
+  });
+
+  it('does not contradict itself between coverage and items', async () => {
+    const fetchFn = routedFetch({
+      you: [new Response(JSON.stringify({ results: [{ url: 'https://site-a.example/story', title: `${boiler}Story A headline` }] }), { status: 200 })],
+      exa: [new Response(JSON.stringify({ results: [{ url: 'https://site-b.example/other', title: `${boiler}Completely different article` }] }), { status: 200 })],
+      brave: [results([])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['storage'], fanout: 3 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn },
+    });
+    // `uniqueUrls` is computed from the per-query merge and `items` from the
+    // cross-query merge. When the two disagree a reader cannot tell which half
+    // to believe, which is worse than either being wrong alone.
+    expect(outcome.coverage.queries[0]?.uniqueUrls).toBe(outcome.items.length);
+  });
+
+  it('still collapses a genuine cross-host twin through the executor', async () => {
+    const same = `${boiler}Identical headline`;
+    const fetchFn = routedFetch({
+      you: [new Response(JSON.stringify({ results: [{ url: 'https://outlet-a.example/s', title: same }] }), { status: 200 })],
+      exa: [new Response(JSON.stringify({ results: [{ url: 'https://outlet-b.example/s', title: same }] }), { status: 200 })],
+      brave: [results([])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['storage'], fanout: 3 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.items).toHaveLength(1);
+    expect(outcome.items[0]?.providers).toHaveLength(2);
+  });
+});
+
+describe('runResearch: guards the review found live but unguarded', () => {
+  it('sends a single query as a one-element array when the schema declares one', async () => {
+    // The entire point of the Task-14 array fix, and it shipped untested:
+    // `newsapi_articles` types its query argument as array-of-string, so a bare
+    // string fails that method's own schema at pre-flight and the rank-1 news
+    // provider is unreachable while still consuming a budgeted slot.
+    let sentBody: unknown;
+    const fetchFn = (async (_url: string | URL, init?: RequestInit) => {
+      sentBody = JSON.parse(String(init?.body ?? '{}'));
+      return results(['https://a.example']);
+    }) as unknown as typeof fetch;
+    const arrayArg = {
+      ...candidate('you', 'search'),
+      inputSchema: {
+        type: 'object',
+        properties: { query: { type: 'array', items: { type: 'string' } } },
+        required: ['query'],
+      },
+    };
+    await runResearch({
+      plan: plan({ queries: ['coffee'], fanout: 1 }), candidates: [arrayArg], excluded: [],
+      gateway: { ...gateway, fetchFn },
+    });
+    expect(sentBody).toEqual({ query: ['coffee'] });
+  });
+
+  it('still sends a bare string when the schema declares a string', async () => {
+    let sentBody: unknown;
+    const fetchFn = (async (_url: string | URL, init?: RequestInit) => {
+      sentBody = JSON.parse(String(init?.body ?? '{}'));
+      return results(['https://a.example']);
+    }) as unknown as typeof fetch;
+    await runResearch({
+      plan: plan({ queries: ['coffee'], fanout: 1 }), candidates: [candidate('you', 'search')], excluded: [],
+      gateway: { ...gateway, fetchFn },
+    });
+    expect(sentBody).toEqual({ query: 'coffee' });
+  });
+
+  it('bills nothing on a negative call budget', async () => {
+    // The Math.max(0, ...) floor has now been silently deleted once; without a
+    // test it can be deleted again. `slice(0, -5)` keeps all but the last five.
+    let calls = 0;
+    const fetchFn = (async () => { calls += 1; return new Response('{"content":"b"}', { status: 200 }); }) as unknown as typeof fetch;
+    const outcome = await runResearch({
+      // SIX targets, not two: `slice(0, -5)` keeps all but the last five, so a
+      // missing floor only leaks when the list is longer than the magnitude of
+      // the negative budget. A two-target case passes with or without the fix.
+      plan: plan({
+        intents: ['search', 'scrape'], queries: ['alpha'],
+        targets: Array.from({ length: 6 }, (_u, i) => `https://t${String(i)}.example`),
+      }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, maxCalls: -5,
+    });
+    expect(calls).toBe(0);
+    expect(outcome.billing.callsBilled).toBe(0);
+    expect(outcome.documents).toHaveLength(0);
+  });
+
+  it('does not fetch a refused target, not merely report it as unfetched', async () => {
+    // Previously only the GAP was pinned, so removing the refusal produced a
+    // round that billed the fetch and reported it as not fetched in the same
+    // document -- a contradiction no test could see.
+    let calls = 0;
+    const fetchFn = (async (url: string | URL) => {
+      calls += 1;
+      return String(url).includes('/scrape')
+        ? new Response('{"content":"b"}', { status: 200 })
+        : results(['https://a.example']);
+    }) as unknown as typeof fetch;
+    const outcome = await runResearch({
+      plan: plan({ intents: ['search'], queries: ['alpha'], targets: ['https://t.example'], fanout: 1 }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.documents).toHaveLength(0);
+    expect(calls).toBe(1); // the one search lane, and nothing else
+  });
+});
+
+describe('runResearch: the target refusal is narrow', () => {
+  it.each(['social', 'proxy', 'other'])('still fetches a target under --intents %s', async (intent) => {
+    // These intents say nothing about fetching. `social` in particular is the
+    // one most likely to accompany a social-media URL, and refusing there
+    // silently drops a fetch the caller plainly asked for.
+    const fetchFn = routedFetch({ scrapingdog: [new Response('{"content":"b"}', { status: 200 })] });
+    const outcome = await runResearch({
+      plan: plan({ intents: [intent as never], queries: [], targets: ['https://t.example'] }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.documents).toHaveLength(1);
+  });
+
+  it.each([['search'], ['news'], ['search', 'news']])('refuses under find-only intents %j', async (...intents) => {
+    const fetchFn = routedFetch({});
+    const outcome = await runResearch({
+      plan: plan({ intents: intents as never, queries: [], targets: ['https://t.example'] }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.documents).toHaveLength(0);
+    expect(outcome.coverage.unfetchedTargets[0]?.reason).toMatch(/search-only/);
   });
 });

@@ -60,7 +60,18 @@ const FIELD_CANDIDATES = {
   url: ['url', 'link', 'href', 'web_url', 'webUrl', 'source_url', 'sourceUrl', 'permalink'],
   title: ['title', 'name', 'heading', 'headline', 'page_title'],
   snippet: ['snippet', 'description', 'summary', 'text', 'content', 'excerpt', 'abstract'],
-  publishedAt: ['published_at', 'publishedAt', 'published_date', 'publishedDate', 'datePublished', 'date', 'pubDate'],
+  // `page_age` is FIRST among the vendor spellings and ahead of `date`, on
+  // evidence rather than taste: the captured fixtures
+  // (tests/fixtures/responses/) show Brave (web and news) and You.com dating
+  // every result with `page_age` in ISO-8601, while Brave's `age` alongside it
+  // is human prose ("January 12, 2021") and its `date` appears on nested
+  // metadata rather than on the result. Omitting `page_age` silently dropped
+  // the date from three of the six calibrated providers -- including both news
+  // paths, where recency is the entire point of the intent.
+  publishedAt: [
+    'published_at', 'publishedAt', 'published_date', 'publishedDate', 'datePublished',
+    'page_age', 'date', 'pubDate',
+  ],
 } as const;
 // Both levels, as in one-step.ts's ARG_CANDIDATES: `as const` is erased at
 // compile time, so freezing only the outer object leaves each name list open to
@@ -224,19 +235,26 @@ function capSnippet(text: string): string {
  * Larger than the snippet cap because a title is the field a reader scans, and
  * truncating a long-but-legitimate headline hurts more than carrying it.
  *
- * APPLIED AT THE END OF `mergeItems`, never on the way in. Capping at the
- * producers put a truncated title into the cross-host dedup KEY, and
- * `titleKey` strips the ellipsis -- so two distinct documents whose titles
- * agreed for the first 299 characters collapsed into one. That is the input
- * class the cap exists for: a provider putting whole-page text in the title,
- * where a shared cookie or nav banner fills the opening paragraphs. The cost
- * was two harms at once -- a real result deleted, and two providers recorded
- * as agreeing, doubling the RRF score and inflating `agreement_median`.
- * Identity is decided on the full title; only the emitted string is bounded.
+ * APPLIED AT THE RENDER BOUNDARY (`render.ts`), never anywhere identity is
+ * decided. Capping a title puts a truncated string into the cross-host dedup
+ * KEY -- `titleKey` strips the ellipsis -- so two distinct documents whose
+ * titles agree for the first 299 characters collapse into one. That is exactly
+ * the input class the cap exists for: a provider putting whole-page text in the
+ * title, where a shared cookie or nav banner fills the opening paragraphs. The
+ * cost is three harms at once: a real result deleted, two providers recorded as
+ * agreeing (doubling the RRF score and inflating `agreement_median`), and a
+ * self-contradicting document whose `coverage.queries` and `items` disagree
+ * about how many URLs were found.
+ *
+ * This was first fixed by moving the cap from the producers to the end of
+ * `mergeItems`, which was still wrong: `research.ts` merges per query and then
+ * merges those merges, so the "end" of the first call is the INPUT of the
+ * second. A cap is only safe where nothing downstream compares titles again --
+ * and the only such place is where the text is written out.
  */
 const TITLE_MAX_CHARS = 300;
 
-function capTitle(text: string): string {
+export function capTitle(text: string): string {
   return capText(text, TITLE_MAX_CHARS);
 }
 
@@ -744,10 +762,12 @@ export function mergeItems(
     item.score = item.providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0);
   }
   merged.sort((a, b) => (b.score - a.score) || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
-  // The title cap, applied ONCE and LAST -- after every identity decision has
-  // been made on the full title. See TITLE_MAX_CHARS for what capping earlier
-  // destroyed.
-  for (const item of merged) item.title = capTitle(item.title);
+  // NO TITLE CAP HERE. See TITLE_MAX_CHARS: capping anywhere inside this
+  // function poisons a dedup key, and "at the end" is not far enough -- callers
+  // compose `mergeItems` (research.ts merges per query, then merges the results
+  // of those merges), so a title capped at the end of one call is a capped
+  // title entering the next call's cross-host key. The cap belongs at the
+  // boundary where text is EMITTED, not where identity is decided.
   // The SET travels alongside the count, because the per-document figure this
   // function is careful to compute is only per-document within ONE call: a
   // caller that merges per sub-query and adds the counts up reintroduces the

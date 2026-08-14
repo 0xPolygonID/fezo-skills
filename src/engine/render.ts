@@ -14,6 +14,7 @@ import type { BoundRequest } from './bindings.js';
 import type { CredentialDisplay, StoreCredentialsResult } from './credentials.js';
 import type { Intent } from './intent.js';
 import type { OneStepResult } from './one-step.js';
+import { capTitle } from './aggregate.js';
 import type { RoutingPlan } from './plan.js';
 import type { AnnotatedProviderRow, CapabilityGroup, ListedProviderRow, ProviderRow } from './provider-view.js';
 import { NOT_SUBSTITUTES_NOTE, annotate, annotateListed } from './provider-view.js';
@@ -1021,7 +1022,11 @@ export function renderResearch(outcome: ResearchOutcome, sessionId: string | und
       plan: outcome.plan,
       items: outcome.items.map((item) => ({
         url: item.url,
-        title: item.title,
+        // Capped HERE, at the emit boundary, because this is the last place the
+        // title is text rather than identity -- see aggregate.ts's
+        // TITLE_MAX_CHARS for the two earlier placements that both poisoned a
+        // dedup key.
+        title: capTitle(item.title),
         ...(item.snippet !== undefined ? { snippet: item.snippet } : {}),
         ...(item.publishedAt !== undefined ? { published_at: item.publishedAt } : {}),
         providers: item.providers.map((p) => ({ backend_id: p.backendId, rank: p.rank, result_rank: p.resultRank })),
@@ -1075,7 +1080,7 @@ export function renderResearch(outcome: ResearchOutcome, sessionId: string | und
   const lines: string[] = [];
   outcome.items.forEach((item, index) => {
     const providers = item.providers.map((p) => p.backendId).join(', ');
-    lines.push(`${String(index + 1)}. ${item.title}`);
+    lines.push(`${String(index + 1)}. ${capTitle(item.title)}`);
     lines.push(`   ${item.url}`);
     if (item.snippet !== undefined) lines.push(`   ${item.snippet}`);
     lines.push(`   sources: ${providers}${item.duplicates.length > 0 ? ` (+${String(item.duplicates.length)} duplicate link(s))` : ''}`);

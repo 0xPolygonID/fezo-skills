@@ -10351,7 +10351,24 @@ var FIELD_CANDIDATES = {
   url: ["url", "link", "href", "web_url", "webUrl", "source_url", "sourceUrl", "permalink"],
   title: ["title", "name", "heading", "headline", "page_title"],
   snippet: ["snippet", "description", "summary", "text", "content", "excerpt", "abstract"],
-  publishedAt: ["published_at", "publishedAt", "published_date", "publishedDate", "datePublished", "date", "pubDate"]
+  // `page_age` is FIRST among the vendor spellings and ahead of `date`, on
+  // evidence rather than taste: the captured fixtures
+  // (tests/fixtures/responses/) show Brave (web and news) and You.com dating
+  // every result with `page_age` in ISO-8601, while Brave's `age` alongside it
+  // is human prose ("January 12, 2021") and its `date` appears on nested
+  // metadata rather than on the result. Omitting `page_age` silently dropped
+  // the date from three of the six calibrated providers -- including both news
+  // paths, where recency is the entire point of the intent.
+  publishedAt: [
+    "published_at",
+    "publishedAt",
+    "published_date",
+    "publishedDate",
+    "datePublished",
+    "page_age",
+    "date",
+    "pubDate"
+  ]
 };
 for (const names of Object.values(FIELD_CANDIDATES)) Object.freeze(names);
 Object.freeze(FIELD_CANDIDATES);
@@ -10592,7 +10609,6 @@ function mergeItems(lanes, seenUrls = /* @__PURE__ */ new Set()) {
     item.score = item.providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0);
   }
   merged.sort((a, b) => b.score - a.score || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
-  for (const item of merged) item.title = capTitle(item.title);
   return { items: merged, suppressed: suppressedUrls.size, suppressedUrls };
 }
 var THIN_QUERY_THRESHOLD = 3;
@@ -10819,9 +10835,9 @@ async function runResearch(options) {
   const droppedQueries = [];
   const narrowedQueries = [];
   const planSkipped = [];
-  const scrapeShaped = plan.intents.some((intent) => intent === "scrape" || intent === "crawl");
-  const noScrapeIntent = plan.intents.length > 0 && !scrapeShaped;
-  const refusedTargets = noScrapeIntent ? plan.targets.map((url) => ({ url, reason: `no scrape-shaped intent declared (intents: ${plan.intents.join(", ")})` })) : [];
+  const FIND_INTENTS = /* @__PURE__ */ new Set(["search", "news"]);
+  const noScrapeIntent = plan.intents.length > 0 && plan.intents.every((intent) => FIND_INTENTS.has(intent));
+  const refusedTargets = noScrapeIntent ? plan.targets.map((url) => ({ url, reason: `intents are search-only (${plan.intents.join(", ")})` })) : [];
   const fetchableTargets = noScrapeIntent ? [] : plan.targets;
   const targetReserve = Math.min(fetchableTargets.length, Math.max(0, maxCalls));
   let budget = maxCalls - targetReserve;
@@ -11653,7 +11669,11 @@ function renderResearch(outcome, sessionId, json) {
       plan: outcome.plan,
       items: outcome.items.map((item) => ({
         url: item.url,
-        title: item.title,
+        // Capped HERE, at the emit boundary, because this is the last place the
+        // title is text rather than identity -- see aggregate.ts's
+        // TITLE_MAX_CHARS for the two earlier placements that both poisoned a
+        // dedup key.
+        title: capTitle(item.title),
         ...item.snippet !== void 0 ? { snippet: item.snippet } : {},
         ...item.publishedAt !== void 0 ? { published_at: item.publishedAt } : {},
         providers: item.providers.map((p) => ({ backend_id: p.backendId, rank: p.rank, result_rank: p.resultRank })),
@@ -11704,7 +11724,7 @@ function renderResearch(outcome, sessionId, json) {
   const lines = [];
   outcome.items.forEach((item, index) => {
     const providers = item.providers.map((p) => p.backendId).join(", ");
-    lines.push(`${String(index + 1)}. ${item.title}`);
+    lines.push(`${String(index + 1)}. ${capTitle(item.title)}`);
     lines.push(`   ${item.url}`);
     if (item.snippet !== void 0) lines.push(`   ${item.snippet}`);
     lines.push(`   sources: ${providers}${item.duplicates.length > 0 ? ` (+${String(item.duplicates.length)} duplicate link(s))` : ""}`);

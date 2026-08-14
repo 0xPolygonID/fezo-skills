@@ -51,8 +51,17 @@ const TOOLS = [
   'brave_news',
 ];
 
-/** Same order, and the same reasoning, as one-step.ts's ARG_CANDIDATES: a
- * required candidate beats an optional one, and among equals this order wins. */
+/**
+ * Same order, and the same reasoning, as one-step.ts's ARG_CANDIDATES: a
+ * required candidate beats an optional one, and among equals this order wins.
+ *
+ * A HAND COPY, and nothing enforces that it stays one — this script is plain
+ * Node and cannot import the TypeScript engine. If ARG_CANDIDATES.query gains
+ * or reorders a name, captures will silently be taken with a different argument
+ * than the executor sends, and the fixture will describe a call that never
+ * happens in production. Re-check it against src/engine/one-step.ts when a
+ * capture looks wrong.
+ */
 const QUERY_ARGS = ['query', 'q', 'search', 'search_query', 'keyword', 'keywords', 'term', 'text', 'prompt'];
 
 function run(args) {
@@ -69,10 +78,18 @@ function resolveArg(tool) {
   } catch {
     return undefined;
   }
-  const props = Object.keys(schema.properties ?? {});
+  const props = schema.properties ?? {};
+  const names = Object.keys(props);
   const required = new Set(schema.required ?? []);
-  const present = QUERY_ARGS.filter((name) => props.includes(name));
-  return present.find((name) => required.has(name)) ?? present[0];
+  const present = QUERY_ARGS.filter((name) => names.includes(name));
+  const name = present.find((n) => required.has(n)) ?? present[0];
+  if (name === undefined) return undefined;
+  // Arity from the schema, exactly as research.ts's `isArrayTyped` decides it.
+  // Without this the harness cannot capture `newsapi_articles` -- the very tool
+  // whose array-typed `keyword` this script's own run discovered -- so the fix
+  // for it could never be exercised end to end and TOOLS would report 6/7
+  // forever.
+  return { name, isArray: props[name]?.type === 'array' };
 }
 
 const argv = process.argv.slice(2);
@@ -89,18 +106,19 @@ let captured = 0;
 let billed = 0;
 
 for (const tool of TOOLS) {
-  const argName = resolveArg(tool);
-  if (argName === undefined) {
+  const arg = resolveArg(tool);
+  if (arg === undefined) {
     process.stdout.write(`skip ${tool}: not in catalog, or no query-shaped argument\n`);
     continue;
   }
+  const value = arg.isArray ? [query] : query;
   if (dryRun) {
-    process.stdout.write(`would call ${tool} with {"${argName}": "${query}"}\n`);
+    process.stdout.write(`would call ${tool} with ${JSON.stringify({ [arg.name]: value })}\n`);
     continue;
   }
   let report;
   try {
-    report = JSON.parse(run(['call', tool, '--args-json', JSON.stringify({ [argName]: query }), '--json']));
+    report = JSON.parse(run(['call', tool, '--args-json', JSON.stringify({ [arg.name]: value }), '--json']));
   } catch (error) {
     // A non-zero exit still prints the report document on stdout (see cli.ts's
     // --json contract), so a failed call is reported, never silently skipped.
