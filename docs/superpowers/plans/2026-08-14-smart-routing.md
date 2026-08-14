@@ -794,6 +794,96 @@ git add src/engine/planners/heuristic.ts tests/heuristic-planner.test.ts
 git commit -m "feat: add the deterministic heuristic planner"
 ```
 
+**Deviations recorded during implementation.**
+
+1. *`targets` strip trailing sentence punctuation.* Step 3's `URL_PATTERN`
+   excludes closing brackets and quotes but not `.`/`,`/`;`, so
+   `see https://example.com/a. and also https://example.com/b,` produced the
+   targets `https://example.com/a.` and `https://example.com/b,`. Nothing
+   downstream repairs that: Task 4's `canonicalizeUrl` runs on sniffed *result*
+   items, not on `plan.targets`, and Task 10 passes each target verbatim into
+   the scrape provider's `argName`. The consequence is a billed fetch of a URL
+   the user never wrote, reported afterwards as a coverage gap. Each match is
+   now put through `TRAILING_PUNCTUATION` (`/[.,;:!?'"]+$/`) before it becomes a
+   target; the two rows above are pinned in the test table.
+2. *Multi-word recency cues moved out of `RECENCY_WORDS` into
+   `RECENCY_PHRASES`.* Step 3 put `'this week'` and `'this month'` in a Set that
+   is only ever tested against `words()` output, which splits on a non-word
+   class and so can never yield a token containing a space -- both entries were
+   unreachable, while the table's own comment ("Matched as whole words") read as
+   if phrases worked. `what happened this week in AI` got `search` and no
+   `news`. The two entries (plus `'this year'`, for symmetry) are now a frozen
+   `RECENCY_PHRASES` array checked with `includes` against the lowercased
+   residual, alongside the token check, and the prompt is a table row.
+3. *`'literature'` replaced by `'literature review'` and `'literature survey'`
+   in `RESEARCH_PHRASES`.* The table's comment justifies substring matching by
+   the entries being "long enough not to collide with ordinary prose"; a bare
+   common noun is not, and the collision is expensive in the one direction that
+   matters -- `The Great Gatsby literature analysis` took depth `research`,
+   fan-out 8, four times the lanes of the shallow lookup it is. Both the
+   negative and the positive case are table rows.
+4. *Three smaller corrections to Step 3's block.* (a) The depth stage pushes
+   `depth:question-form` rather than a second `question-form`, because both
+   stages read the same cue and `plan.ts` renders `signals` to a human as the
+   explanation of the routing, where the same entry twice reads as a bug.
+   (b) The residual collapses interior whitespace as well as trimming, so the
+   hole a cut URL leaves does not travel into the provider's query argument --
+   and so two logically identical queries cannot survive `clampPlan`'s dedupe,
+   which trims but does not collapse. (c) `words()` splits on `/[^\p{L}\p{N}]+/u`
+   instead of `/[^a-z0-9]+/`: the ASCII-only class discarded every non-Latin
+   character, tokenizing a Chinese or Russian prompt to `[]`, which sent it down
+   the `fallback:no-signal` path at depth `shallow` however long it was. The
+   word tables stay English-only, so such a prompt still takes the fallback
+   intent, but `pickDepth` now measures its length correctly.
+5. *`RESEARCH_PHRASES` and `RECENCY_PHRASES` are frozen; the Sets are typed
+   `ReadonlySet<string>`.* Global Constraints require declared tables to be
+   frozen at module scope. `Object.freeze` on a `Set` does not stop `.add`, so
+   the Sets follow `rank.ts:35`'s `STOP_WORDS` convention instead, which states
+   the same intent through the type.
+6. *The test file is table-driven, as the spec asks, and pins exact signal
+   arrays.* Step 1's transparency test asserted only `signals.length > 0`, which
+   would have caught none of the above. The intent and depth blocks are now one
+   `it.each` table of prompt -> `{ intents, queries, targets, depth, fanout }`
+   (the spec's § Testing "table-driven prompt -> plan"), and five separate cases
+   assert the exact `signals` array, since a missing entry and a duplicated one
+   are both defects in output whose entire job is to be read.
+7. *`)` admitted into `URL_PATTERN` and unwound by a balanced-paren rule.*
+   Step 3 excluded `)` from the character class outright, which truncated
+   `.../wiki/Merkle_tree_(data_structure)` to `.../wiki/Merkle_tree_(data_structure`
+   -- the same harm deviation 1 was written to close, since Task 10 passes each
+   target verbatim to the scrape provider: a billed fetch of an address the
+   user never wrote, reported afterwards as a coverage gap. Wikipedia- and
+   MSDN-style parenthesised URLs are among the commonest a research prompt
+   pastes. Unlike `>`/`"`/`'`/`]`, a closing paren is genuinely common inside
+   an address, so no fixed character class can decide it; the match now admits
+   `)` and `trimUrl` drops trailing ones only while the match holds more `)`
+   than `(`, i.e. only when the paren closes something opened outside the URL.
+   The stripper loops, because `(see https://example.com/a.)` ends in `)` (so
+   `TRAILING_PUNCTUATION` does not fire) and ends in `.` once that paren goes.
+   Four rows pin it: the parenthesised address kept whole, and
+   `(https://example.com/a)` / `[the docs](https://example.com/docs)` still
+   yielding the bare URL.
+8. *`RECENCY_PHRASES` matched with a word boundary.* `lowerResidual.includes(phrase)`
+   fired "this week" inside "this weekend" and "this year" inside "this
+   yearbook", so `catalogue this yearbook of student photos please` took a
+   `news` lane the user never asked for -- and the table's own comment
+   ("already reads as a time reference in any sentence it appears in")
+   justified the substring test on a premise those words disprove. The frozen
+   phrase table is now compiled once into `RECENCY_PHRASE_PATTERNS`
+   (`\bphrase\b`), which is what makes scanning the text safe; the "yearbook"
+   prompt is a negative table row beside the positive "this week" one.
+9. *The `fallback:no-signal` branch is pinned and explained.* It was the one
+   untested path, and the only one that can emit a plan with neither queries
+   nor targets -- which `parsePlanJson` rejects outright ("a plan needs at
+   least one of them"), so the gap between what the planner may produce and
+   what the caller path forbids was undocumented. It is intended: an empty
+   prompt is Task 12's usage error (exit 1) to catch during argv parsing,
+   before anything is billed, and throwing from the planner would put that
+   check behind a planner call and deny a caller a plain "what would you do
+   with this?". A whitespace-only row and an exact-signals case
+   (`['fallback:no-signal', 'short-prompt:0-tokens']`) pin the behaviour, and
+   the branch carries the rationale.
+
 ---
 
 ### Task 4: Response sniffing and URL canonicalization
