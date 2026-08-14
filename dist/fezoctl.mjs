@@ -7855,8 +7855,9 @@ var require__2 = __commonJS({
 });
 
 // src/cli.ts
-import { readFileSync as readFileSync2 } from "node:fs";
-import { dirname as dirname2, join as join2 } from "node:path";
+import { readFileSync as readFileSync3 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { dirname as dirname3, join as join3 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/engine/ajv-instance.ts
@@ -9136,6 +9137,35 @@ function displayNameFor(backendId) {
   }
   return void 0;
 }
+function orderByIndexDiversity(recs, limit) {
+  const byIndex = /* @__PURE__ */ new Map();
+  for (const rec of recs) {
+    const list = byIndex.get(rec.indexId);
+    if (list) list.push(rec);
+    else byIndex.set(rec.indexId, [rec]);
+  }
+  const ordered = [];
+  let round = 0;
+  while (ordered.length < recs.length) {
+    let addedThisRound = false;
+    for (const bucket of byIndex.values()) {
+      const next = bucket[round];
+      if (next !== void 0) {
+        ordered.push(next);
+        addedThisRound = true;
+      }
+    }
+    if (!addedThisRound) break;
+    round += 1;
+  }
+  return ordered.slice(0, Math.max(0, limit));
+}
+function diversityOrder(intent, limit, excluded) {
+  const eligible = recommendationsFor(intent).filter(
+    (rec) => rec.notRecommended === void 0 && !isExcluded(rec.backendId, excluded)
+  );
+  return orderByIndexDiversity(eligible, limit);
+}
 
 // src/engine/provider-view.ts
 var NOT_SUBSTITUTES_NOTE = "These providers are not substitutes for one another \u2014 they span distinct functional categories (search, scrape/crawl, news, social, proxy). Compare providers within one capability group; a top rank in one group says nothing about fitness for another.";
@@ -9784,6 +9814,247 @@ async function runOneStep(spec, value, extra, candidates, excluded, gateway, max
   };
 }
 
+// src/engine/plan.ts
+var DEPTH_FANOUT = { shallow: 2, standard: 4, research: 8 };
+Object.freeze(DEPTH_FANOUT);
+var MAX_FANOUT = 10;
+var MAX_RESEARCH_CALLS = 24;
+var PLAN_SCHEMA = {
+  type: "object",
+  properties: {
+    intents: { type: "array", items: { type: "string", enum: INTENTS } },
+    queries: { type: "array", items: { type: "string" } },
+    targets: { type: "array", items: { type: "string" } },
+    depth: { type: "string", enum: ["shallow", "standard", "research"] },
+    // `maximum` as well as `minimum`, because this schema is the documented
+    // gate for caller-supplied plans and fanout is the field that multiplies
+    // spend: `{"fanout":9999}` validating and coming back verbatim made the
+    // gate advertise a cap it did not check. Rejecting is right here rather
+    // than clamping quietly -- a caller who typed 9999 asked for a round that
+    // does not exist, and this throw becomes exit 1 during argv parsing, before
+    // anything is billed. (`clampPlan` still clamps, for the flag and planner
+    // paths that never touch a schema.)
+    fanout: { type: "integer", minimum: 1, maximum: MAX_FANOUT },
+    signals: { type: "array", items: { type: "string" } },
+    source: { type: "string", enum: ["heuristic", "flags", "caller", "llm"] }
+  },
+  // Closed on purpose: a typo'd key in a hand-written --plan-json must fail
+  // loudly at parse time rather than being silently ignored and producing a
+  // round the caller did not ask for -- and paid for.
+  additionalProperties: false
+};
+function freezeDeep(value) {
+  if (value === null || typeof value !== "object") return;
+  for (const nested of Object.values(value)) freezeDeep(nested);
+  Object.freeze(value);
+}
+freezeDeep(PLAN_SCHEMA);
+var validatePlanSchema = newSchemaCompiler().compile(PLAN_SCHEMA);
+function parsePlanJson(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("--plan-json must be a JSON object");
+  }
+  if (!validatePlanSchema(raw)) {
+    throw new Error(`--plan-json is not a valid plan: ${ajvErrorsToText(validatePlanSchema.errors)}`);
+  }
+  const partial = raw;
+  const depth = partial.depth ?? "standard";
+  const plan = clampPlan({
+    intents: partial.intents ?? ["search"],
+    queries: partial.queries ?? [],
+    targets: partial.targets ?? [],
+    depth,
+    fanout: partial.fanout ?? DEPTH_FANOUT[depth],
+    signals: partial.signals ?? [],
+    // Always 'caller', whatever the JSON claims: this plan arrived from the
+    // command line, and `source` records who actually won the merge rather
+    // than what the document says about itself.
+    source: "caller"
+  });
+  if (plan.queries.length === 0 && plan.targets.length === 0) {
+    throw new Error(
+      "--plan-json has no queries and no targets: a plan needs at least one of them (note that --plan-json replaces the planner's whole plan, it does not merge field-wise -- use --depth/--fanout/--queries to adjust one field)"
+    );
+  }
+  return plan;
+}
+function mergePlan(base, overrides) {
+  let out = overrides.plan !== void 0 ? { ...overrides.plan, source: "caller" } : base;
+  const flagged = overrides.intents !== void 0 || overrides.queries !== void 0 || overrides.targets !== void 0 || overrides.depth !== void 0 || overrides.fanout !== void 0;
+  if (!flagged) return clampPlan(out);
+  const depth = overrides.depth ?? out.depth;
+  out = {
+    ...out,
+    intents: overrides.intents ?? out.intents,
+    queries: overrides.queries ?? out.queries,
+    targets: overrides.targets ?? out.targets,
+    signals: [...out.signals],
+    depth,
+    // A depth flag with no explicit fanout re-derives the width, so
+    // `--depth research` widens the round the way a caller expects.
+    fanout: overrides.fanout ?? (overrides.depth !== void 0 ? DEPTH_FANOUT[depth] : out.fanout),
+    source: "flags"
+  };
+  return clampPlan(out);
+}
+function clampPlan(plan) {
+  const dedupe = (values) => {
+    const seen = /* @__PURE__ */ new Set();
+    const out = [];
+    for (const value of values) {
+      const trimmed = value.trim();
+      if (trimmed === "" || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      out.push(trimmed);
+    }
+    return out;
+  };
+  const fanout = Number.isFinite(plan.fanout) ? Math.min(MAX_FANOUT, Math.max(1, Math.trunc(plan.fanout))) : DEPTH_FANOUT[plan.depth];
+  const targets = dedupe(plan.targets).slice(0, MAX_RESEARCH_CALLS);
+  const maxQueries = Math.floor((MAX_RESEARCH_CALLS - targets.length) / fanout);
+  return {
+    ...plan,
+    intents: [...new Set(plan.intents)],
+    queries: dedupe(plan.queries).slice(0, maxQueries),
+    targets,
+    // Copied so the returned plan shares no array with its input; every other
+    // array here is rebuilt anyway, and an advisory list is exactly the thing
+    // a renderer is tempted to append to.
+    signals: [...plan.signals],
+    fanout
+  };
+}
+
+// src/engine/planners/heuristic.ts
+var URL_PATTERN = /https?:\/\/[^\s<>"'\]]+/g;
+var TRAILING_PUNCTUATION = /[.,;:!?'"]+$/;
+function countOf(text, ch) {
+  let n = 0;
+  for (const c of text) if (c === ch) n += 1;
+  return n;
+}
+function trimUrl(match) {
+  let url = match;
+  for (; ; ) {
+    const stripped = url.replace(TRAILING_PUNCTUATION, "");
+    if (stripped.endsWith(")") && countOf(stripped, ")") > countOf(stripped, "(")) {
+      url = stripped.slice(0, -1);
+      continue;
+    }
+    return stripped;
+  }
+}
+var RECENCY_WORDS = /* @__PURE__ */ new Set([
+  "latest",
+  "recent",
+  "current",
+  "currently",
+  "today",
+  "yesterday",
+  "now",
+  "breaking",
+  "news",
+  "update",
+  "updates"
+]);
+var RECENCY_PHRASES = ["this week", "this month", "this year"];
+Object.freeze(RECENCY_PHRASES);
+var RECENCY_PHRASE_PATTERNS = Object.freeze(
+  RECENCY_PHRASES.map((phrase) => new RegExp(`\\b${phrase}\\b`))
+);
+var RESEARCH_PHRASES = [
+  "deep research",
+  "comprehensive",
+  "in depth",
+  "in-depth",
+  "thorough",
+  "everything about",
+  "all sources",
+  "as much as possible",
+  "exhaustive",
+  "literature review",
+  "literature survey",
+  "survey of",
+  "research on",
+  "research about"
+];
+Object.freeze(RESEARCH_PHRASES);
+var QUESTION_WORDS = /* @__PURE__ */ new Set(["what", "why", "how", "when", "where", "who", "which", "is", "are", "does", "do", "can", "should"]);
+var SEARCH_VERBS = /* @__PURE__ */ new Set(["find", "search", "compare", "list", "research", "investigate", "analyse", "analyze", "gather"]);
+function words(prompt) {
+  return prompt.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w !== "");
+}
+function looksLikeYear(word) {
+  return /^(19|20)\d{2}$/.test(word);
+}
+function pickDepth(prompt, tokens, signals) {
+  const lower = prompt.toLowerCase();
+  for (const phrase of RESEARCH_PHRASES) {
+    if (lower.includes(phrase)) {
+      signals.push(`research-phrase:${phrase}`);
+      return "research";
+    }
+  }
+  if (tokens.length >= 12) {
+    signals.push(`long-prompt:${String(tokens.length)}-tokens`);
+    return "standard";
+  }
+  if (tokens.length <= 4) {
+    signals.push(`short-prompt:${String(tokens.length)}-tokens`);
+    return "shallow";
+  }
+  const isQuestion = tokens[0] !== void 0 && QUESTION_WORDS.has(tokens[0]);
+  if (isQuestion) {
+    signals.push("depth:question-form");
+    return "standard";
+  }
+  signals.push("default-depth");
+  return "shallow";
+}
+var heuristicPlanner = {
+  id: "heuristic",
+  plan(prompt) {
+    const signals = [];
+    const intents = [];
+    const targets = [...prompt.matchAll(URL_PATTERN)].map((m) => trimUrl(m[0]));
+    if (targets.length > 0) {
+      intents.push("scrape");
+      signals.push(`url-literal:${String(targets.length)}`);
+    }
+    const residual = prompt.replace(URL_PATTERN, " ").replace(/\s+/g, " ").trim();
+    const tokens = words(residual);
+    const hasQuestion = tokens[0] !== void 0 && QUESTION_WORDS.has(tokens[0]);
+    const hasSearchVerb = tokens.some((t) => SEARCH_VERBS.has(t));
+    const wantsSearch = targets.length === 0 || hasQuestion || hasSearchVerb || tokens.length >= 4;
+    if (wantsSearch && tokens.length > 0) {
+      intents.push("search");
+      if (hasQuestion) signals.push("question-form");
+      if (hasSearchVerb) signals.push("search-verb");
+    }
+    const lowerResidual = residual.toLowerCase();
+    const hasRecency = tokens.some((t) => RECENCY_WORDS.has(t) || looksLikeYear(t)) || RECENCY_PHRASE_PATTERNS.some((pattern) => pattern.test(lowerResidual));
+    if (hasRecency && intents.includes("search")) {
+      intents.push("news");
+      signals.push("recency-cue");
+    }
+    if (intents.length === 0) {
+      intents.push("search");
+      signals.push("fallback:no-signal");
+    }
+    const depth = pickDepth(residual, tokens, signals);
+    const queries = intents.includes("search") && residual !== "" ? [residual] : [];
+    if (queries.length === 0 && targets.length > 0) signals.push("targets-only");
+    if (depth === "research" && queries.length <= 1) {
+      signals.push("no-decomposition: heuristic cannot split this into sub-queries; supply --queries");
+    }
+    return { intents, queries, targets, depth, fanout: DEPTH_FANOUT[depth], signals, source: "heuristic" };
+  }
+};
+function resolvePlanner(id) {
+  if (id === "heuristic") return heuristicPlanner;
+  throw new Error(`unknown planner "${id}"`);
+}
+
 // src/engine/preference.ts
 var CAPABILITY_KEYWORDS = {
   scrape: [
@@ -10053,6 +10324,557 @@ function selectForRun(candidates, intent) {
   const chosen = ranked[0];
   if (chosen === void 0) return { outcome: "no-match" };
   return { outcome: "selected", chosen, ranked };
+}
+
+// src/engine/aggregate.ts
+var TRACKING_PARAMS = [
+  "gclid",
+  "fbclid",
+  "msclkid",
+  "mc_eid",
+  "mc_cid",
+  "igshid",
+  "ref",
+  "ref_src",
+  "yclid",
+  "dclid",
+  "_hsenc",
+  "_hsmi"
+];
+Object.freeze(TRACKING_PARAMS);
+var FIELD_CANDIDATES = {
+  url: ["url", "link", "href", "web_url", "webUrl", "source_url", "sourceUrl", "permalink"],
+  title: ["title", "name", "heading", "headline", "page_title"],
+  snippet: ["snippet", "description", "summary", "text", "content", "excerpt", "abstract"],
+  publishedAt: ["published_at", "publishedAt", "published_date", "publishedDate", "datePublished", "date", "pubDate"]
+};
+for (const names of Object.values(FIELD_CANDIDATES)) Object.freeze(names);
+Object.freeze(FIELD_CANDIDATES);
+var SNIPPET_MAX_CHARS = 500;
+function isRecord4(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function firstString(record, names) {
+  for (const name of names) {
+    const value = record[name];
+    if (typeof value === "string" && value.trim() !== "") return value.trim();
+  }
+  return void 0;
+}
+function canonicalizeUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return url;
+  }
+  parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  parsed.hash = "";
+  const params = [...parsed.searchParams.entries()].filter(([key]) => !key.toLowerCase().startsWith("utm_") && !TRACKING_PARAMS.includes(key.toLowerCase())).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  parsed.search = "";
+  for (const [key, value] of params) parsed.searchParams.append(key, value);
+  if (parsed.pathname.endsWith("/") && parsed.pathname !== "/") {
+    parsed.pathname = parsed.pathname.slice(0, -1);
+  }
+  let out = parsed.toString();
+  if (out.endsWith("/")) out = out.slice(0, -1);
+  return out;
+}
+function collectArrays(value, depth = 0, found = []) {
+  if (depth > 6) return found;
+  if (Array.isArray(value)) {
+    found.push(value);
+    for (const entry of value) collectArrays(entry, depth + 1, found);
+    return found;
+  }
+  if (isRecord4(value)) {
+    for (const entry of Object.values(value)) collectArrays(entry, depth + 1, found);
+  }
+  return found;
+}
+function toRawItem(entry) {
+  if (!isRecord4(entry)) return void 0;
+  const url = firstString(entry, FIELD_CANDIDATES.url);
+  if (url === void 0) return void 0;
+  const title = firstString(entry, FIELD_CANDIDATES.title);
+  const full = firstString(entry, FIELD_CANDIDATES.snippet);
+  const snippet = full !== void 0 && full.length > SNIPPET_MAX_CHARS ? `${full.slice(0, SNIPPET_MAX_CHARS - 1)}\u2026` : full;
+  const publishedAt = firstString(entry, FIELD_CANDIDATES.publishedAt);
+  return {
+    url,
+    ...title !== void 0 ? { title } : {},
+    ...snippet !== void 0 ? { snippet } : {},
+    ...publishedAt !== void 0 ? { publishedAt } : {}
+  };
+}
+function sniffItems(body) {
+  let best = [];
+  for (const array of collectArrays(body)) {
+    const items = [];
+    for (const entry of array) {
+      const item = toRawItem(entry);
+      if (item !== void 0) items.push(item);
+    }
+    if (items.length > best.length) best = items;
+  }
+  return best;
+}
+var RESPONSE_ADAPTERS = {};
+function extractItems(tool, body) {
+  const adapter = RESPONSE_ADAPTERS[tool];
+  if (adapter !== void 0) {
+    try {
+      const out = adapter(body);
+      return Array.isArray(out) ? out : sniffItems(body);
+    } catch {
+      return sniffItems(body);
+    }
+  }
+  return sniffItems(body);
+}
+function recordHit(providers, hit) {
+  const existing = providers.find((p) => p.backendId === hit.backendId);
+  if (existing === void 0) {
+    providers.push(hit);
+    return;
+  }
+  if (hit.resultRank < existing.resultRank) {
+    existing.rank = hit.rank;
+    existing.resultRank = hit.resultRank;
+  }
+}
+var RRF_K = 60;
+function titleKey(title) {
+  return title.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
+}
+function hostOf(url) {
+  let host;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return void 0;
+  }
+  return host === "" ? void 0 : host;
+}
+function sanitizeRow(entry) {
+  if (!isRecord4(entry)) return void 0;
+  const { url, title, snippet, publishedAt } = entry;
+  if (typeof url !== "string" || url.trim() === "") return void 0;
+  return {
+    url,
+    ...typeof title === "string" ? { title } : {},
+    ...typeof snippet === "string" ? { snippet } : {},
+    ...typeof publishedAt === "string" ? { publishedAt } : {}
+  };
+}
+function mergeItems(lanes, seenUrls = /* @__PURE__ */ new Set()) {
+  const byCanonical = /* @__PURE__ */ new Map();
+  const suppressedUrls = /* @__PURE__ */ new Set();
+  for (const lane of lanes) {
+    lane.items.forEach((entry, index) => {
+      const raw = sanitizeRow(entry);
+      if (raw === void 0) return;
+      const canonical = canonicalizeUrl(raw.url);
+      if (seenUrls.has(canonical)) {
+        suppressedUrls.add(canonical);
+        return;
+      }
+      const hit = { backendId: lane.backendId, rank: lane.rank, resultRank: index + 1 };
+      const existing = byCanonical.get(canonical);
+      if (existing === void 0) {
+        byCanonical.set(canonical, {
+          url: canonical,
+          title: raw.title ?? canonical,
+          ...raw.snippet !== void 0 ? { snippet: raw.snippet } : {},
+          ...raw.publishedAt !== void 0 ? { publishedAt: raw.publishedAt } : {},
+          providers: [hit],
+          score: 0,
+          duplicates: raw.url === canonical ? [] : [raw.url]
+        });
+        return;
+      }
+      recordHit(existing.providers, hit);
+      if (raw.url !== canonical && !existing.duplicates.includes(raw.url)) existing.duplicates.push(raw.url);
+      if (existing.title === existing.url && raw.title !== void 0) existing.title = raw.title;
+      if (existing.snippet === void 0 && raw.snippet !== void 0) existing.snippet = raw.snippet;
+      if (existing.publishedAt === void 0 && raw.publishedAt !== void 0) existing.publishedAt = raw.publishedAt;
+    });
+  }
+  const byTitle = /* @__PURE__ */ new Map();
+  const merged = [];
+  for (const item of byCanonical.values()) {
+    const reduced = item.title === item.url ? "" : titleKey(item.title);
+    const key = reduced === "" ? void 0 : reduced;
+    const entry = key !== void 0 ? byTitle.get(key) : void 0;
+    const host = hostOf(item.url);
+    if (entry !== void 0 && host !== void 0 && !entry.hosts.has(host)) {
+      entry.hosts.add(host);
+      for (const hit of item.providers) recordHit(entry.rep.providers, hit);
+      entry.rep.duplicates.push(item.url, ...item.duplicates);
+      if (entry.rep.snippet === void 0 && item.snippet !== void 0) entry.rep.snippet = item.snippet;
+      if (entry.rep.publishedAt === void 0 && item.publishedAt !== void 0) entry.rep.publishedAt = item.publishedAt;
+      continue;
+    }
+    if (key !== void 0 && entry === void 0 && host !== void 0) byTitle.set(key, { rep: item, hosts: /* @__PURE__ */ new Set([host]) });
+    merged.push(item);
+  }
+  for (const item of merged) {
+    item.score = item.providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0);
+  }
+  merged.sort((a, b) => b.score - a.score || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
+  return { items: merged, suppressed: suppressedUrls.size, suppressedUrls };
+}
+var THIN_QUERY_THRESHOLD = 3;
+function median(values) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2 : sorted[mid] ?? 0;
+}
+function computeCoverage(input) {
+  const queries = input.queries.map(({ query, items }) => ({
+    query,
+    uniqueUrls: items.length,
+    agreementMedian: median(items.map((i) => i.providers.length))
+  }));
+  const hosts = /* @__PURE__ */ new Map();
+  let total = 0;
+  for (const { items } of input.queries) {
+    for (const item of items) {
+      const host = hostOf(item.url);
+      if (host === void 0) continue;
+      hosts.set(host, (hosts.get(host) ?? 0) + 1);
+      total += 1;
+    }
+  }
+  let domainConcentration;
+  if (total > 0) {
+    const [host, count] = [...hosts.entries()].sort((a, b) => b[1] - a[1])[0] ?? ["", 0];
+    if (host !== "") domainConcentration = { host, share: count / total };
+  }
+  const gaps = [];
+  for (const q of queries) {
+    if (q.uniqueUrls === 0) gaps.push(`"${q.query}" returned no results`);
+    else if (q.uniqueUrls < THIN_QUERY_THRESHOLD) gaps.push(`"${q.query}" is thin (${String(q.uniqueUrls)} unique URLs)`);
+    else if (q.agreementMedian <= 1) gaps.push(`"${q.query}" has no cross-provider agreement`);
+  }
+  for (const failure of input.failed) gaps.push(`${failure.backendId} failed (${failure.reason})`);
+  if (input.droppedQueries.length > 0) gaps.push(`not run (call budget): ${input.droppedQueries.join(", ")}`);
+  if (input.unfetchedTargets.length > 0) {
+    const rendered = input.unfetchedTargets.map((t) => t.reason !== void 0 ? `${t.url} (${t.reason})` : t.url);
+    gaps.push(`not fetched: ${rendered.join(", ")}`);
+  }
+  if (domainConcentration !== void 0 && domainConcentration.share > 0.6 && total >= 5) {
+    gaps.push(`${String(Math.round(domainConcentration.share * 100))}% of results are from ${domainConcentration.host}`);
+  }
+  return {
+    queries,
+    served: [...input.served],
+    failed: input.failed.map((f) => ({ ...f })),
+    skipped: [...input.skipped],
+    ...domainConcentration !== void 0 ? { domainConcentration } : {},
+    droppedQueries: [...input.droppedQueries],
+    // Element-wise, like `failed` above and for the same reason: a spread alone
+    // would hand the caller's own objects back inside a finished report.
+    unfetchedTargets: input.unfetchedTargets.map((t) => ({ ...t })),
+    suppressed: input.suppressed,
+    gaps
+  };
+}
+function shellQuote(value) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+function nextActions(coverage, sessionId) {
+  const session = sessionId !== void 0 ? ` --session ${sessionId}` : "";
+  const actions = [];
+  for (const q of coverage.queries) {
+    if (q.uniqueUrls >= THIN_QUERY_THRESHOLD && q.agreementMedian > 1) continue;
+    actions.push({
+      // Mirrors the three-way branch the gap text uses, because `why` and the
+      // gap describe the same query to the same reader: calling a query with
+      // plenty of unique URLs "thin" contradicts the gap line sitting next to it
+      // and sends the agent after the wrong remedy.
+      why: q.uniqueUrls === 0 ? `"${q.query}" returned nothing` : q.uniqueUrls < THIN_QUERY_THRESHOLD ? `"${q.query}" is thin` : `"${q.query}" has no cross-provider agreement`,
+      cmd: `fezoctl research ${shellQuote(q.query)} --depth research${session}`
+    });
+  }
+  for (const failure of coverage.failed) {
+    actions.push({
+      why: `${failure.backendId} failed (${failure.reason})`,
+      cmd: `fezoctl providers --intent search`
+    });
+  }
+  for (const query of coverage.droppedQueries) {
+    actions.push({ why: "not run: call budget", cmd: `fezoctl research ${shellQuote(query)}${session}` });
+  }
+  for (const target of coverage.unfetchedTargets) {
+    actions.push({
+      why: target.reason !== void 0 ? `not fetched (${target.reason})` : "not fetched",
+      cmd: `fezoctl scrape ${shellQuote(target.url)}`
+    });
+  }
+  return actions;
+}
+
+// src/engine/research.ts
+var RESEARCH_CONCURRENCY = 6;
+function lanesForQuery(query, plan, candidates, excluded) {
+  const byTool = new Map(candidates.map((c) => [c.tool, c]));
+  const intents = plan.intents.filter((intent) => intent !== "scrape" && intent !== "crawl");
+  const eligible = [];
+  const seenBackend = /* @__PURE__ */ new Set();
+  for (const intent of intents.length > 0 ? intents : ["search"]) {
+    for (const rec of diversityOrder(intent, Number.MAX_SAFE_INTEGER, excluded)) {
+      if (seenBackend.has(rec.backendId)) continue;
+      seenBackend.add(rec.backendId);
+      eligible.push(rec);
+    }
+  }
+  const lanes = [];
+  for (const rec of orderByIndexDiversity(eligible, plan.fanout)) {
+    for (const entry of rec.entryMethods) {
+      const candidate = byTool.get(entry);
+      if (candidate === void 0) continue;
+      const argName = resolveArgName(candidate.inputSchema, "query");
+      if (argName === void 0) continue;
+      lanes.push({ query, backendId: rec.backendId, rank: lanes.length + 1, candidate, argName });
+      break;
+    }
+  }
+  return lanes;
+}
+async function pool(tasks, limit, shouldStop) {
+  const out = [];
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, async () => {
+    for (; ; ) {
+      if (shouldStop()) return;
+      const index = next;
+      next += 1;
+      const task = tasks[index];
+      if (task === void 0) return;
+      out.push(await task());
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+function scrapeLane(candidates, excluded) {
+  const byTool = new Map(candidates.map((c) => [c.tool, c]));
+  for (const rec of diversityOrder("scrape", Number.MAX_SAFE_INTEGER, excluded)) {
+    for (const entry of rec.entryMethods) {
+      const candidate = byTool.get(entry);
+      if (candidate === void 0) continue;
+      const argName = resolveArgName(candidate.inputSchema, "url");
+      if (argName === void 0) continue;
+      return { backendId: rec.backendId, candidate, argName };
+    }
+  }
+  return void 0;
+}
+async function runResearch(options) {
+  const { plan, candidates, excluded, gateway } = options;
+  const maxCalls = Math.min(options.maxCalls ?? MAX_RESEARCH_CALLS, MAX_RESEARCH_CALLS);
+  const concurrency = options.concurrency ?? RESEARCH_CONCURRENCY;
+  const planned = [];
+  const droppedQueries = [];
+  let budget = maxCalls;
+  for (const query of plan.queries) {
+    const lanes = lanesForQuery(query, plan, candidates, excluded);
+    if (lanes.length === 0) {
+      planned.push({ query, lanes: [] });
+      continue;
+    }
+    if (lanes.length > budget) {
+      droppedQueries.push(query);
+      continue;
+    }
+    budget -= lanes.length;
+    planned.push({ query, lanes });
+  }
+  const fetchable = Math.max(0, budget);
+  const fetchTargets = plan.targets.slice(0, fetchable);
+  const unfetchedTargets = plan.targets.slice(fetchable);
+  const plannedLanes = planned.flatMap(
+    ({ lanes }, queryIndex) => lanes.map((lane2) => ({ queryIndex, lane: lane2 }))
+  );
+  const laneReports = plannedLanes.map(() => void 0);
+  const laneItemsByQuery = planned.map(() => []);
+  const targetReports = fetchTargets.map(() => void 0);
+  let abortSeen = false;
+  const tasks = plannedLanes.map(({ queryIndex, lane: lane2 }, laneIndex) => async () => {
+    const report = await run({
+      baseUrl: gateway.baseUrl,
+      apiKey: gateway.apiKey,
+      candidates: [lane2.candidate],
+      args: { [lane2.argName]: lane2.query },
+      maxAttempts: 1,
+      ...gateway.fetchFn !== void 0 ? { fetchFn: gateway.fetchFn } : {}
+    });
+    const laneReport = { attempts: [...report.attempts] };
+    laneReports[laneIndex] = laneReport;
+    for (const attempt of report.attempts) {
+      if (attempt.gatewayCode !== void 0 && ABORT_CODES.has(attempt.gatewayCode)) {
+        laneReport.aborted ??= `${attempt.gatewayCode}: ${attempt.reason}`;
+        abortSeen = true;
+      }
+    }
+    if (report.outcome.kind !== "success") {
+      const last = report.attempts[report.attempts.length - 1];
+      if (last?.preflight !== void 0) laneReport.skipped = `${lane2.backendId} (${last.preflight} rejected)`;
+      else laneReport.failed = { backendId: lane2.backendId, reason: last?.gatewayCode ?? last?.reason ?? "failed" };
+      return;
+    }
+    laneReport.served = lane2.backendId;
+    let body;
+    try {
+      body = JSON.parse(report.outcome.result.bodyText);
+    } catch {
+      body = void 0;
+    }
+    const items2 = extractItems(lane2.candidate.tool, body);
+    const list = laneItemsByQuery[queryIndex];
+    if (list !== void 0) list[lane2.rank - 1] = { backendId: lane2.backendId, rank: lane2.rank, items: items2 };
+  });
+  const lane = scrapeLane(candidates, excluded);
+  const targetTasks = fetchTargets.map((target, targetIndex) => async () => {
+    if (lane === void 0) {
+      targetReports[targetIndex] = { attempts: [], failed: { url: target, reason: "no scrape provider available" } };
+      return;
+    }
+    const report = await run({
+      baseUrl: gateway.baseUrl,
+      apiKey: gateway.apiKey,
+      candidates: [lane.candidate],
+      args: { [lane.argName]: target },
+      maxAttempts: 1,
+      ...gateway.fetchFn !== void 0 ? { fetchFn: gateway.fetchFn } : {}
+    });
+    const targetReport = { attempts: [...report.attempts] };
+    targetReports[targetIndex] = targetReport;
+    for (const attempt of report.attempts) {
+      if (attempt.gatewayCode !== void 0 && ABORT_CODES.has(attempt.gatewayCode)) {
+        targetReport.aborted ??= `${attempt.gatewayCode}: ${attempt.reason}`;
+        abortSeen = true;
+      }
+    }
+    if (report.outcome.kind !== "success") {
+      const last = report.attempts[report.attempts.length - 1];
+      targetReport.failed = { url: target, reason: last?.gatewayCode ?? last?.reason ?? "failed" };
+      return;
+    }
+    targetReport.document = { url: target, backendId: lane.backendId, content: report.outcome.result.bodyText };
+  });
+  await pool([...tasks, ...targetTasks], concurrency, () => abortSeen);
+  const ran = laneReports.filter((r) => r !== void 0);
+  const targetsRan = targetReports.filter((r) => r !== void 0);
+  const documents = targetsRan.flatMap((r) => r.document !== void 0 ? [r.document] : []);
+  const failedTargets = targetsRan.flatMap((r) => r.failed !== void 0 ? [r.failed] : []);
+  const attempts = [...ran.flatMap((r) => r.attempts), ...targetsRan.flatMap((r) => r.attempts)];
+  const served = /* @__PURE__ */ new Set([
+    ...ran.flatMap((r) => r.served !== void 0 ? [r.served] : []),
+    ...documents.map((d) => d.backendId)
+  ]);
+  const failed = ran.flatMap((r) => r.failed !== void 0 ? [r.failed] : []);
+  const skipped = ran.flatMap((r) => r.skipped !== void 0 ? [r.skipped] : []);
+  const aborted = ran.find((r) => r.aborted !== void 0)?.aborted ?? targetsRan.find((r) => r.aborted !== void 0)?.aborted;
+  const seen = options.seenUrls ?? /* @__PURE__ */ new Set();
+  const perQuery = [];
+  const suppressedUrls = /* @__PURE__ */ new Set();
+  planned.forEach(({ query }, queryIndex) => {
+    const laneItems = (laneItemsByQuery[queryIndex] ?? []).filter((l) => l !== void 0);
+    const merged = mergeItems(laneItems, seen);
+    for (const url of merged.suppressedUrls) suppressedUrls.add(url);
+    perQuery.push({ query, items: merged.items });
+  });
+  const allLanes = perQuery.map(({ items: items2 }, queryIndex) => ({
+    backendId: `merged-${String(queryIndex)}`,
+    rank: queryIndex + 1,
+    items: items2.map((i) => ({
+      url: i.url,
+      ...i.title !== i.url ? { title: i.title } : {},
+      ...i.snippet !== void 0 ? { snippet: i.snippet } : {},
+      // Carried through even though neither pass keys on it: the emitted
+      // document is built from THIS merge's representative (see below), so a
+      // field dropped here is a field dropped from the round's output.
+      ...i.publishedAt !== void 0 ? { publishedAt: i.publishedAt } : {}
+    }))
+  }));
+  const combined = mergeItems(allLanes, /* @__PURE__ */ new Set());
+  const attributionByUrl = /* @__PURE__ */ new Map();
+  for (const { items: items2 } of perQuery) {
+    for (const item of items2) {
+      const existing = attributionByUrl.get(item.url);
+      if (existing === void 0) {
+        attributionByUrl.set(item.url, {
+          ...item,
+          providers: item.providers.map((hit) => ({ ...hit })),
+          duplicates: [...item.duplicates]
+        });
+        continue;
+      }
+      for (const hit of item.providers) recordHit(existing.providers, hit);
+      for (const url of item.duplicates) {
+        if (!existing.duplicates.includes(url)) existing.duplicates.push(url);
+      }
+    }
+  }
+  const items = combined.items.map((item) => {
+    const contributors = [item.url, ...item.duplicates].flatMap((url) => attributionByUrl.get(url) ?? []);
+    const providers = [];
+    const duplicates = [...item.duplicates];
+    for (const contributor of contributors) {
+      for (const hit of contributor.providers) recordHit(providers, hit);
+      for (const url of contributor.duplicates) {
+        if (!duplicates.includes(url)) duplicates.push(url);
+      }
+    }
+    return {
+      ...item,
+      providers,
+      duplicates,
+      // Re-scored over the UNION rather than carried from one query's merge:
+      // `score` is defined as the RRF sum over `providers`, so an item whose
+      // provider list grew here and whose score did not would state two
+      // different numbers of contributing providers in one document.
+      score: providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0)
+    };
+  });
+  items.sort((a, b) => b.score - a.score || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
+  const coverage = computeCoverage({
+    queries: perQuery,
+    served: [...served],
+    failed,
+    skipped,
+    droppedQueries,
+    // Both budget-dropped targets and targets whose fetch failed belong in the
+    // one gap: `computeCoverage`'s own comment on this field says a label
+    // naming only one cause would misreport the other. A budget drop carries no
+    // `reason` -- nothing was attempted, so there is nothing to report but the
+    // URL, and the shared "not fetched" label already says that much.
+    unfetchedTargets: [...unfetchedTargets.map((url) => ({ url })), ...failedTargets],
+    suppressed: suppressedUrls.size
+  });
+  const callsBilled = attempts.filter((a) => a.billed).length;
+  return {
+    plan,
+    // `served` unions the backends that answered a QUERY with the backends that
+    // fetched a DOCUMENT (see its construction above), so a round with targets
+    // and no queries reports `served: ['scrapingdog']` and a served scrape
+    // backend is what makes such a round a success. The `|| documents.length > 0`
+    // disjunct that used to sit here predated that union and could no longer
+    // decide the value either way.
+    ok: aborted === void 0 && served.size > 0,
+    ...aborted !== void 0 ? { aborted } : {},
+    items,
+    documents,
+    coverage,
+    nextActions: nextActions(coverage, options.sessionId),
+    billing: { callsBilled, attempts }
+  };
+}
+function seenUrlsFrom(outcome) {
+  return outcome.items.map((item) => canonicalizeUrl(item.url));
 }
 
 // src/engine/one-step-descriptions.json
@@ -10614,6 +11436,112 @@ function renderSetup(input, json) {
   }
   return lines.join("\n");
 }
+function renderPlan(plan, json) {
+  if (json) return toJson(plan);
+  const lines = [
+    `intents:  ${plan.intents.join(", ")}`,
+    `queries:  ${plan.queries.length > 0 ? plan.queries.map((q) => `"${q}"`).join(", ") : "(none)"}`,
+    `targets:  ${plan.targets.length > 0 ? plan.targets.join(", ") : "(none)"}`,
+    `depth:    ${plan.depth} (fan-out ${String(plan.fanout)} providers per query)`,
+    `source:   ${plan.source}`,
+    `signals:  ${plan.signals.length > 0 ? plan.signals.join("; ") : "(none)"}`,
+    "",
+    "Override any field: --intents, --queries, --targets, --depth, --fanout, or --plan-json."
+  ];
+  return lines.join("\n");
+}
+function renderResearch(outcome, sessionId, json) {
+  if (json) {
+    return toJson({
+      ok: outcome.ok,
+      plan: outcome.plan,
+      items: outcome.items.map((item) => ({
+        url: item.url,
+        title: item.title,
+        ...item.snippet !== void 0 ? { snippet: item.snippet } : {},
+        ...item.publishedAt !== void 0 ? { published_at: item.publishedAt } : {},
+        providers: item.providers.map((p) => ({ backend_id: p.backendId, rank: p.rank, result_rank: p.resultRank })),
+        score: item.score,
+        duplicates: item.duplicates
+      })),
+      documents: outcome.documents.map((doc) => ({ url: doc.url, backend_id: doc.backendId, content: doc.content })),
+      coverage: outcome.coverage,
+      next_actions: outcome.nextActions.map((a) => ({ why: a.why, cmd: a.cmd })),
+      billing: { calls_billed: outcome.billing.callsBilled, attempts: outcome.billing.attempts },
+      session: sessionId !== void 0 ? { id: sessionId } : null
+    });
+  }
+  const lines = [];
+  outcome.items.forEach((item, index) => {
+    const providers = item.providers.map((p) => p.backendId).join(", ");
+    lines.push(`${String(index + 1)}. ${item.title}`);
+    lines.push(`   ${item.url}`);
+    if (item.snippet !== void 0) lines.push(`   ${item.snippet}`);
+    lines.push(`   sources: ${providers}${item.duplicates.length > 0 ? ` (+${String(item.duplicates.length)} duplicate link(s))` : ""}`);
+    lines.push("");
+  });
+  if (outcome.items.length === 0) lines.push("No results.", "");
+  for (const doc of outcome.documents) {
+    lines.push(`fetched ${doc.url} via ${doc.backendId} (${String(doc.content.length)} bytes)`);
+  }
+  if (outcome.documents.length > 0) lines.push("");
+  lines.push(`Providers served: ${outcome.coverage.served.join(", ") || "(none)"}`);
+  if (outcome.coverage.failed.length > 0) {
+    lines.push(`Failed: ${outcome.coverage.failed.map((f) => `${f.backendId} (${f.reason})`).join(", ")}`);
+  }
+  if (outcome.coverage.suppressed > 0) {
+    lines.push(`Suppressed ${String(outcome.coverage.suppressed)} result(s) already seen in this session.`);
+  }
+  lines.push(`Billed ${String(outcome.billing.callsBilled)} call(s).`);
+  if (outcome.aborted !== void 0) lines.push(`Stopped: ${outcome.aborted}`);
+  if (outcome.coverage.gaps.length > 0) {
+    lines.push("", "Gaps:");
+    for (const gap of outcome.coverage.gaps) lines.push(`  - ${gap}`);
+  }
+  if (outcome.nextActions.length > 0) {
+    lines.push("", "Next:");
+    for (const action of outcome.nextActions) lines.push(`  ${action.cmd}   # ${action.why}`);
+  }
+  return lines.join("\n");
+}
+
+// src/engine/session.ts
+import { mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync } from "node:fs";
+import { dirname as dirname2, join as join2 } from "node:path";
+var SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+function validateSessionId(id) {
+  if (!SESSION_ID_PATTERN.test(id) || id === "." || id === "..") {
+    throw new Error("session id must be 1-64 characters of letters, digits, dot, dash or underscore");
+  }
+}
+function sessionPath(id, env, home) {
+  const base = env["XDG_CACHE_HOME"] !== void 0 && env["XDG_CACHE_HOME"] !== "" ? env["XDG_CACHE_HOME"] : join2(home, ".cache");
+  return join2(base, "fezo", "sessions", `${id}.json`);
+}
+function loadSession(id, env, home) {
+  const empty = { id, seenUrls: [], queries: [], callsBilled: 0 };
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync2(sessionPath(id, env, home), "utf8"));
+  } catch {
+    return empty;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return empty;
+  const record = parsed;
+  const strings = (value) => Array.isArray(value) ? value.filter((v) => typeof v === "string") : [];
+  return {
+    id,
+    seenUrls: strings(record.seenUrls),
+    queries: strings(record.queries),
+    callsBilled: typeof record.callsBilled === "number" ? record.callsBilled : 0
+  };
+}
+function saveSession(state, env, home) {
+  const path = sessionPath(state.id, env, home);
+  mkdirSync2(dirname2(path), { recursive: true, mode: 448 });
+  writeFileSync(path, `${JSON.stringify(state, null, 2)}
+`, { mode: 384 });
+}
 
 // src/cli.ts
 var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--schema", "--retry-empty-2xx", "--allow-unhinted-auto-pick", "--key-stdin", "--explain"]);
@@ -10626,11 +11554,20 @@ var VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--intent",
   "--detail",
   "--limit",
-  "--extra-json"
+  "--extra-json",
+  "--planner",
+  "--plan-json",
+  "--intents",
+  "--depth",
+  "--fanout",
+  "--max-calls",
+  "--session"
 ]);
+var REPEATABLE_VALUE_FLAGS = /* @__PURE__ */ new Set(["--queries", "--targets"]);
 function parseArgv(argv) {
   const positionals = [];
   const values = {};
+  const arrays = {};
   const booleans = /* @__PURE__ */ new Set();
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
@@ -10643,6 +11580,13 @@ function parseArgv(argv) {
       const next = argv[i + 1];
       if (next === void 0) return { ok: false, error: `flag ${token} requires a value` };
       values[token] = next;
+      i += 1;
+      continue;
+    }
+    if (REPEATABLE_VALUE_FLAGS.has(token)) {
+      const next = argv[i + 1];
+      if (next === void 0) return { ok: false, error: `flag ${token} requires a value` };
+      (arrays[token] ??= []).push(next);
       i += 1;
       continue;
     }
@@ -10667,14 +11611,23 @@ function parseArgv(argv) {
       ...values["--intent"] !== void 0 ? { intent: values["--intent"] } : {},
       ...values["--detail"] !== void 0 ? { detail: values["--detail"] } : {},
       ...values["--limit"] !== void 0 ? { limit: values["--limit"] } : {},
-      ...values["--extra-json"] !== void 0 ? { extraJson: values["--extra-json"] } : {}
+      ...values["--extra-json"] !== void 0 ? { extraJson: values["--extra-json"] } : {},
+      ...values["--planner"] !== void 0 ? { planner: values["--planner"] } : {},
+      ...values["--plan-json"] !== void 0 ? { planJson: values["--plan-json"] } : {},
+      ...values["--intents"] !== void 0 ? { intents: values["--intents"] } : {},
+      ...values["--depth"] !== void 0 ? { depth: values["--depth"] } : {},
+      ...values["--fanout"] !== void 0 ? { fanout: values["--fanout"] } : {},
+      ...values["--max-calls"] !== void 0 ? { maxCalls: values["--max-calls"] } : {},
+      ...values["--session"] !== void 0 ? { session: values["--session"] } : {},
+      ...arrays["--queries"] !== void 0 ? { queries: arrays["--queries"] } : {},
+      ...arrays["--targets"] !== void 0 ? { targets: arrays["--targets"] } : {}
     }
   };
 }
 function resolvePackageVersion() {
-  const here = dirname2(fileURLToPath(import.meta.url));
-  const packageJsonPath = join2(here, "..", "package.json");
-  const raw = readFileSync2(packageJsonPath, "utf8");
+  const here = dirname3(fileURLToPath(import.meta.url));
+  const packageJsonPath = join3(here, "..", "package.json");
+  const raw = readFileSync3(packageJsonPath, "utf8");
   const parsed = JSON.parse(raw);
   if (parsed !== null && typeof parsed === "object") {
     const version = Reflect.get(parsed, "version");
@@ -10778,6 +11731,10 @@ Usage:
   fezoctl web-search "<query>" [--extra-json '<json>'] [--max-attempts N] [--json]
   fezoctl scrape <url>         [--extra-json '<json>'] [--max-attempts N] [--json]
   fezoctl crawl <url>          [--extra-json '<json>'] [--max-attempts N] [--json]
+  fezoctl plan "<prompt>" [--json]
+  fezoctl research "<prompt>" [--intents a,b] [--queries "q"]... [--targets <url>]...
+                   [--depth shallow|standard|research] [--fanout N] [--max-calls N]
+                   [--session <id>] [--plan-json '<json>'] [--planner heuristic] [--json]
   fezoctl catalog [--json]
   fezoctl providers [--intent <intent>] [--detail names|descriptions|schema]
                      [--limit N] [--explain] [--json]
@@ -10832,6 +11789,13 @@ the command line: on expiry it stops STARTING new attempts (never aborting one
 already in flight, which would discard a result already billed) and reports
 whichever candidate answered last. Deny-listed and not-recommended providers
 are never attempted by any of the three commands.
+
+research fans one prompt out to several providers at once and returns a
+single deduplicated, source-attributed result set with a coverage report.
+\`plan\` shows what routing a prompt would get without calling anything. Depth
+sets the width (shallow 2, standard 4, research 8 providers per query);
+--session <id> makes a follow-up round exclude what an earlier round already
+returned.
 
 What each one is for (the same sentences skills/fezo/SKILL.md uses):
 
@@ -11116,6 +12080,118 @@ async function cmdRun(flags, deps, emit, excluded) {
   );
   if (report === void 0) return EXIT_OPERATIONAL;
   return report.outcome.kind === "success" ? EXIT_OK : EXIT_OPERATIONAL;
+}
+function planFromFlags(prompt, flags) {
+  if (typeof flags.intent === "string") {
+    throw new Error(`--intent belongs to \`providers\`; routing takes the plural, e.g. --intents ${flags.intent}`);
+  }
+  const planner = resolvePlanner(typeof flags.planner === "string" ? flags.planner : "heuristic");
+  const overrides = {};
+  if (typeof flags.planJson === "string") {
+    let parsed;
+    try {
+      parsed = JSON.parse(flags.planJson);
+    } catch (error) {
+      throw new Error(`--plan-json is not valid JSON: ${error.message}`);
+    }
+    overrides.plan = parsePlanJson(parsed);
+  }
+  if (typeof flags.intents === "string") {
+    const intents = flags.intents.split(",").map((s) => s.trim()).filter((s) => s !== "");
+    for (const intent of intents) {
+      if (!INTENTS.includes(intent)) throw new Error(`unknown intent "${intent}"`);
+    }
+    overrides.intents = intents;
+  }
+  if (Array.isArray(flags.queries)) overrides.queries = flags.queries;
+  if (Array.isArray(flags.targets)) overrides.targets = flags.targets;
+  if (typeof flags.depth === "string") {
+    if (!["shallow", "standard", "research"].includes(flags.depth)) {
+      throw new Error("--depth must be shallow, standard or research");
+    }
+    overrides.depth = flags.depth;
+  }
+  if (flags.fanout !== void 0) {
+    const fanout = Number(flags.fanout);
+    if (!Number.isInteger(fanout) || fanout < 1) throw new Error("--fanout must be a positive integer");
+    overrides.fanout = fanout;
+  }
+  return clampPlan(mergePlan(planner.plan(prompt), overrides));
+}
+async function cmdPlan(flags, emit) {
+  const prompt = flags.positionals.join(" ");
+  if (prompt.trim() === "") {
+    emitUsageError(emit, "plan", 'requires a prompt, e.g. `fezoctl plan "what is a merkle tree"`');
+    return EXIT_USAGE;
+  }
+  let plan;
+  try {
+    plan = planFromFlags(prompt, flags);
+  } catch (error) {
+    emitUsageError(emit, "plan", error.message);
+    return EXIT_USAGE;
+  }
+  emit.out(renderPlan(plan, flags.json));
+  return EXIT_OK;
+}
+async function cmdResearch(flags, deps, emit, excluded) {
+  const prompt = flags.positionals.join(" ");
+  if (prompt.trim() === "") {
+    emitUsageError(emit, "research", 'requires a prompt, e.g. `fezoctl research "what is a merkle tree"`');
+    return EXIT_USAGE;
+  }
+  let plan;
+  let sessionId;
+  let maxCalls;
+  try {
+    plan = planFromFlags(prompt, flags);
+    if (typeof flags.session === "string") {
+      validateSessionId(flags.session);
+      sessionId = flags.session;
+    }
+    if (flags.maxCalls !== void 0) {
+      const value = Number(flags.maxCalls);
+      if (!Number.isInteger(value) || value < 1) throw new Error("--max-calls must be a positive integer");
+      maxCalls = value;
+    }
+  } catch (error) {
+    emitUsageError(emit, "research", error.message);
+    return EXIT_USAGE;
+  }
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
+  const { creds, candidates } = gateway.session;
+  const env = deps.env ?? process.env;
+  const home = deps.homeDir ?? homedir2();
+  const active = sessionId !== void 0 ? { id: sessionId, state: loadSession(sessionId, env, home) } : void 0;
+  const outcome = await runResearch({
+    plan,
+    candidates,
+    excluded,
+    gateway: { baseUrl: creds.baseUrl, apiKey: creds.apiKey, ...deps.fetchFn !== void 0 ? { fetchFn: deps.fetchFn } : {} },
+    ...active !== void 0 ? { seenUrls: new Set(active.state.seenUrls), sessionId: active.id } : {},
+    ...maxCalls !== void 0 ? { maxCalls } : {}
+  });
+  emit.out(renderResearch(outcome, sessionId, flags.json));
+  if (active !== void 0) {
+    try {
+      saveSession(
+        {
+          id: active.id,
+          seenUrls: [.../* @__PURE__ */ new Set([...active.state.seenUrls, ...seenUrlsFrom(outcome)])],
+          queries: [.../* @__PURE__ */ new Set([...active.state.queries, ...plan.queries])],
+          callsBilled: active.state.callsBilled + outcome.billing.callsBilled
+        },
+        env,
+        home
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      emit.err(`fezoctl: could not write the session cache for "${active.id}": ${message} \u2014 the next --session round will not suppress what this one returned
+`);
+    }
+  }
+  return outcome.ok ? EXIT_OK : EXIT_OPERATIONAL;
 }
 function oneStepArgWord(argKind) {
   return argKind === "query" ? "a query" : "a URL";
@@ -11420,6 +12496,10 @@ async function runCli(argv, deps = {}) {
       return finish(await cmdCall(flags, deps, emit, excluded));
     case "run":
       return finish(await cmdRun(flags, deps, emit, excluded));
+    case "plan":
+      return finish(await cmdPlan(flags, emit));
+    case "research":
+      return finish(await cmdResearch(flags, deps, emit, excluded));
     case "catalog":
       return finish(await cmdCatalog(flags, deps, emit, excluded));
     case "providers":

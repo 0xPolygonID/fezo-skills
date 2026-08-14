@@ -32,6 +32,7 @@
 // the exit code is the same with and without `--json`.
 
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
@@ -54,11 +55,15 @@ import type { Intent } from './engine/intent.js';
 import { INTENTS } from './engine/intent.js';
 import type { OneStepSpec } from './engine/one-step.js';
 import { MAX_PROVIDER_ATTEMPTS, ONE_STEP_SPECS, runOneStep } from './engine/one-step.js';
+import { clampPlan, mergePlan, parsePlanJson } from './engine/plan.js';
+import type { PlanOverrides, RoutingPlan } from './engine/plan.js';
+import { resolvePlanner } from './engine/planners/heuristic.js';
 import { inferCapability } from './engine/preference.js';
 import { groupByCapability, listProviders } from './engine/provider-view.js';
 import { isExcluded, recommendationsFor, resolveExcludedBackends } from './engine/providers.js';
 import type { RunSelection } from './engine/rank.js';
 import { rankCandidates, searchCandidates, selectForRun } from './engine/rank.js';
+import { runResearch, seenUrlsFrom } from './engine/research.js';
 import type { CliErrorKind, DoctorCheck } from './engine/render.js';
 import {
   renderCall,
@@ -67,7 +72,9 @@ import {
   renderError,
   renderListProviders,
   renderOneStep,
+  renderPlan,
   renderProviders,
+  renderResearch,
   renderRun,
   renderSchema,
   renderSearch,
@@ -79,6 +86,7 @@ import type { AttemptLog, MechanicalFailure, RunReport } from './engine/retry.js
 import { classifyFailure, run } from './engine/retry.js';
 import type { ValidationResult } from './engine/schema.js';
 import { SchemaValidatorCache, validateArgs } from './engine/schema.js';
+import { loadSession, saveSession, validateSessionId } from './engine/session.js';
 import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS } from './engine/steering.js';
 import { findCandidateByToolName } from './engine/tool-name.js';
 
@@ -97,7 +105,20 @@ const VALUE_FLAGS = new Set([
   '--detail',
   '--limit',
   '--extra-json',
+  '--planner',
+  '--plan-json',
+  '--intents',
+  '--depth',
+  '--fanout',
+  '--max-calls',
+  '--session',
 ]);
+// `plan`/`research` are the only commands whose flags can legitimately repeat
+// (a research round has several sub-queries, or several scrape targets): every
+// other VALUE_FLAG is last-token-wins, matching the rest of this parser, so
+// these two get their own set rather than making every value flag an array
+// and pushing that ambiguity onto every existing call site.
+const REPEATABLE_VALUE_FLAGS = new Set(['--queries', '--targets']);
 
 interface Flags {
   positionals: string[];
@@ -119,6 +140,20 @@ interface Flags {
    * the resolved candidate's args alongside the command's single positional
    * value -- see one-step.ts's `runOneStep`. */
   extraJson?: string;
+  /** `plan`/`research` (Task 12): which `Planner` (planners/heuristic.ts's
+   * `resolvePlanner`) turns the prompt into a `RoutingPlan`. Only "heuristic"
+   * ships, but the flag exists now so a future LLM planner needs no CLI change. */
+  planner?: string;
+  /** A whole caller-supplied plan (plan.ts's `parsePlanJson`), replaced
+   * wholesale rather than merged -- see `planFromFlags`. */
+  planJson?: string;
+  intents?: string;
+  queries?: string[];
+  targets?: string[];
+  depth?: string;
+  fanout?: string;
+  maxCalls?: string;
+  session?: string;
 }
 
 type ParseResult = { ok: true; flags: Flags } | { ok: false; error: string };
@@ -126,6 +161,7 @@ type ParseResult = { ok: true; flags: Flags } | { ok: false; error: string };
 function parseArgv(argv: readonly string[]): ParseResult {
   const positionals: string[] = [];
   const values: Record<string, string> = {};
+  const arrays: Record<string, string[]> = {};
   const booleans = new Set<string>();
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -139,6 +175,13 @@ function parseArgv(argv: readonly string[]): ParseResult {
       const next = argv[i + 1];
       if (next === undefined) return { ok: false, error: `flag ${token} requires a value` };
       values[token] = next;
+      i += 1;
+      continue;
+    }
+    if (REPEATABLE_VALUE_FLAGS.has(token)) {
+      const next = argv[i + 1];
+      if (next === undefined) return { ok: false, error: `flag ${token} requires a value` };
+      (arrays[token] ??= []).push(next);
       i += 1;
       continue;
     }
@@ -165,6 +208,15 @@ function parseArgv(argv: readonly string[]): ParseResult {
       ...(values['--detail'] !== undefined ? { detail: values['--detail'] } : {}),
       ...(values['--limit'] !== undefined ? { limit: values['--limit'] } : {}),
       ...(values['--extra-json'] !== undefined ? { extraJson: values['--extra-json'] } : {}),
+      ...(values['--planner'] !== undefined ? { planner: values['--planner'] } : {}),
+      ...(values['--plan-json'] !== undefined ? { planJson: values['--plan-json'] } : {}),
+      ...(values['--intents'] !== undefined ? { intents: values['--intents'] } : {}),
+      ...(values['--depth'] !== undefined ? { depth: values['--depth'] } : {}),
+      ...(values['--fanout'] !== undefined ? { fanout: values['--fanout'] } : {}),
+      ...(values['--max-calls'] !== undefined ? { maxCalls: values['--max-calls'] } : {}),
+      ...(values['--session'] !== undefined ? { session: values['--session'] } : {}),
+      ...(arrays['--queries'] !== undefined ? { queries: arrays['--queries'] } : {}),
+      ...(arrays['--targets'] !== undefined ? { targets: arrays['--targets'] } : {}),
     },
   };
 }
@@ -340,6 +392,10 @@ export interface CliDeps {
   stdin?: Readable;
   keychain?: KeychainRunner;
   dotEnvPath?: string;
+  /** Overrides `os.homedir()` for session-cache placement (session.ts's
+   * `sessionPath`). Tests only; production never sets it, and gets the real
+   * home directory via the `homedir()` fallback below. */
+  homeDir?: string;
 }
 
 export interface CliResult {
@@ -408,6 +464,10 @@ Usage:
   fezoctl web-search "<query>" [--extra-json '<json>'] [--max-attempts N] [--json]
   fezoctl scrape <url>         [--extra-json '<json>'] [--max-attempts N] [--json]
   fezoctl crawl <url>          [--extra-json '<json>'] [--max-attempts N] [--json]
+  fezoctl plan "<prompt>" [--json]
+  fezoctl research "<prompt>" [--intents a,b] [--queries "q"]... [--targets <url>]...
+                   [--depth shallow|standard|research] [--fanout N] [--max-calls N]
+                   [--session <id>] [--plan-json '<json>'] [--planner heuristic] [--json]
   fezoctl catalog [--json]
   fezoctl providers [--intent <intent>] [--detail names|descriptions|schema]
                      [--limit N] [--explain] [--json]
@@ -462,6 +522,13 @@ the command line: on expiry it stops STARTING new attempts (never aborting one
 already in flight, which would discard a result already billed) and reports
 whichever candidate answered last. Deny-listed and not-recommended providers
 are never attempted by any of the three commands.
+
+research fans one prompt out to several providers at once and returns a
+single deduplicated, source-attributed result set with a coverage report.
+\`plan\` shows what routing a prompt would get without calling anything. Depth
+sets the width (shallow 2, standard 4, research 8 providers per query);
+--session <id> makes a follow-up round exclude what an earlier round already
+returned.
 
 What each one is for (the same sentences skills/fezo/SKILL.md uses):
 
@@ -936,6 +1003,171 @@ async function cmdRun(flags: Flags, deps: CliDeps, emit: Emit, excluded: readonl
 
   if (report === undefined) return EXIT_OPERATIONAL;
   return report.outcome.kind === 'success' ? EXIT_OK : EXIT_OPERATIONAL;
+}
+
+// ---------------------------------------------------------------------------
+// plan / research (Task 10-11's fan-out executor, wired to argv here). `plan`
+// does no network I/O at all -- it exists so a caller can see what routing a
+// prompt would get before paying for a round -- so it never calls
+// `openGateway`, the one thing every other command past this comment does
+// first. `research` is the wide fan-out: one round, several providers per
+// query, deduplicated and source-attributed, optionally suppressing what an
+// earlier `--session` round already returned.
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the round's plan from prompt + flags, or throws a usage error.
+ *
+ * Every rejection here happens during argv handling, before a candidate is
+ * selected or a call is billed -- the contract stated at the top of this file
+ * and already followed by `--args-json`.
+ */
+function planFromFlags(prompt: string, flags: Flags): RoutingPlan {
+  // `--intent` (singular) is `providers`' flag; routing takes `--intents`
+  // (plural, comma-separated). The parser accepts any known flag for any
+  // command, and everywhere else an inapplicable flag is merely ignored -- but
+  // this is the one near-miss pair where being ignored changes WHICH providers
+  // get billed, so it is rejected rather than dropped. Still a usage error
+  // raised from argv handling, i.e. still before anything is called.
+  if (typeof flags.intent === 'string') {
+    throw new Error(`--intent belongs to \`providers\`; routing takes the plural, e.g. --intents ${flags.intent}`);
+  }
+  const planner = resolvePlanner(typeof flags.planner === 'string' ? flags.planner : 'heuristic');
+  const overrides: PlanOverrides = {};
+  if (typeof flags.planJson === 'string') {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(flags.planJson);
+    } catch (error) {
+      throw new Error(`--plan-json is not valid JSON: ${(error as Error).message}`);
+    }
+    overrides.plan = parsePlanJson(parsed);
+  }
+  if (typeof flags.intents === 'string') {
+    const intents = flags.intents.split(',').map((s) => s.trim()).filter((s) => s !== '');
+    for (const intent of intents) {
+      if (!INTENTS.includes(intent as never)) throw new Error(`unknown intent "${intent}"`);
+    }
+    overrides.intents = intents as RoutingPlan['intents'];
+  }
+  if (Array.isArray(flags.queries)) overrides.queries = flags.queries;
+  if (Array.isArray(flags.targets)) overrides.targets = flags.targets;
+  if (typeof flags.depth === 'string') {
+    if (!['shallow', 'standard', 'research'].includes(flags.depth)) {
+      throw new Error('--depth must be shallow, standard or research');
+    }
+    overrides.depth = flags.depth as RoutingPlan['depth'];
+  }
+  if (flags.fanout !== undefined) {
+    const fanout = Number(flags.fanout);
+    if (!Number.isInteger(fanout) || fanout < 1) throw new Error('--fanout must be a positive integer');
+    overrides.fanout = fanout;
+  }
+  return clampPlan(mergePlan(planner.plan(prompt), overrides));
+}
+
+async function cmdPlan(flags: Flags, emit: Emit): Promise<number> {
+  const prompt = flags.positionals.join(' ');
+  if (prompt.trim() === '') {
+    emitUsageError(emit, 'plan', 'requires a prompt, e.g. `fezoctl plan "what is a merkle tree"`');
+    return EXIT_USAGE;
+  }
+  let plan: RoutingPlan;
+  try {
+    plan = planFromFlags(prompt, flags);
+  } catch (error) {
+    emitUsageError(emit, 'plan', (error as Error).message);
+    return EXIT_USAGE;
+  }
+  emit.out(renderPlan(plan, flags.json));
+  return EXIT_OK;
+}
+
+async function cmdResearch(flags: Flags, deps: CliDeps, emit: Emit, excluded: readonly string[]): Promise<number> {
+  const prompt = flags.positionals.join(' ');
+  if (prompt.trim() === '') {
+    emitUsageError(emit, 'research', 'requires a prompt, e.g. `fezoctl research "what is a merkle tree"`');
+    return EXIT_USAGE;
+  }
+  let plan: RoutingPlan;
+  let sessionId: string | undefined;
+  let maxCalls: number | undefined;
+  try {
+    plan = planFromFlags(prompt, flags);
+    if (typeof flags.session === 'string') {
+      validateSessionId(flags.session);
+      sessionId = flags.session;
+    }
+    if (flags.maxCalls !== undefined) {
+      const value = Number(flags.maxCalls);
+      if (!Number.isInteger(value) || value < 1) throw new Error('--max-calls must be a positive integer');
+      maxCalls = value;
+    }
+  } catch (error) {
+    emitUsageError(emit, 'research', (error as Error).message);
+    return EXIT_USAGE;
+  }
+
+  // The same opening move as search/schema/call/run/catalog: resolve
+  // credentials and fetch the catalog, with both failure kinds reported in one
+  // place. See `openGateway`'s own comment.
+  const gateway = await openGateway(deps, emit);
+  if (!gateway.ok) return gateway.exitCode;
+  const { creds, candidates } = gateway.session;
+
+  const env = deps.env ?? process.env;
+  const home = deps.homeDir ?? homedir();
+  // Id and state travel together, in one binding: `loadSession` is total (it
+  // answers a missing or damaged file with an empty state, never `undefined`),
+  // so the state exists on exactly the branch where the id does. Pairing them
+  // here is what keeps the save site below from re-proving that with a second
+  // `!== undefined` test that reads like a case where a first round with a
+  // fresh id might skip persistence -- it never does.
+  const active = sessionId !== undefined ? { id: sessionId, state: loadSession(sessionId, env, home) } : undefined;
+
+  const outcome = await runResearch({
+    plan,
+    candidates,
+    excluded,
+    gateway: { baseUrl: creds.baseUrl, apiKey: creds.apiKey, ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}) },
+    ...(active !== undefined ? { seenUrls: new Set(active.state.seenUrls), sessionId: active.id } : {}),
+    ...(maxCalls !== undefined ? { maxCalls } : {}),
+  });
+
+  // Results first, cache second -- and the cache never takes the round down
+  // with it. By this line the providers have already been called and billed,
+  // so an unwritable cache location (a read-only or sandboxed home, an
+  // XDG_CACHE_HOME pointing at a non-directory, ENOSPC) must cost the caller
+  // the NEXT round's suppression, never this round's paid-for results. Throwing
+  // here would reject `runCli` itself: stdout empty despite `--json`, whose
+  // contract at the top of this file is that stdout is always a document, and
+  // an unhandled rejection out of `main()` instead of an exit code. Same
+  // reasoning that makes `loadSession` never throw on a damaged file, and that
+  // makes `writeDotEnvFile` report a failed write rather than raise it.
+  emit.out(renderResearch(outcome, sessionId, flags.json));
+
+  if (active !== undefined) {
+    try {
+      saveSession(
+        {
+          id: active.id,
+          seenUrls: [...new Set([...active.state.seenUrls, ...seenUrlsFrom(outcome)])],
+          queries: [...new Set([...active.state.queries, ...plan.queries])],
+          callsBilled: active.state.callsBilled + outcome.billing.callsBilled,
+        },
+        env,
+        home,
+      );
+    } catch (err) {
+      // Reported on stderr only, and deliberately NOT through `emitFailure`:
+      // that would put a second JSON document on stdout after the report the
+      // round just emitted, and `--json` promises exactly one.
+      const message = err instanceof Error ? err.message : String(err);
+      emit.err(`fezoctl: could not write the session cache for "${active.id}": ${message} — the next --session round will not suppress what this one returned\n`);
+    }
+  }
+
+  return outcome.ok ? EXIT_OK : EXIT_OPERATIONAL;
 }
 
 // ---------------------------------------------------------------------------
@@ -1472,6 +1704,10 @@ export async function runCli(argv: readonly string[], deps: CliDeps = {}): Promi
       return finish(await cmdCall(flags, deps, emit, excluded));
     case 'run':
       return finish(await cmdRun(flags, deps, emit, excluded));
+    case 'plan':
+      return finish(await cmdPlan(flags, emit));
+    case 'research':
+      return finish(await cmdResearch(flags, deps, emit, excluded));
     case 'catalog':
       return finish(await cmdCatalog(flags, deps, emit, excluded));
     case 'providers':
