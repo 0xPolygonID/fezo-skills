@@ -2806,7 +2806,13 @@ export function computeCoverage(input: CoverageInput): Coverage {
   let total = 0;
   for (const { items } of input.queries) {
     for (const item of items) {
+      // `hostOf` returns `undefined` for a URL that carries no host evidence at
+      // all (see its docstring). That is not a distinct host to concentrate on,
+      // so it is left out of both the tally and the denominator -- counting it
+      // in the denominator while it can never win the numerator would only
+      // dilute a real concentration signal with results this metric cannot see.
       const host = hostOf(item.url);
+      if (host === undefined) continue;
       hosts.set(host, (hosts.get(host) ?? 0) + 1);
       total += 1;
     }
@@ -2833,17 +2839,40 @@ export function computeCoverage(input: CoverageInput): Coverage {
     gaps.push(`${String(Math.round(domainConcentration.share * 100))}% of results are from ${domainConcentration.host}`);
   }
 
+  // Copied, not aliased. A `Coverage` reads as a finished report of a round and
+  // is handed to a renderer and to `nextActions`; returning the caller's own
+  // arrays would make a later `push` on either side silently rewrite the other's
+  // history of what was served. Cheap here (these are round-sized lists) and it
+  // keeps the function as pure as its signature claims.
   return {
     queries,
-    served: input.served,
-    failed: input.failed,
-    skipped: input.skipped,
+    served: [...input.served],
+    failed: input.failed.map((f) => ({ ...f })),
+    skipped: [...input.skipped],
     ...(domainConcentration !== undefined ? { domainConcentration } : {}),
-    droppedQueries: input.droppedQueries,
-    unfetchedTargets: input.unfetchedTargets,
+    droppedQueries: [...input.droppedQueries],
+    unfetchedTargets: [...input.unfetchedTargets],
     suppressed: input.suppressed,
     gaps,
   };
+}
+
+/**
+ * A string wrapped so a POSIX shell passes it through as one literal argument.
+ *
+ * `cmd` is promised to be ready to run, and its ingredients are untrusted: a
+ * query is the user's prompt minus its URLs, and a target is whatever matched
+ * the URL pattern in that prompt. Interpolated raw into double quotes, `$100`
+ * expands to nothing (the follow-up round then searches for, and bills for, the
+ * wrong thing), a `"` in `27" monitor` closes the quote and leaves the shell on
+ * a continuation prompt, and a backtick or `$(...)` reaches command
+ * substitution. Bare, a `?` or `&` in a query string truncates the URL and
+ * backgrounds the job under bash, and fails outright under zsh's globbing.
+ * Single quotes suppress every one of those; the only character they cannot
+ * carry is `'` itself, hence the close-escape-reopen dance.
+ */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /**
@@ -2854,13 +2883,26 @@ export function computeCoverage(input: CoverageInput): Coverage {
  * links it already has.
  */
 export function nextActions(coverage: Coverage, sessionId: string | undefined): NextAction[] {
+  // The id alone needs no quoting: it is validated against
+  // /^[A-Za-z0-9._-]{1,64}$/ at parse time because it becomes a filename, so it
+  // holds nothing a shell reacts to. Everything else here goes through
+  // `shellQuote`.
   const session = sessionId !== undefined ? ` --session ${sessionId}` : '';
   const actions: NextAction[] = [];
   for (const q of coverage.queries) {
     if (q.uniqueUrls >= THIN_QUERY_THRESHOLD && q.agreementMedian > 1) continue;
     actions.push({
-      why: q.uniqueUrls === 0 ? `"${q.query}" returned nothing` : `"${q.query}" is thin`,
-      cmd: `fezoctl research "${q.query}" --depth research${session}`,
+      // Mirrors the three-way branch the gap text uses, because `why` and the
+      // gap describe the same query to the same reader: calling a query with
+      // plenty of unique URLs "thin" contradicts the gap line sitting next to it
+      // and sends the agent after the wrong remedy.
+      why:
+        q.uniqueUrls === 0
+          ? `"${q.query}" returned nothing`
+          : q.uniqueUrls < THIN_QUERY_THRESHOLD
+            ? `"${q.query}" is thin`
+            : `"${q.query}" has no cross-provider agreement`,
+      cmd: `fezoctl research ${shellQuote(q.query)} --depth research${session}`,
     });
   }
   for (const failure of coverage.failed) {
@@ -2870,12 +2912,12 @@ export function nextActions(coverage: Coverage, sessionId: string | undefined): 
     });
   }
   for (const query of coverage.droppedQueries) {
-    actions.push({ why: 'not run: call budget', cmd: `fezoctl research "${query}"${session}` });
+    actions.push({ why: 'not run: call budget', cmd: `fezoctl research ${shellQuote(query)}${session}` });
   }
   for (const target of coverage.unfetchedTargets) {
     // `--session` is deliberately absent: `scrape` is a one-step command and
     // takes no session flag.
-    actions.push({ why: 'not fetched', cmd: `fezoctl scrape ${target}` });
+    actions.push({ why: 'not fetched', cmd: `fezoctl scrape ${shellQuote(target)}` });
   }
   return actions;
 }
@@ -2892,6 +2934,61 @@ Expected: PASS.
 git add src/engine/aggregate.ts tests/aggregate.test.ts
 git commit -m "feat: compute coverage gaps and runnable follow-up actions"
 ```
+
+**Deviations recorded during implementation.**
+
+The Step 3 block above is the corrected code -- it is what shipped, and what a
+reader rebuilding this task should build against. The changes it absorbed, and
+why, are recorded here so implementation can still be reviewed against intent.
+
+1. *Host-less URLs are excluded from the concentration tally AND its
+   denominator.* Step 3 originally wrote `hosts.set(host, ...)` directly on
+   `hostOf(item.url)`, which does not typecheck against the `hostOf(url): string
+   | undefined` repaired under Task 6 -- a reader building Task 7 from the
+   uncorrected block gets a `tsc` failure on the first run. Skipping such an
+   item is the only reading that keeps the metric honest: a URL carrying no host
+   evidence can never win the numerator, so counting it in the denominator would
+   do nothing but dilute a real concentration signal with results this metric
+   cannot see.
+2. *Every interpolated value in a `cmd` is single-quoted.* Step 3 built the
+   commands as `research "${q.query}"` and `scrape ${target}`. Both ingredients
+   are untrusted -- a query is the user's prompt minus its URLs
+   (`heuristic.ts`'s `residual`), a target is whatever matched `URL_PATTERN` in
+   that prompt -- so the spec's "literal, ready-to-run `cmd`" was not literal:
+   `best $100 keyboards` ran as `best 00 keyboards` (the follow-up round
+   searches for, and bills for, the wrong thing), `27" monitor` left an
+   unterminated string, a backtick reached command substitution, and an
+   unquoted `https://ex.com/p?a=1&b=2` lost `&b=2` and backgrounded the job
+   under bash while failing zsh's globbing outright. A local `shellQuote` fixes
+   all three sites. The session id is deliberately left bare: it is validated
+   against `/^[A-Za-z0-9._-]{1,64}$/` at parse time (§ Session state) because it
+   becomes a filename, so it holds nothing a shell reacts to -- and leaving it
+   bare keeps `--session r-42` greppable in output. Pinned by 'quotes a query so
+   the shell cannot expand, split or truncate it', 'quotes a dropped query and
+   an unfetched target', and 'emits commands a POSIX shell parses back into the
+   exact arguments' (which runs the emitted strings through `/bin/sh` and
+   compares argv).
+3. *A `why` mirrors its gap's three-way branch instead of saying "is thin" for
+   every non-empty query.* The gap text distinguishes "returned no results" /
+   "is thin" / "has no cross-provider agreement", but `why` collapsed the last
+   two, so a query with four unique URLs and no corroboration was labelled thin
+   in the very line sitting next to the gap that says otherwise. The two fields
+   describe the same query to the same reader; disagreeing sends the agent after
+   the wrong remedy. Pinned by 'says why a well-populated query still needs
+   another round'.
+4. *The returned `Coverage` copies the input's arrays rather than aliasing
+   them.* `computeCoverage(input)` reads as pure and its result is a finished
+   report handed onward; returning `input.served` et al by reference (and
+   `failed`'s elements by identity) meant a `push` on either side rewrote the
+   other's history. Pinned by 'does not alias the caller arrays it was handed'.
+
+*Text no test asserts yet*, left for the Task 9 wiring that first supplies these
+inputs from a real round: the domain-concentration gap text (`N% of results are
+from <host>`, which needs `share > 0.6` and `total >= 5`, so the concentration
+test's three items never trip it), the `not fetched: ...` gap line (executed by
+the quoting test but not asserted), and the `fezoctl providers --intent search`
+failure action. The `agreementMedian <= 1` gap branch and the `scrape` action
+are now both pinned by the tests added above.
 
 ---
 

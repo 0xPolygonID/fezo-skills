@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { RRF_K, SNIPPET_MAX_CHARS, canonicalizeUrl, mergeItems, sniffItems } from '../src/engine/aggregate.js';
 import { RESPONSE_ADAPTERS, extractItems } from '../src/engine/aggregate.js';
+import { computeCoverage, nextActions } from '../src/engine/aggregate.js';
 import type { LaneItems, RawItem } from '../src/engine/aggregate.js';
 
 describe('canonicalizeUrl', () => {
@@ -519,5 +520,177 @@ describe('mergeItems', () => {
     ]);
     expect(items[0]?.score).toBe(items[1]?.score);
     expect(items.map((i) => i.url)).toEqual(['https://a.example', 'https://b.example']);
+  });
+});
+
+const item = (url: string, providers: number) => ({
+  url,
+  title: url,
+  providers: Array.from({ length: providers }, (_unused, i) => ({ backendId: `p${String(i)}`, rank: i + 1, resultRank: 1 })),
+  score: 1,
+  duplicates: [],
+});
+
+describe('computeCoverage', () => {
+  it('reports unique URLs and median agreement per query', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [item('https://x.example', 3), item('https://y.example', 1)] }],
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    expect(coverage.queries[0]?.uniqueUrls).toBe(2);
+    expect(coverage.queries[0]?.agreementMedian).toBe(2);
+  });
+
+  it('flags a thin query as a gap', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [item('https://x.example', 1)] }],
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    expect(coverage.gaps.join(' ')).toMatch(/thin/i);
+  });
+
+  it('flags a zero-result query', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [] }],
+      served: [], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    expect(coverage.gaps.join(' ')).toMatch(/no results/i);
+  });
+
+  it('reports domain concentration', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [item('https://one.example/a', 1), item('https://one.example/b', 1), item('https://two.example/c', 1)] }],
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    expect(coverage.domainConcentration?.host).toBe('one.example');
+    expect(coverage.domainConcentration?.share).toBeCloseTo(2 / 3, 5);
+  });
+
+  it('flags a retryable provider failure', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [item('https://x.example', 4)] }],
+      served: ['you'], failed: [{ backendId: 'firecrawl', reason: 'rate_limited' }],
+      skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    expect(coverage.gaps.join(' ')).toMatch(/firecrawl/);
+  });
+
+  it('flags dropped queries so truncation is never silent', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [item('https://x.example', 4)] }],
+      served: ['you'], failed: [], skipped: [], droppedQueries: ['b'], unfetchedTargets: [], suppressed: 0,
+    });
+    expect(coverage.gaps.join(' ')).toMatch(/not run/i);
+  });
+
+  it('flags a query no provider corroborated, however many URLs it returned', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'solid state batteries', items: [item('https://a.example', 1), item('https://b.example', 1), item('https://c.example', 1), item('https://d.example', 1)] }],
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    expect(coverage.gaps.join(' ')).toMatch(/no cross-provider agreement/);
+  });
+
+  it('does not alias the caller arrays it was handed', () => {
+    const served = ['you'];
+    const failed = [{ backendId: 'firecrawl', reason: 'rate_limited' }];
+    const skipped = ['exa'];
+    const droppedQueries = ['b'];
+    const unfetchedTargets = ['https://t.example'];
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [item('https://x.example', 4)] }],
+      served, failed, skipped, droppedQueries, unfetchedTargets, suppressed: 0,
+    });
+    coverage.served.push('exa');
+    coverage.skipped.push('you');
+    coverage.droppedQueries.push('c');
+    coverage.unfetchedTargets.push('https://u.example');
+    coverage.failed.push({ backendId: 'you', reason: 'timeout' });
+    const firstFailure = coverage.failed[0];
+    if (firstFailure !== undefined) firstFailure.reason = 'rewritten';
+    expect(served).toEqual(['you']);
+    expect(skipped).toEqual(['exa']);
+    expect(droppedQueries).toEqual(['b']);
+    expect(unfetchedTargets).toEqual(['https://t.example']);
+    expect(failed).toEqual([{ backendId: 'firecrawl', reason: 'rate_limited' }]);
+  });
+});
+
+describe('nextActions', () => {
+  it('emits a runnable follow-up command carrying the session', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'thin one', items: [item('https://x.example', 1)] }],
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    const actions = nextActions(coverage, 'r-42');
+    expect(actions[0]?.cmd).toContain('--session r-42');
+    expect(actions[0]?.cmd).toContain('fezoctl research');
+  });
+
+  it('omits the session flag when no session is in use', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'thin one', items: [item('https://x.example', 1)] }],
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    expect(nextActions(coverage, undefined)[0]?.cmd).not.toContain('--session');
+  });
+
+  it('returns nothing when there are no gaps', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [item('https://x.example', 4), item('https://y.example', 3), item('https://z.example', 3)] }],
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    expect(nextActions(coverage, undefined)).toEqual([]);
+  });
+
+  it('says why a well-populated query still needs another round', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'solid state batteries', items: [item('https://a.example', 1), item('https://b.example', 1), item('https://c.example', 1), item('https://d.example', 1)] }],
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    // Not "is thin": the query returned four unique URLs, and a `why` that
+    // contradicts its own gap line points the agent at the wrong remedy.
+    expect(nextActions(coverage, undefined)[0]?.why).toBe('"solid state batteries" has no cross-provider agreement');
+  });
+
+  it('quotes a query so the shell cannot expand, split or truncate it', () => {
+    const coverage = computeCoverage({
+      queries: [
+        { query: 'best $100 keyboards', items: [] },
+        { query: 'is a 27" monitor better', items: [] },
+        { query: "o'brien `whoami` review", items: [] },
+      ],
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+    });
+    const actions = nextActions(coverage, 'r-42');
+    expect(actions[0]?.cmd).toBe(`fezoctl research 'best $100 keyboards' --depth research --session r-42`);
+    expect(actions[1]?.cmd).toBe(`fezoctl research 'is a 27" monitor better' --depth research --session r-42`);
+    expect(actions[2]?.cmd).toBe(`fezoctl research 'o'\\''brien \`whoami\` review' --depth research --session r-42`);
+  });
+
+  it('quotes a dropped query and an unfetched target', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [item('https://x.example', 4), item('https://y.example', 3), item('https://z.example', 3)] }],
+      served: ['you'], failed: [], skipped: [],
+      droppedQueries: ['price of $BTC & gold'], unfetchedTargets: ['https://example.com/p?a=1&b=2'], suppressed: 0,
+    });
+    const actions = nextActions(coverage, undefined);
+    expect(actions[0]?.cmd).toBe(`fezoctl research 'price of $BTC & gold'`);
+    expect(actions[1]?.cmd).toBe(`fezoctl scrape 'https://example.com/p?a=1&b=2'`);
+  });
+
+  it('emits commands a POSIX shell parses back into the exact arguments', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const coverage = computeCoverage({
+      queries: [{ query: 'best $100 keyboards & "27\' monitors"', items: [] }],
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: ['https://example.com/p?a=1&b=2'], suppressed: 0,
+    });
+    const argvOf = (cmd: string): string[] =>
+      execFileSync('/bin/sh', ['-c', `fezoctl() { for a in "$@"; do printf '%s\\n' "$a"; done; }; ${cmd}`], { encoding: 'utf8' })
+        .split('\n')
+        .slice(0, -1);
+    const actions = nextActions(coverage, 'r-42');
+    expect(argvOf(actions[0]?.cmd ?? '')).toEqual(['research', 'best $100 keyboards & "27\' monitors"', '--depth', 'research', '--session', 'r-42']);
+    expect(argvOf(actions[1]?.cmd ?? '')).toEqual(['scrape', 'https://example.com/p?a=1&b=2']);
   });
 });

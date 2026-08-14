@@ -578,3 +578,186 @@ export function mergeItems(
   merged.sort((a, b) => (b.score - a.score) || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
   return { items: merged, suppressed: suppressedUrls.size };
 }
+
+/** Below this many unique URLs, a query is reported as thin. */
+const THIN_QUERY_THRESHOLD = 3;
+
+export interface QueryCoverage {
+  query: string;
+  uniqueUrls: number;
+  /** Median number of providers that returned each item. 1 means no provider
+   * corroborated any other -- weak coverage even when the count looks fine. */
+  agreementMedian: number;
+}
+
+export interface Coverage {
+  queries: QueryCoverage[];
+  served: string[];
+  failed: Array<{ backendId: string; reason: string }>;
+  skipped: string[];
+  domainConcentration?: { host: string; share: number };
+  droppedQueries: string[];
+  unfetchedTargets: string[];
+  /** Results withheld because a session had already seen them. */
+  suppressed: number;
+  /** Machine-computed, human-readable. The agent's cue to spend another round. */
+  gaps: string[];
+}
+
+export interface CoverageInput {
+  queries: Array<{ query: string; items: readonly ResearchItem[] }>;
+  served: string[];
+  failed: Array<{ backendId: string; reason: string }>;
+  skipped: string[];
+  droppedQueries: string[];
+  unfetchedTargets: string[];
+  suppressed: number;
+}
+
+export interface NextAction {
+  why: string;
+  cmd: string;
+}
+
+function median(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2 : (sorted[mid] ?? 0);
+}
+
+/**
+ * Everything about this round that a caller could act on, computed from the
+ * round's own data -- never a judgement about whether the RESULTS answered the
+ * question, which needs the question's meaning and belongs to the agent.
+ *
+ * This exists for the reason one-step.ts reports "stopped after 3 providers":
+ * a cap, a failure, and a genuinely empty web must not produce identical
+ * output. A silent gap reads as full coverage.
+ */
+export function computeCoverage(input: CoverageInput): Coverage {
+  const queries: QueryCoverage[] = input.queries.map(({ query, items }) => ({
+    query,
+    uniqueUrls: items.length,
+    agreementMedian: median(items.map((i) => i.providers.length)),
+  }));
+
+  const hosts = new Map<string, number>();
+  let total = 0;
+  for (const { items } of input.queries) {
+    for (const item of items) {
+      // `hostOf` returns `undefined` for a URL that carries no host evidence at
+      // all (see its docstring). That is not a distinct host to concentrate on,
+      // so it is left out of both the tally and the denominator -- counting it
+      // in the denominator while it can never win the numerator would only
+      // dilute a real concentration signal with results this metric cannot see.
+      const host = hostOf(item.url);
+      if (host === undefined) continue;
+      hosts.set(host, (hosts.get(host) ?? 0) + 1);
+      total += 1;
+    }
+  }
+  let domainConcentration: Coverage['domainConcentration'];
+  if (total > 0) {
+    const [host, count] = [...hosts.entries()].sort((a, b) => b[1] - a[1])[0] ?? ['', 0];
+    if (host !== '') domainConcentration = { host, share: count / total };
+  }
+
+  const gaps: string[] = [];
+  for (const q of queries) {
+    if (q.uniqueUrls === 0) gaps.push(`"${q.query}" returned no results`);
+    else if (q.uniqueUrls < THIN_QUERY_THRESHOLD) gaps.push(`"${q.query}" is thin (${String(q.uniqueUrls)} unique URLs)`);
+    else if (q.agreementMedian <= 1) gaps.push(`"${q.query}" has no cross-provider agreement`);
+  }
+  for (const failure of input.failed) gaps.push(`${failure.backendId} failed (${failure.reason})`);
+  if (input.droppedQueries.length > 0) gaps.push(`not run (call budget): ${input.droppedQueries.join(', ')}`);
+  // Deliberately not "call budget": this list carries both targets dropped on
+  // the budget AND targets whose fetch failed, and a label naming only one
+  // cause would misreport the other.
+  if (input.unfetchedTargets.length > 0) gaps.push(`not fetched: ${input.unfetchedTargets.join(', ')}`);
+  if (domainConcentration !== undefined && domainConcentration.share > 0.6 && total >= 5) {
+    gaps.push(`${String(Math.round(domainConcentration.share * 100))}% of results are from ${domainConcentration.host}`);
+  }
+
+  // Copied, not aliased. A `Coverage` reads as a finished report of a round and
+  // is handed to a renderer and to `nextActions`; returning the caller's own
+  // arrays would make a later `push` on either side silently rewrite the other's
+  // history of what was served. Cheap here (these are round-sized lists) and it
+  // keeps the function as pure as its signature claims.
+  return {
+    queries,
+    served: [...input.served],
+    failed: input.failed.map((f) => ({ ...f })),
+    skipped: [...input.skipped],
+    ...(domainConcentration !== undefined ? { domainConcentration } : {}),
+    droppedQueries: [...input.droppedQueries],
+    unfetchedTargets: [...input.unfetchedTargets],
+    suppressed: input.suppressed,
+    gaps,
+  };
+}
+
+/**
+ * A string wrapped so a POSIX shell passes it through as one literal argument.
+ *
+ * `cmd` is promised to be ready to run, and its ingredients are untrusted: a
+ * query is the user's prompt minus its URLs, and a target is whatever matched
+ * the URL pattern in that prompt. Interpolated raw into double quotes, `$100`
+ * expands to nothing (the follow-up round then searches for, and bills for, the
+ * wrong thing), a `"` in `27" monitor` closes the quote and leaves the shell on
+ * a continuation prompt, and a backtick or `$(...)` reaches command
+ * substitution. Bare, a `?` or `&` in a query string truncates the URL and
+ * backgrounds the job under bash, and fails outright under zsh's globbing.
+ * Single quotes suppress every one of those; the only character they cannot
+ * carry is `'` itself, hence the close-escape-reopen dance.
+ */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Ready-to-run follow-up commands, one per actionable gap.
+ *
+ * Handing over the literal command is the point: an agent that has to compose
+ * the follow-up itself will sometimes get the session flag wrong and re-pay for
+ * links it already has.
+ */
+export function nextActions(coverage: Coverage, sessionId: string | undefined): NextAction[] {
+  // The id alone needs no quoting: it is validated against
+  // /^[A-Za-z0-9._-]{1,64}$/ at parse time because it becomes a filename, so it
+  // holds nothing a shell reacts to. Everything else here goes through
+  // `shellQuote`.
+  const session = sessionId !== undefined ? ` --session ${sessionId}` : '';
+  const actions: NextAction[] = [];
+  for (const q of coverage.queries) {
+    if (q.uniqueUrls >= THIN_QUERY_THRESHOLD && q.agreementMedian > 1) continue;
+    actions.push({
+      // Mirrors the three-way branch the gap text uses, because `why` and the
+      // gap describe the same query to the same reader: calling a query with
+      // plenty of unique URLs "thin" contradicts the gap line sitting next to it
+      // and sends the agent after the wrong remedy.
+      why:
+        q.uniqueUrls === 0
+          ? `"${q.query}" returned nothing`
+          : q.uniqueUrls < THIN_QUERY_THRESHOLD
+            ? `"${q.query}" is thin`
+            : `"${q.query}" has no cross-provider agreement`,
+      cmd: `fezoctl research ${shellQuote(q.query)} --depth research${session}`,
+    });
+  }
+  for (const failure of coverage.failed) {
+    actions.push({
+      why: `${failure.backendId} failed (${failure.reason})`,
+      cmd: `fezoctl providers --intent search`,
+    });
+  }
+  for (const query of coverage.droppedQueries) {
+    actions.push({ why: 'not run: call budget', cmd: `fezoctl research ${shellQuote(query)}${session}` });
+  }
+  for (const target of coverage.unfetchedTargets) {
+    // `--session` is deliberately absent: `scrape` is a one-step command and
+    // takes no session flag.
+    actions.push({ why: 'not fetched', cmd: `fezoctl scrape ${shellQuote(target)}` });
+  }
+  return actions;
+}
