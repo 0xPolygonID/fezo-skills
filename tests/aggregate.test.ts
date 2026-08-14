@@ -547,7 +547,7 @@ describe('computeCoverage', () => {
   it('reports unique URLs and median agreement per query', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://x.example', 3), item('https://y.example', 1)] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     expect(coverage.queries[0]?.uniqueUrls).toBe(2);
     expect(coverage.queries[0]?.agreementMedian).toBe(2);
@@ -556,7 +556,7 @@ describe('computeCoverage', () => {
   it('flags a thin query as a gap', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://x.example', 1)] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     expect(coverage.gaps.join(' ')).toMatch(/thin/i);
   });
@@ -564,7 +564,7 @@ describe('computeCoverage', () => {
   it('flags a zero-result query', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [] }],
-      served: [], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      served: [], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     expect(coverage.gaps.join(' ')).toMatch(/no results/i);
   });
@@ -572,7 +572,7 @@ describe('computeCoverage', () => {
   it('reports domain concentration', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://one.example/a', 1), item('https://one.example/b', 1), item('https://two.example/c', 1)] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     expect(coverage.domainConcentration?.host).toBe('one.example');
     expect(coverage.domainConcentration?.share).toBeCloseTo(2 / 3, 5);
@@ -582,7 +582,7 @@ describe('computeCoverage', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://x.example', 4)] }],
       served: ['you'], failed: [{ backendId: 'firecrawl', reason: 'rate_limited' }],
-      skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     expect(coverage.gaps.join(' ')).toMatch(/firecrawl/);
   });
@@ -590,7 +590,7 @@ describe('computeCoverage', () => {
   it('flags dropped queries so truncation is never silent', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://x.example', 4)] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: ['b'], unfetchedTargets: [], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [{ query: 'b' }], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     expect(coverage.gaps.join(' ')).toMatch(/not run/i);
   });
@@ -598,7 +598,7 @@ describe('computeCoverage', () => {
   it('flags a query no provider corroborated, however many URLs it returned', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'solid state batteries', items: [item('https://a.example', 1), item('https://b.example', 1), item('https://c.example', 1), item('https://d.example', 1)] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     expect(coverage.gaps.join(' ')).toMatch(/no cross-provider agreement/);
   });
@@ -607,15 +607,15 @@ describe('computeCoverage', () => {
     const served = ['you'];
     const failed = [{ backendId: 'firecrawl', reason: 'rate_limited' }];
     const skipped = ['exa'];
-    const droppedQueries = ['b'];
+    const droppedQueries = [{ query: 'b' }];
     const unfetchedTargets = [{ url: 'https://t.example', reason: 'rate_limited' }];
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://x.example', 4)] }],
-      served, failed, skipped, droppedQueries, unfetchedTargets, suppressed: 0,
+      served, failed, skipped, droppedQueries, narrowedQueries: [], unfetchedTargets, suppressed: 0,
     });
     coverage.served.push('exa');
     coverage.skipped.push('you');
-    coverage.droppedQueries.push('c');
+    coverage.droppedQueries.push({ query: 'c' });
     coverage.unfetchedTargets.push({ url: 'https://u.example' });
     const firstTarget = coverage.unfetchedTargets[0];
     if (firstTarget !== undefined) firstTarget.url = 'https://rewritten.example';
@@ -624,7 +624,7 @@ describe('computeCoverage', () => {
     if (firstFailure !== undefined) firstFailure.reason = 'rewritten';
     expect(served).toEqual(['you']);
     expect(skipped).toEqual(['exa']);
-    expect(droppedQueries).toEqual(['b']);
+    expect(droppedQueries).toEqual([{ query: 'b' }]);
     expect(unfetchedTargets).toEqual([{ url: 'https://t.example', reason: 'rate_limited' }]);
     expect(failed).toEqual([{ backendId: 'firecrawl', reason: 'rate_limited' }]);
   });
@@ -634,7 +634,7 @@ describe('nextActions', () => {
   it('emits a runnable follow-up command carrying the session', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'thin one', items: [item('https://x.example', 1)] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     const actions = nextActions(coverage, 'r-42');
     expect(actions[0]?.cmd).toContain('--session r-42');
@@ -644,7 +644,7 @@ describe('nextActions', () => {
   it('omits the session flag when no session is in use', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'thin one', items: [item('https://x.example', 1)] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     expect(nextActions(coverage, undefined)[0]?.cmd).not.toContain('--session');
   });
@@ -652,7 +652,7 @@ describe('nextActions', () => {
   it('returns nothing when there are no gaps', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://x.example', 4), item('https://y.example', 3), item('https://z.example', 3)] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     expect(nextActions(coverage, undefined)).toEqual([]);
   });
@@ -660,7 +660,7 @@ describe('nextActions', () => {
   it('says why a well-populated query still needs another round', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'solid state batteries', items: [item('https://a.example', 1), item('https://b.example', 1), item('https://c.example', 1), item('https://d.example', 1)] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     // Not "is thin": the query returned four unique URLs, and a `why` that
     // contradicts its own gap line points the agent at the wrong remedy.
@@ -674,7 +674,7 @@ describe('nextActions', () => {
         { query: 'is a 27" monitor better', items: [] },
         { query: "o'brien `whoami` review", items: [] },
       ],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [], suppressed: 0,
     });
     const actions = nextActions(coverage, 'r-42');
     expect(actions[0]?.cmd).toBe(`fezoctl research 'best $100 keyboards' --depth research --session r-42`);
@@ -686,7 +686,8 @@ describe('nextActions', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://x.example', 4), item('https://y.example', 3), item('https://z.example', 3)] }],
       served: ['you'], failed: [], skipped: [],
-      droppedQueries: ['price of $BTC & gold'], unfetchedTargets: [{ url: 'https://example.com/p?a=1&b=2' }], suppressed: 0,
+      droppedQueries: [{ query: 'price of $BTC & gold' }], narrowedQueries: [],
+      unfetchedTargets: [{ url: 'https://example.com/p?a=1&b=2' }], suppressed: 0,
     });
     const actions = nextActions(coverage, undefined);
     expect(actions[0]?.cmd).toBe(`fezoctl research 'price of $BTC & gold'`);
@@ -699,7 +700,7 @@ describe('nextActions', () => {
   it('carries a failed target\'s reason in why and leaves the command runnable', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://x.example', 4), item('https://y.example', 3), item('https://z.example', 3)] }],
-      served: ['scrapingdog'], failed: [], skipped: [], droppedQueries: [],
+      served: ['scrapingdog'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [],
       unfetchedTargets: [{ url: 'https://t.example/a', reason: 'rate_limited' }, { url: 'https://t.example/b' }],
       suppressed: 0,
     });
@@ -717,7 +718,7 @@ describe('nextActions', () => {
     const { execFileSync } = await import('node:child_process');
     const coverage = computeCoverage({
       queries: [{ query: 'best $100 keyboards & "27\' monitors"', items: [] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [{ url: 'https://example.com/p?a=1&b=2' }], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [{ url: 'https://example.com/p?a=1&b=2' }], suppressed: 0,
     });
     const argvOf = (cmd: string): string[] =>
       execFileSync('/bin/sh', ['-c', `fezoctl() { for a in "$@"; do printf '%s\\n' "$a"; done; }; ${cmd}`], { encoding: 'utf8' })
@@ -726,5 +727,106 @@ describe('nextActions', () => {
     const actions = nextActions(coverage, 'r-42');
     expect(argvOf(actions[0]?.cmd ?? '')).toEqual(['research', 'best $100 keyboards & "27\' monitors"', '--depth', 'research', '--session', 'r-42']);
     expect(argvOf(actions[1]?.cmd ?? '')).toEqual(['scrape', 'https://example.com/p?a=1&b=2']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Final-review MAJ-2: the snippet cap is a property of every item entering
+// `mergeItems`, not of one of its two producers. `toRawItem` (the sniffer) had
+// it; `sanitizeRow` (the adapter path) did not -- and the adapter path is
+// precisely the one Task 14 exists to populate, from the Firecrawl-family
+// captures that put whole-page markdown in `content`.
+// ---------------------------------------------------------------------------
+
+describe('SNIPPET_MAX_CHARS covers the adapter path', () => {
+  it('caps an adapter-supplied snippet exactly as the sniffer path does', () => {
+    const original = RESPONSE_ADAPTERS['capped_tool'];
+    RESPONSE_ADAPTERS['capped_tool'] = () => [{ url: 'https://a.example', title: 't', snippet: 'x'.repeat(200_000) }];
+    try {
+      // Through `mergeItems`, which is where `sanitizeRow` guards every row
+      // entering the merged set -- `extractItems` hands an adapter's output
+      // back as-is, so the cap has to hold at the boundary the OUTPUT crosses,
+      // not at the one the adapter returns from. This is the final review's own
+      // reproduction, inverted into an assertion.
+      const { items } = mergeItems([{ backendId: 'b', rank: 1, items: extractItems('capped_tool', {}) }]);
+      expect(items[0]?.snippet?.length).toBe(SNIPPET_MAX_CHARS);
+      expect(items[0]?.snippet?.endsWith('…')).toBe(true);
+    } finally {
+      if (original === undefined) delete RESPONSE_ADAPTERS['capped_tool'];
+      else RESPONSE_ADAPTERS['capped_tool'] = original;
+    }
+  });
+
+  it('leaves a short adapter snippet untouched', () => {
+    const original = RESPONSE_ADAPTERS['short_tool'];
+    RESPONSE_ADAPTERS['short_tool'] = () => [{ url: 'https://a.example', snippet: 'brief' }];
+    try {
+      const { items } = mergeItems([{ backendId: 'b', rank: 1, items: extractItems('short_tool', {}) }]);
+      expect(items[0]?.snippet).toBe('brief');
+    } finally {
+      if (original === undefined) delete RESPONSE_ADAPTERS['short_tool'];
+      else RESPONSE_ADAPTERS['short_tool'] = original;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Final-review MAJ-1 / MAJ-3: a dropped query must say WHY it was dropped, a
+// narrowed query must be reported at all, and an account-scoped abort must not
+// produce actions that spend again.
+// ---------------------------------------------------------------------------
+
+describe('computeCoverage: dropped and narrowed queries', () => {
+  const base = {
+    served: ['you'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [],
+    suppressed: 0,
+  };
+
+  it('renders a budget drop and an abort drop as different gaps', () => {
+    const coverage = computeCoverage({
+      ...base,
+      queries: [],
+      droppedQueries: [{ query: 'b' }, { query: 'c', reason: 'round aborted' }],
+    });
+    const gaps = coverage.gaps.join(' | ');
+    expect(gaps).toMatch(/not run \(call budget\).*\bb\b/);
+    expect(gaps).toMatch(/round aborted.*\bc\b/);
+  });
+
+  it('reports a narrowed query with the width it asked for and the width it got', () => {
+    const coverage = computeCoverage({
+      ...base,
+      queries: [],
+      narrowedQueries: [{ query: 'a', requested: 5, actual: 2 }],
+    });
+    expect(coverage.gaps.join(' ')).toMatch(/"a" narrowed to 2 of 5 providers/);
+  });
+});
+
+describe('nextActions: an account-scoped abort', () => {
+  const coverage = computeCoverage({
+    queries: [{ query: 'thin one', items: [] }],
+    served: [], failed: [{ backendId: 'you', reason: 'insufficient_balance' }], skipped: [],
+    droppedQueries: [{ query: 'beta', reason: 'round aborted' }],
+    unfetchedTargets: [{ url: 'https://t1.example', reason: 'round aborted' }],
+    narrowedQueries: [], suppressed: 0,
+  });
+
+  it('emits nothing that would bill again', () => {
+    for (const action of nextActions(coverage, 'r-1', 'insufficient_balance: out of credit')) {
+      expect(action.cmd).not.toMatch(/fezoctl research/);
+      expect(action.cmd).not.toMatch(/fezoctl scrape/);
+    }
+  });
+
+  it('still tells the caller what to do', () => {
+    const actions = nextActions(coverage, 'r-1', 'insufficient_balance: out of credit');
+    expect(actions.length).toBeGreaterThan(0);
+    expect(actions[0]?.why).toMatch(/insufficient_balance/);
+  });
+
+  it('emits the ordinary spend-again actions when there was no abort', () => {
+    const actions = nextActions(coverage, 'r-1', undefined);
+    expect(actions.some((a) => a.cmd.includes('fezoctl research'))).toBe(true);
   });
 });

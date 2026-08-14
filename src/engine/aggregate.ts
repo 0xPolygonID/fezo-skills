@@ -168,22 +168,32 @@ function collectArrays(value: unknown, depth = 0, found: unknown[][] = []): unkn
   return found;
 }
 
+/**
+ * `text` truncated to `SNIPPET_MAX_CHARS`, ellipsis included in the count.
+ *
+ * The ellipsis is the whole point of not slicing silently: a truncated preview
+ * that ends mid-sentence with no marker reads as a provider that returned a
+ * broken snippet, and someone then goes looking for a bug in the provider
+ * rather than finding this cap. It costs one character of text rather than
+ * being added on top, so the emitted string honours the cap the constant
+ * declares instead of overrunning it by one.
+ *
+ * Shared by BOTH producers of a `RawItem` -- the sniffer (`toRawItem`) and the
+ * adapter path (`sanitizeRow`). It lived inline in the sniffer first, which
+ * left the adapter path uncapped; a cap that only one of two producers applies
+ * is not a bound on anything.
+ */
+function capSnippet(text: string): string {
+  return text.length > SNIPPET_MAX_CHARS ? `${text.slice(0, SNIPPET_MAX_CHARS - 1)}…` : text;
+}
+
 function toRawItem(entry: unknown): RawItem | undefined {
   if (!isRecord(entry)) return undefined;
   const url = firstString(entry, FIELD_CANDIDATES.url);
   if (url === undefined) return undefined;
   const title = firstString(entry, FIELD_CANDIDATES.title);
   const full = firstString(entry, FIELD_CANDIDATES.snippet);
-  // The ellipsis is the whole point of not slicing silently: a truncated
-  // preview that ends mid-sentence with no marker reads as a provider that
-  // returned a broken snippet, and someone then goes looking for a bug in the
-  // provider rather than finding this cap. It costs one character of text
-  // rather than being added on top, so the emitted string honours the cap the
-  // constant declares instead of overrunning it by one.
-  const snippet =
-    full !== undefined && full.length > SNIPPET_MAX_CHARS
-      ? `${full.slice(0, SNIPPET_MAX_CHARS - 1)}…`
-      : full;
+  const snippet = full !== undefined ? capSnippet(full) : undefined;
   const publishedAt = firstString(entry, FIELD_CANDIDATES.publishedAt);
   return {
     url,
@@ -425,7 +435,15 @@ function sanitizeRow(entry: unknown): RawItem | undefined {
   return {
     url,
     ...(typeof title === 'string' ? { title } : {}),
-    ...(typeof snippet === 'string' ? { snippet } : {}),
+    // Capped here as well as in `toRawItem`, so the bound is a property of
+    // every item entering `mergeItems` rather than of one of its two
+    // producers. This is the ADAPTER path, and adapters are hand-transcribed
+    // from live captures -- including the Firecrawl-family responses that put
+    // whole-page markdown in `content`, which is exactly the 200,000-character
+    // snippet the cap exists to stop. Capping in only one producer left the
+    // constant's own promise ("keeps the bound true however many providers
+    // answer") false for every adapter-served provider.
+    ...(typeof snippet === 'string' ? { snippet: capSnippet(snippet) } : {}),
     ...(typeof publishedAt === 'string' ? { publishedAt } : {}),
   };
 }
@@ -622,18 +640,69 @@ export interface UnfetchedTarget {
   reason?: string;
 }
 
+/**
+ * A query this round planned but did not run, and why.
+ *
+ * Structured rather than a bare string, for the same reason `UnfetchedTarget`
+ * is: two causes reach this list and they call for different responses from the
+ * caller. A budget drop (`reason` absent) is a "run it again, on its own" —
+ * money was left unspent. An abort (`reason` present) means the ACCOUNT stopped
+ * the round, and running it again spends into whatever tripped. Rendering both
+ * as "not run (call budget)" told the caller to do the one thing that cannot
+ * work.
+ */
+export interface DroppedQuery {
+  query: string;
+  /** Absent for a call-budget drop; present when something other than the
+   * budget stopped it (today: the round aborted). */
+  reason?: string;
+}
+
+/**
+ * A query that ran at less than its planned fan-out width because the call
+ * budget could not cover all of it.
+ *
+ * Reported because a narrowed round and a full one are otherwise
+ * indistinguishable in the output: the caller sees fewer results and reads them
+ * as the web being thin, when the truth is that the round asked fewer
+ * providers. Same principle as every other field here — a silent gap reads as
+ * full coverage.
+ */
+export interface NarrowedQuery {
+  query: string;
+  /** The fan-out width the plan asked for. */
+  requested: number;
+  /** The number of lanes the budget actually allowed. */
+  actual: number;
+}
+
 export interface Coverage {
   queries: QueryCoverage[];
   served: string[];
   failed: Array<{ backendId: string; reason: string }>;
   skipped: string[];
   domainConcentration?: { host: string; share: number };
-  droppedQueries: string[];
+  droppedQueries: DroppedQuery[];
   unfetchedTargets: UnfetchedTarget[];
+  narrowedQueries: NarrowedQuery[];
   /** Results withheld because a session had already seen them. */
   suppressed: number;
   /** Machine-computed, human-readable. The agent's cue to spend another round. */
   gaps: string[];
+}
+
+/** Dropped queries that carry a reason, grouped by it, in first-seen order —
+ * so N queries stopped by one abort render as one line naming all of them
+ * rather than N lines repeating the same cause. */
+function groupByReason(dropped: readonly DroppedQuery[]): Array<[string, string[]]> {
+  const byReason = new Map<string, string[]>();
+  for (const entry of dropped) {
+    if (entry.reason === undefined) continue;
+    const list = byReason.get(entry.reason);
+    if (list) list.push(entry.query);
+    else byReason.set(entry.reason, [entry.query]);
+  }
+  return [...byReason.entries()];
 }
 
 export interface CoverageInput {
@@ -641,8 +710,9 @@ export interface CoverageInput {
   served: string[];
   failed: Array<{ backendId: string; reason: string }>;
   skipped: string[];
-  droppedQueries: string[];
+  droppedQueries: DroppedQuery[];
   unfetchedTargets: UnfetchedTarget[];
+  narrowedQueries: NarrowedQuery[];
   suppressed: number;
 }
 
@@ -702,7 +772,18 @@ export function computeCoverage(input: CoverageInput): Coverage {
     else if (q.agreementMedian <= 1) gaps.push(`"${q.query}" has no cross-provider agreement`);
   }
   for (const failure of input.failed) gaps.push(`${failure.backendId} failed (${failure.reason})`);
-  if (input.droppedQueries.length > 0) gaps.push(`not run (call budget): ${input.droppedQueries.join(', ')}`);
+  // Split by cause, not joined into one line: a budget drop tells the caller
+  // to run the query again, an abort tells them not to. See `DroppedQuery`.
+  const budgetDropped = input.droppedQueries.filter((d) => d.reason === undefined).map((d) => d.query);
+  if (budgetDropped.length > 0) gaps.push(`not run (call budget): ${budgetDropped.join(', ')}`);
+  for (const [reason, queries_] of groupByReason(input.droppedQueries)) {
+    gaps.push(`not run (${reason}): ${queries_.join(', ')}`);
+  }
+  for (const narrowed of input.narrowedQueries) {
+    gaps.push(
+      `"${narrowed.query}" narrowed to ${String(narrowed.actual)} of ${String(narrowed.requested)} providers (call budget)`,
+    );
+  }
   // Deliberately not "call budget": this list carries both targets dropped on
   // the budget AND targets whose fetch failed, and a label naming only one
   // cause would misreport the other. The per-target `reason` is rendered HERE,
@@ -727,10 +808,11 @@ export function computeCoverage(input: CoverageInput): Coverage {
     failed: input.failed.map((f) => ({ ...f })),
     skipped: [...input.skipped],
     ...(domainConcentration !== undefined ? { domainConcentration } : {}),
-    droppedQueries: [...input.droppedQueries],
     // Element-wise, like `failed` above and for the same reason: a spread alone
     // would hand the caller's own objects back inside a finished report.
+    droppedQueries: input.droppedQueries.map((d) => ({ ...d })),
     unfetchedTargets: input.unfetchedTargets.map((t) => ({ ...t })),
+    narrowedQueries: input.narrowedQueries.map((n) => ({ ...n })),
     suppressed: input.suppressed,
     gaps,
   };
@@ -761,7 +843,26 @@ function shellQuote(value: string): string {
  * the follow-up itself will sometimes get the session flag wrong and re-pay for
  * links it already has.
  */
-export function nextActions(coverage: Coverage, sessionId: string | undefined): NextAction[] {
+export function nextActions(coverage: Coverage, sessionId: string | undefined, aborted?: string): NextAction[] {
+  // An account-scoped abort (`retry.ts`'s ABORT_CODES: unauthorized,
+  // limit_exceeded, insufficient_balance) is the one state in which every
+  // action below is not merely useless but actively harmful. Those codes
+  // describe the ACCOUNT, not one provider, so re-running any query spends into
+  // whatever just tripped -- and a `--depth research` follow-up, which is what
+  // the thin-query branch emits, is eight lanes of it. SKILL.md instructs the
+  // agent to run what this function returns, so returning them at all is
+  // instructing it to do exactly that.
+  //
+  // One action, naming the real blocker. It carries no `fezoctl` command
+  // because there is no command in this CLI that fixes a spend limit or a bad
+  // key; pointing at a command that cannot help is how the caller ends up
+  // running it anyway.
+  if (aborted !== undefined) {
+    return [{
+      why: `the round stopped on an account-scoped failure (${aborted}) — every provider presents the same account, so a follow-up round would spend into it`,
+      cmd: 'check the account balance or spend limits, then re-run this round',
+    }];
+  }
   // The id alone needs no quoting: it is validated against
   // /^[A-Za-z0-9._-]{1,64}$/ at parse time because it becomes a filename, so it
   // holds nothing a shell reacts to. Everything else here goes through
@@ -790,8 +891,11 @@ export function nextActions(coverage: Coverage, sessionId: string | undefined): 
       cmd: `fezoctl providers --intent search`,
     });
   }
-  for (const query of coverage.droppedQueries) {
-    actions.push({ why: 'not run: call budget', cmd: `fezoctl research ${shellQuote(query)}${session}` });
+  for (const dropped of coverage.droppedQueries) {
+    actions.push({
+      why: dropped.reason !== undefined ? `not run (${dropped.reason})` : 'not run: call budget',
+      cmd: `fezoctl research ${shellQuote(dropped.query)}${session}`,
+    });
   }
   for (const target of coverage.unfetchedTargets) {
     // `--session` is deliberately absent: `scrape` is a one-step command and

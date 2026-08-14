@@ -11,7 +11,7 @@
 // the repository.
 
 import { canonicalizeUrl, computeCoverage, extractItems, mergeItems, nextActions, recordHit, RRF_K } from './aggregate.js';
-import type { Coverage, LaneItems, NextAction, ProviderHit, ResearchItem, UnfetchedTarget } from './aggregate.js';
+import type { Coverage, DroppedQuery, LaneItems, NarrowedQuery, NextAction, ProviderHit, ResearchItem, UnfetchedTarget } from './aggregate.js';
 import type { ToolCandidate } from './catalog.js';
 import { resolveArgName } from './one-step.js';
 import { MAX_RESEARCH_CALLS } from './plan.js';
@@ -241,21 +241,42 @@ interface TargetReport {
 
 export async function runResearch(options: ResearchOptions): Promise<ResearchOutcome> {
   const { plan, candidates, excluded, gateway } = options;
-  const maxCalls = Math.min(options.maxCalls ?? MAX_RESEARCH_CALLS, MAX_RESEARCH_CALLS);
+  // `Math.min(NaN, n)` is NaN, and every `lanes.length > NaN` test below is
+  // false -- so a non-finite budget would wave through every lane of every
+  // query, in the one module whose header calls itself the absolute bound.
+  // Treated as "no budget supplied" rather than as unlimited, matching
+  // `clampPlan`'s rationale for the same input class on `fanout`.
+  const requestedCalls = options.maxCalls;
+  const maxCalls = Math.min(
+    Number.isFinite(requestedCalls) ? (requestedCalls as number) : MAX_RESEARCH_CALLS,
+    MAX_RESEARCH_CALLS,
+  );
   const concurrency = options.concurrency ?? RESEARCH_CONCURRENCY;
 
   // Budget allocation, whole queries first: half of two queries' providers is
   // worse coverage than all of one query's, and a partially-run query reports
   // a "thin" gap that is really a budget artefact.
   const planned: Array<{ query: string; lanes: Lane[] }> = [];
-  const droppedQueries: string[] = [];
+  const droppedQueries: DroppedQuery[] = [];
+  const narrowedQueries: NarrowedQuery[] = [];
   let budget = maxCalls;
   for (const query of plan.queries) {
     const lanes = lanesForQuery(query, plan, candidates, excluded);
     if (lanes.length === 0) { planned.push({ query, lanes: [] }); continue; }
-    if (lanes.length > budget) { droppedQueries.push(query); continue; }
-    budget -= lanes.length;
-    planned.push({ query, lanes });
+    if (budget <= 0) { droppedQueries.push({ query }); continue; }
+    // A budget smaller than the width NARROWS the query rather than cancelling
+    // it: `--max-calls 4` on a fanout-5 round used to bill nothing and exit 2,
+    // spending none of the four calls the caller explicitly authorised. Lanes
+    // are dropped from the TAIL, which by `diversityOrder`'s construction is
+    // the lowest-diversity provider -- the one whose index another lane in this
+    // same query is most likely to have covered already. The narrowing is
+    // reported (see `narrowedQueries`), because a thinner round and a full one
+    // otherwise read identically in the output.
+    const width = Math.min(lanes.length, budget);
+    if (width < lanes.length) narrowedQueries.push({ query, requested: lanes.length, actual: width });
+    const kept = lanes.slice(0, width);
+    budget -= kept.length;
+    planned.push({ query, lanes: kept });
   }
   // Split by POSITION, never by value. `plan.targets.filter((t) => !unfetched.includes(t))`
   // decides membership by string equality, so a target listed twice with only
@@ -400,6 +421,40 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   const skipped = ran.flatMap((r) => (r.skipped !== undefined ? [r.skipped] : []));
   const aborted = ran.find((r) => r.aborted !== undefined)?.aborted ?? targetsRan.find((r) => r.aborted !== undefined)?.aborted;
 
+  // Work the pool never started, recovered by diffing the plan against the
+  // slots. Without this the round reports a query nobody asked as
+  // `"beta" returned no results` -- a claim about the WEB, made on the strength
+  // of a request that was never sent -- and the planned target disappears from
+  // the report entirely. `computeCoverage`'s own docstring says it exists to
+  // stop exactly that, and the abort path was the one route around it.
+  //
+  // A query counts as unstarted only when NONE of its lanes ran: one lane that
+  // came back is a real, if thin, answer, and the thin-coverage gap is the
+  // honest description of it.
+  const unstartedQueryIndexes = new Set<number>();
+  if (aborted !== undefined) {
+    planned.forEach(({ lanes }, queryIndex) => {
+      if (lanes.length === 0) return;
+      const laneSlots = plannedLanes
+        .map((entry, laneIndex) => ({ entry, laneIndex }))
+        .filter(({ entry }) => entry.queryIndex === queryIndex);
+      if (laneSlots.every(({ laneIndex }) => laneReports[laneIndex] === undefined)) {
+        unstartedQueryIndexes.add(queryIndex);
+      }
+    });
+    for (const queryIndex of unstartedQueryIndexes) {
+      const entry = planned[queryIndex];
+      if (entry !== undefined) droppedQueries.push({ query: entry.query, reason: 'round aborted' });
+    }
+  }
+  // Targets whose slot is still empty were never fetched, for the same reason.
+  const unstartedTargets: UnfetchedTarget[] =
+    aborted === undefined
+      ? []
+      : fetchTargets.flatMap((url, index) =>
+          targetReports[index] === undefined ? [{ url, reason: 'round aborted' }] : [],
+        );
+
   const seen = options.seenUrls ?? new Set<string>();
   const perQuery: Array<{ query: string; items: ResearchItem[] }> = [];
   // A set of URLs unioned across queries, never a sum of the per-query counts.
@@ -412,6 +467,11 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   // and that answer cannot depend on how the plan was split.
   const suppressedUrls = new Set<string>();
   planned.forEach(({ query }, queryIndex) => {
+    // A query the abort stopped before any lane started is reported as not run
+    // (see `unstartedQueryIndexes`), not as a query that came back empty. Left
+    // in here it would ALSO get a `"…" returned no results` gap, which is the
+    // false claim this whole diff exists to remove.
+    if (unstartedQueryIndexes.has(queryIndex)) return;
     const laneItems = (laneItemsByQuery[queryIndex] ?? []).filter((l): l is LaneItems => l !== undefined);
     const merged = mergeItems(laneItems, seen);
     for (const url of merged.suppressedUrls) suppressedUrls.add(url);
@@ -521,7 +581,8 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     // naming only one cause would misreport the other. A budget drop carries no
     // `reason` -- nothing was attempted, so there is nothing to report but the
     // URL, and the shared "not fetched" label already says that much.
-    unfetchedTargets: [...unfetchedTargets.map((url) => ({ url })), ...failedTargets],
+    unfetchedTargets: [...unfetchedTargets.map((url) => ({ url })), ...failedTargets, ...unstartedTargets],
+    narrowedQueries,
     suppressed: suppressedUrls.size,
   });
 
@@ -539,7 +600,7 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     items,
     documents,
     coverage,
-    nextActions: nextActions(coverage, options.sessionId),
+    nextActions: nextActions(coverage, options.sessionId, aborted),
     billing: { callsBilled, attempts },
   };
 }

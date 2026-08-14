@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { ToolCandidate } from '../src/engine/catalog.js';
 import type { RoutingPlan } from '../src/engine/plan.js';
+import { MAX_RESEARCH_CALLS } from '../src/engine/plan.js';
 import { runResearch } from '../src/engine/research.js';
 
 function candidate(backendId: string, method: string): ToolCandidate {
@@ -127,7 +128,7 @@ describe('runResearch', () => {
       plan: plan({ queries: ['one', 'two'], fanout: 1 }), candidates: CANDIDATES, excluded: [],
       gateway: { ...gateway, fetchFn }, maxCalls: 1,
     });
-    expect(outcome.coverage.droppedQueries).toEqual(['two']);
+    expect(outcome.coverage.droppedQueries).toEqual([{ query: 'two' }]);
   });
 
   it('suppresses URLs a session has already seen', async () => {
@@ -453,5 +454,119 @@ describe('runResearch: targets', () => {
     });
     expect(outcome.items.length).toBeGreaterThan(0);
     expect(outcome.documents).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reporting honesty on the abort and budget paths (final review MAJ-1, MAJ-3).
+//
+// The abort MECHANISM was already correct -- no new lane starts, in-flight
+// lanes are awaited rather than discarded. What these pin is the REPORT: an
+// aborted round must not describe work it never started as work that came back
+// empty, and it must not hand the caller commands that would spend again into
+// an account that just ran out of money.
+// ---------------------------------------------------------------------------
+
+describe('runResearch: an aborted round reports what it never started', () => {
+  const limit = () =>
+    new Response(JSON.stringify({ error: { code: 'insufficient_balance', message: 'out of credit' } }), { status: 402 });
+
+  it('reports unstarted queries as not run, never as "returned no results"', async () => {
+    const fetchFn = routedFetch({ you: [limit()] });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha', 'beta', 'gamma'], fanout: 1 }),
+      candidates: CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, concurrency: 1,
+    });
+    expect(outcome.aborted).toMatch(/insufficient_balance/);
+    // 'beta' and 'gamma' never had a lane start. Saying they returned nothing
+    // is a claim about the web; the truth is a claim about this round.
+    expect(outcome.coverage.droppedQueries.map((d) => d.query)).toEqual(['beta', 'gamma']);
+    for (const dropped of outcome.coverage.droppedQueries) {
+      expect(dropped.reason).toMatch(/abort/i);
+    }
+    expect(outcome.coverage.gaps.join(' ')).not.toMatch(/"beta" returned no results/);
+    expect(outcome.coverage.gaps.join(' ')).not.toMatch(/"gamma" returned no results/);
+  });
+
+  it('reports an unstarted target instead of dropping it from the report', async () => {
+    const fetchFn = routedFetch({ you: [limit()] });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha'], targets: ['https://t1.example'], fanout: 1 }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, concurrency: 1,
+    });
+    expect(outcome.documents).toHaveLength(0);
+    expect(outcome.coverage.unfetchedTargets.map((t) => t.url)).toContain('https://t1.example');
+  });
+
+  it('emits no spend-again next actions once the account is the problem', async () => {
+    const fetchFn = routedFetch({ you: [limit()] });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha', 'beta'], targets: ['https://t1.example'], fanout: 1 }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, concurrency: 1,
+    });
+    for (const action of outcome.nextActions) {
+      expect(action.cmd).not.toMatch(/fezoctl research/);
+      expect(action.cmd).not.toMatch(/fezoctl scrape/);
+    }
+    // Still actionable -- the round must say what to do, just not "spend more".
+    expect(outcome.nextActions.length).toBeGreaterThan(0);
+  });
+});
+
+describe('runResearch: --max-calls narrows a round instead of cancelling it', () => {
+  it('runs a reduced width when the budget is below the requested fan-out', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results(['https://b.example'])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha'], fanout: 5 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn }, maxCalls: 2,
+    });
+    expect(outcome.billing.callsBilled).toBe(2);
+    expect(outcome.ok).toBe(true);
+    expect(outcome.coverage.droppedQueries).toEqual([]);
+  });
+
+  it('reports the narrowing rather than passing a thinner round off as a full one', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results(['https://b.example'])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha'], fanout: 5 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn }, maxCalls: 2,
+    });
+    expect(outcome.coverage.narrowedQueries).toEqual([{ query: 'alpha', requested: 5, actual: 2 }]);
+    expect(outcome.coverage.gaps.join(' ')).toMatch(/narrowed/i);
+  });
+
+  it('drops a query only when the budget leaves it no lane at all', async () => {
+    const fetchFn = routedFetch({ you: [results(['https://a.example'])] });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['one', 'two'], fanout: 1 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn }, maxCalls: 1,
+    });
+    expect(outcome.coverage.droppedQueries.map((d) => d.query)).toEqual(['two']);
+  });
+
+  it('treats a non-finite call budget as no budget at all, never as unlimited', async () => {
+    // Not reachable through the CLI (cli.ts requires an integer >= 1), but this
+    // module's header calls itself the absolute bound, and `Math.min(NaN, 24)`
+    // is NaN -- against which every `lanes.length > budget` test is false, so a
+    // NaN budget would wave through every lane of every query.
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results(['https://b.example'])],
+      brave: [results(['https://c.example'])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: Array.from({ length: 12 }, (_u, i) => `q${String(i)}`), fanout: 3 }),
+      candidates: CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, maxCalls: Number.NaN,
+    });
+    // 12 queries x 3 = 36 lanes requested; the absolute bound is 24. A NaN that
+    // reached the comparisons unguarded would let all 36 through.
+    expect(outcome.billing.attempts.length).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+    expect(outcome.coverage.droppedQueries.length).toBeGreaterThan(0);
   });
 });

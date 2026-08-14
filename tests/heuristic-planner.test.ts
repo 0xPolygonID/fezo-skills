@@ -134,3 +134,59 @@ describe('resolvePlanner', () => {
     expect(() => resolvePlanner('psychic')).toThrow(/unknown planner/i);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Final-review MAJ-4: a residual made only of connectives is not a query.
+//
+// Stripping the URLs out of a prompt leaves whatever prose surrounded them, and
+// that remainder was emitted as a query whenever it had a search verb, a
+// question word, or four tokens -- none of which requires the remainder to
+// carry any SUBJECT. The cost is not the wasted fan-out. It is that the round
+// then correctly diagnoses the junk result as a thin-coverage gap and offers a
+// `--depth research` follow-up on the same meaningless string, turning two
+// wasted calls into ten.
+//
+// The test is "does any token survive the stop-word, question-word and
+// search-verb sets", so a residual with a real subject still becomes a query
+// even when it reads awkwardly -- see the `is ... better` row below, which is
+// deliberately NOT suppressed.
+// ---------------------------------------------------------------------------
+
+describe('heuristicPlanner: a residual with no content word is not a query', () => {
+  const noQuery = [
+    'compare https://a.example/x and https://b.example/y',
+    'what https://example.com/a',
+    'find https://a.example',
+    'a the of and https://a.example',
+    'search https://a.example please',
+  ];
+
+  it.each(noQuery)('emits no query for %s', (prompt) => {
+    const p = heuristicPlanner.plan(prompt);
+    expect(p.queries).toEqual([]);
+    expect(p.intents).toContain('scrape');
+  });
+
+  it('records the decision as a signal, like every other decision it makes', () => {
+    expect(heuristicPlanner.plan('compare https://a.example/x and https://b.example/y').signals)
+      .toContain('residual-has-no-content');
+  });
+
+  it('still emits a query when the residual carries a real subject', () => {
+    // 'say', 'about' and 'pricing' survive all three sets; the row at the top
+    // of this file asserting this exact prompt must keep passing.
+    expect(heuristicPlanner.plan('what does https://example.com say about pricing').queries)
+      .toEqual(['what does say about pricing']);
+  });
+
+  it('does not suppress a residual that is merely terse', () => {
+    // 'better' is a content word. Suppressing this would be the heuristic
+    // deciding the query is bad rather than deciding it is empty, which is a
+    // judgement it has no basis to make.
+    expect(heuristicPlanner.plan('is https://a.example/x better').queries).toEqual(['is better']);
+  });
+
+  it('leaves a URL-free prompt alone', () => {
+    expect(heuristicPlanner.plan('compare rust and go').queries).toEqual(['compare rust and go']);
+  });
+});

@@ -630,7 +630,7 @@ const OUTCOME: ResearchOutcome = {
   documents: [{ url: 'https://t.example', backendId: 'scrapingdog', content: '{"content":"body"}' }],
   coverage: {
     queries: [{ query: 'coffee', uniqueUrls: 1, agreementMedian: 2 }],
-    served: ['you', 'exa'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [],
+    served: ['you', 'exa'], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [],
     suppressed: 0, gaps: ['"coffee" is thin (1 unique URLs)'],
   },
   nextActions: [{ why: '"coffee" is thin', cmd: 'fezoctl research "coffee" --depth research' }],

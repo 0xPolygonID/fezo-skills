@@ -11,6 +11,7 @@
 // exactly what to override.
 
 import type { Intent } from '../intent.js';
+import { STOP_WORDS } from '../rank.js';
 import { DEPTH_FANOUT } from '../plan.js';
 import type { PlanDepth, Planner, RoutingPlan } from '../plan.js';
 
@@ -217,7 +218,29 @@ export const heuristicPlanner: Planner = {
     }
 
     const depth = pickDepth(residual, tokens, signals);
-    const queries = intents.includes('search') && residual !== '' ? [residual] : [];
+    // A residual with no CONTENT word is not a query, however it was reached.
+    //
+    // `wantsSearch` above is satisfied by a search verb, a question word, or
+    // four tokens -- none of which requires the remainder to name a subject. So
+    // "compare <url> and <url>" arrived here with a residual of "compare and"
+    // and became a billed fan-out for a string that asks nothing.
+    //
+    // The wasted calls are not the real cost. The round then correctly
+    // diagnoses the junk it gets back as a thin-coverage gap and offers a
+    // `--depth research` follow-up on the SAME string -- eight more lanes --
+    // and SKILL.md tells the agent to run what `next_actions` offers. Two
+    // wasted calls become ten, and the gap, which is honest, points at a remedy
+    // that cannot work.
+    //
+    // The test is emptiness, never quality: a residual keeps its query if any
+    // token survives all three sets, so a terse "is ... better" still searches.
+    // Deciding a query is BAD is a judgement this planner has no basis to make;
+    // deciding it is EMPTY is arithmetic.
+    const hasContentWord = tokens.some(
+      (token) => !STOP_WORDS.has(token) && !QUESTION_WORDS.has(token) && !SEARCH_VERBS.has(token),
+    );
+    const queries = intents.includes('search') && residual !== '' && hasContentWord ? [residual] : [];
+    if (!hasContentWord && tokens.length > 0) signals.push('residual-has-no-content');
     if (queries.length === 0 && targets.length > 0) signals.push('targets-only');
     // Stated plainly, because it is the single most important limitation of
     // this planner and the reason an agent should override it for research.

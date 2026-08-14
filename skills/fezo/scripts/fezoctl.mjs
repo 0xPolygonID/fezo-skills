@@ -9925,136 +9925,6 @@ function clampPlan(plan) {
   };
 }
 
-// src/engine/planners/heuristic.ts
-var URL_PATTERN = /https?:\/\/[^\s<>"'\]]+/g;
-var TRAILING_PUNCTUATION = /[.,;:!?'"]+$/;
-function countOf(text, ch) {
-  let n = 0;
-  for (const c of text) if (c === ch) n += 1;
-  return n;
-}
-function trimUrl(match) {
-  let url = match;
-  for (; ; ) {
-    const stripped = url.replace(TRAILING_PUNCTUATION, "");
-    if (stripped.endsWith(")") && countOf(stripped, ")") > countOf(stripped, "(")) {
-      url = stripped.slice(0, -1);
-      continue;
-    }
-    return stripped;
-  }
-}
-var RECENCY_WORDS = /* @__PURE__ */ new Set([
-  "latest",
-  "recent",
-  "current",
-  "currently",
-  "today",
-  "yesterday",
-  "now",
-  "breaking",
-  "news",
-  "update",
-  "updates"
-]);
-var RECENCY_PHRASES = ["this week", "this month", "this year"];
-Object.freeze(RECENCY_PHRASES);
-var RECENCY_PHRASE_PATTERNS = Object.freeze(
-  RECENCY_PHRASES.map((phrase) => new RegExp(`\\b${phrase}\\b`))
-);
-var RESEARCH_PHRASES = [
-  "deep research",
-  "comprehensive",
-  "in depth",
-  "in-depth",
-  "thorough",
-  "everything about",
-  "all sources",
-  "as much as possible",
-  "exhaustive",
-  "literature review",
-  "literature survey",
-  "survey of",
-  "research on",
-  "research about"
-];
-Object.freeze(RESEARCH_PHRASES);
-var QUESTION_WORDS = /* @__PURE__ */ new Set(["what", "why", "how", "when", "where", "who", "which", "is", "are", "does", "do", "can", "should"]);
-var SEARCH_VERBS = /* @__PURE__ */ new Set(["find", "search", "compare", "list", "research", "investigate", "analyse", "analyze", "gather"]);
-function words(prompt) {
-  return prompt.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w !== "");
-}
-function looksLikeYear(word) {
-  return /^(19|20)\d{2}$/.test(word);
-}
-function pickDepth(prompt, tokens, signals) {
-  const lower = prompt.toLowerCase();
-  for (const phrase of RESEARCH_PHRASES) {
-    if (lower.includes(phrase)) {
-      signals.push(`research-phrase:${phrase}`);
-      return "research";
-    }
-  }
-  if (tokens.length >= 12) {
-    signals.push(`long-prompt:${String(tokens.length)}-tokens`);
-    return "standard";
-  }
-  if (tokens.length <= 4) {
-    signals.push(`short-prompt:${String(tokens.length)}-tokens`);
-    return "shallow";
-  }
-  const isQuestion = tokens[0] !== void 0 && QUESTION_WORDS.has(tokens[0]);
-  if (isQuestion) {
-    signals.push("depth:question-form");
-    return "standard";
-  }
-  signals.push("default-depth");
-  return "shallow";
-}
-var heuristicPlanner = {
-  id: "heuristic",
-  plan(prompt) {
-    const signals = [];
-    const intents = [];
-    const targets = [...prompt.matchAll(URL_PATTERN)].map((m) => trimUrl(m[0]));
-    if (targets.length > 0) {
-      intents.push("scrape");
-      signals.push(`url-literal:${String(targets.length)}`);
-    }
-    const residual = prompt.replace(URL_PATTERN, " ").replace(/\s+/g, " ").trim();
-    const tokens = words(residual);
-    const hasQuestion = tokens[0] !== void 0 && QUESTION_WORDS.has(tokens[0]);
-    const hasSearchVerb = tokens.some((t) => SEARCH_VERBS.has(t));
-    const wantsSearch = targets.length === 0 || hasQuestion || hasSearchVerb || tokens.length >= 4;
-    if (wantsSearch && tokens.length > 0) {
-      intents.push("search");
-      if (hasQuestion) signals.push("question-form");
-      if (hasSearchVerb) signals.push("search-verb");
-    }
-    const lowerResidual = residual.toLowerCase();
-    const hasRecency = tokens.some((t) => RECENCY_WORDS.has(t) || looksLikeYear(t)) || RECENCY_PHRASE_PATTERNS.some((pattern) => pattern.test(lowerResidual));
-    if (hasRecency && intents.includes("search")) {
-      intents.push("news");
-      signals.push("recency-cue");
-    }
-    if (intents.length === 0) {
-      intents.push("search");
-      signals.push("fallback:no-signal");
-    }
-    const depth = pickDepth(residual, tokens, signals);
-    const queries = intents.includes("search") && residual !== "" ? [residual] : [];
-    if (queries.length === 0 && targets.length > 0) signals.push("targets-only");
-    if (depth === "research" && queries.length <= 1) {
-      signals.push("no-decomposition: heuristic cannot split this into sub-queries; supply --queries");
-    }
-    return { intents, queries, targets, depth, fanout: DEPTH_FANOUT[depth], signals, source: "heuristic" };
-  }
-};
-function resolvePlanner(id) {
-  if (id === "heuristic") return heuristicPlanner;
-  throw new Error(`unknown planner "${id}"`);
-}
-
 // src/engine/preference.ts
 var CAPABILITY_KEYWORDS = {
   scrape: [
@@ -10326,6 +10196,140 @@ function selectForRun(candidates, intent) {
   return { outcome: "selected", chosen, ranked };
 }
 
+// src/engine/planners/heuristic.ts
+var URL_PATTERN = /https?:\/\/[^\s<>"'\]]+/g;
+var TRAILING_PUNCTUATION = /[.,;:!?'"]+$/;
+function countOf(text, ch) {
+  let n = 0;
+  for (const c of text) if (c === ch) n += 1;
+  return n;
+}
+function trimUrl(match) {
+  let url = match;
+  for (; ; ) {
+    const stripped = url.replace(TRAILING_PUNCTUATION, "");
+    if (stripped.endsWith(")") && countOf(stripped, ")") > countOf(stripped, "(")) {
+      url = stripped.slice(0, -1);
+      continue;
+    }
+    return stripped;
+  }
+}
+var RECENCY_WORDS = /* @__PURE__ */ new Set([
+  "latest",
+  "recent",
+  "current",
+  "currently",
+  "today",
+  "yesterday",
+  "now",
+  "breaking",
+  "news",
+  "update",
+  "updates"
+]);
+var RECENCY_PHRASES = ["this week", "this month", "this year"];
+Object.freeze(RECENCY_PHRASES);
+var RECENCY_PHRASE_PATTERNS = Object.freeze(
+  RECENCY_PHRASES.map((phrase) => new RegExp(`\\b${phrase}\\b`))
+);
+var RESEARCH_PHRASES = [
+  "deep research",
+  "comprehensive",
+  "in depth",
+  "in-depth",
+  "thorough",
+  "everything about",
+  "all sources",
+  "as much as possible",
+  "exhaustive",
+  "literature review",
+  "literature survey",
+  "survey of",
+  "research on",
+  "research about"
+];
+Object.freeze(RESEARCH_PHRASES);
+var QUESTION_WORDS = /* @__PURE__ */ new Set(["what", "why", "how", "when", "where", "who", "which", "is", "are", "does", "do", "can", "should"]);
+var SEARCH_VERBS = /* @__PURE__ */ new Set(["find", "search", "compare", "list", "research", "investigate", "analyse", "analyze", "gather"]);
+function words(prompt) {
+  return prompt.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w !== "");
+}
+function looksLikeYear(word) {
+  return /^(19|20)\d{2}$/.test(word);
+}
+function pickDepth(prompt, tokens, signals) {
+  const lower = prompt.toLowerCase();
+  for (const phrase of RESEARCH_PHRASES) {
+    if (lower.includes(phrase)) {
+      signals.push(`research-phrase:${phrase}`);
+      return "research";
+    }
+  }
+  if (tokens.length >= 12) {
+    signals.push(`long-prompt:${String(tokens.length)}-tokens`);
+    return "standard";
+  }
+  if (tokens.length <= 4) {
+    signals.push(`short-prompt:${String(tokens.length)}-tokens`);
+    return "shallow";
+  }
+  const isQuestion = tokens[0] !== void 0 && QUESTION_WORDS.has(tokens[0]);
+  if (isQuestion) {
+    signals.push("depth:question-form");
+    return "standard";
+  }
+  signals.push("default-depth");
+  return "shallow";
+}
+var heuristicPlanner = {
+  id: "heuristic",
+  plan(prompt) {
+    const signals = [];
+    const intents = [];
+    const targets = [...prompt.matchAll(URL_PATTERN)].map((m) => trimUrl(m[0]));
+    if (targets.length > 0) {
+      intents.push("scrape");
+      signals.push(`url-literal:${String(targets.length)}`);
+    }
+    const residual = prompt.replace(URL_PATTERN, " ").replace(/\s+/g, " ").trim();
+    const tokens = words(residual);
+    const hasQuestion = tokens[0] !== void 0 && QUESTION_WORDS.has(tokens[0]);
+    const hasSearchVerb = tokens.some((t) => SEARCH_VERBS.has(t));
+    const wantsSearch = targets.length === 0 || hasQuestion || hasSearchVerb || tokens.length >= 4;
+    if (wantsSearch && tokens.length > 0) {
+      intents.push("search");
+      if (hasQuestion) signals.push("question-form");
+      if (hasSearchVerb) signals.push("search-verb");
+    }
+    const lowerResidual = residual.toLowerCase();
+    const hasRecency = tokens.some((t) => RECENCY_WORDS.has(t) || looksLikeYear(t)) || RECENCY_PHRASE_PATTERNS.some((pattern) => pattern.test(lowerResidual));
+    if (hasRecency && intents.includes("search")) {
+      intents.push("news");
+      signals.push("recency-cue");
+    }
+    if (intents.length === 0) {
+      intents.push("search");
+      signals.push("fallback:no-signal");
+    }
+    const depth = pickDepth(residual, tokens, signals);
+    const hasContentWord = tokens.some(
+      (token) => !STOP_WORDS.has(token) && !QUESTION_WORDS.has(token) && !SEARCH_VERBS.has(token)
+    );
+    const queries = intents.includes("search") && residual !== "" && hasContentWord ? [residual] : [];
+    if (!hasContentWord && tokens.length > 0) signals.push("residual-has-no-content");
+    if (queries.length === 0 && targets.length > 0) signals.push("targets-only");
+    if (depth === "research" && queries.length <= 1) {
+      signals.push("no-decomposition: heuristic cannot split this into sub-queries; supply --queries");
+    }
+    return { intents, queries, targets, depth, fanout: DEPTH_FANOUT[depth], signals, source: "heuristic" };
+  }
+};
+function resolvePlanner(id) {
+  if (id === "heuristic") return heuristicPlanner;
+  throw new Error(`unknown planner "${id}"`);
+}
+
 // src/engine/aggregate.ts
 var TRACKING_PARAMS = [
   "gclid",
@@ -10392,13 +10396,16 @@ function collectArrays(value, depth = 0, found = []) {
   }
   return found;
 }
+function capSnippet(text) {
+  return text.length > SNIPPET_MAX_CHARS ? `${text.slice(0, SNIPPET_MAX_CHARS - 1)}\u2026` : text;
+}
 function toRawItem(entry) {
   if (!isRecord4(entry)) return void 0;
   const url = firstString(entry, FIELD_CANDIDATES.url);
   if (url === void 0) return void 0;
   const title = firstString(entry, FIELD_CANDIDATES.title);
   const full = firstString(entry, FIELD_CANDIDATES.snippet);
-  const snippet = full !== void 0 && full.length > SNIPPET_MAX_CHARS ? `${full.slice(0, SNIPPET_MAX_CHARS - 1)}\u2026` : full;
+  const snippet = full !== void 0 ? capSnippet(full) : void 0;
   const publishedAt = firstString(entry, FIELD_CANDIDATES.publishedAt);
   return {
     url,
@@ -10463,7 +10470,15 @@ function sanitizeRow(entry) {
   return {
     url,
     ...typeof title === "string" ? { title } : {},
-    ...typeof snippet === "string" ? { snippet } : {},
+    // Capped here as well as in `toRawItem`, so the bound is a property of
+    // every item entering `mergeItems` rather than of one of its two
+    // producers. This is the ADAPTER path, and adapters are hand-transcribed
+    // from live captures -- including the Firecrawl-family responses that put
+    // whole-page markdown in `content`, which is exactly the 200,000-character
+    // snippet the cap exists to stop. Capping in only one producer left the
+    // constant's own promise ("keeps the bound true however many providers
+    // answer") false for every adapter-served provider.
+    ...typeof snippet === "string" ? { snippet: capSnippet(snippet) } : {},
     ...typeof publishedAt === "string" ? { publishedAt } : {}
   };
 }
@@ -10525,6 +10540,16 @@ function mergeItems(lanes, seenUrls = /* @__PURE__ */ new Set()) {
   return { items: merged, suppressed: suppressedUrls.size, suppressedUrls };
 }
 var THIN_QUERY_THRESHOLD = 3;
+function groupByReason(dropped) {
+  const byReason = /* @__PURE__ */ new Map();
+  for (const entry of dropped) {
+    if (entry.reason === void 0) continue;
+    const list = byReason.get(entry.reason);
+    if (list) list.push(entry.query);
+    else byReason.set(entry.reason, [entry.query]);
+  }
+  return [...byReason.entries()];
+}
 function median(values) {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
@@ -10559,7 +10584,16 @@ function computeCoverage(input) {
     else if (q.agreementMedian <= 1) gaps.push(`"${q.query}" has no cross-provider agreement`);
   }
   for (const failure of input.failed) gaps.push(`${failure.backendId} failed (${failure.reason})`);
-  if (input.droppedQueries.length > 0) gaps.push(`not run (call budget): ${input.droppedQueries.join(", ")}`);
+  const budgetDropped = input.droppedQueries.filter((d) => d.reason === void 0).map((d) => d.query);
+  if (budgetDropped.length > 0) gaps.push(`not run (call budget): ${budgetDropped.join(", ")}`);
+  for (const [reason, queries_] of groupByReason(input.droppedQueries)) {
+    gaps.push(`not run (${reason}): ${queries_.join(", ")}`);
+  }
+  for (const narrowed of input.narrowedQueries) {
+    gaps.push(
+      `"${narrowed.query}" narrowed to ${String(narrowed.actual)} of ${String(narrowed.requested)} providers (call budget)`
+    );
+  }
   if (input.unfetchedTargets.length > 0) {
     const rendered = input.unfetchedTargets.map((t) => t.reason !== void 0 ? `${t.url} (${t.reason})` : t.url);
     gaps.push(`not fetched: ${rendered.join(", ")}`);
@@ -10573,10 +10607,11 @@ function computeCoverage(input) {
     failed: input.failed.map((f) => ({ ...f })),
     skipped: [...input.skipped],
     ...domainConcentration !== void 0 ? { domainConcentration } : {},
-    droppedQueries: [...input.droppedQueries],
     // Element-wise, like `failed` above and for the same reason: a spread alone
     // would hand the caller's own objects back inside a finished report.
+    droppedQueries: input.droppedQueries.map((d) => ({ ...d })),
     unfetchedTargets: input.unfetchedTargets.map((t) => ({ ...t })),
+    narrowedQueries: input.narrowedQueries.map((n) => ({ ...n })),
     suppressed: input.suppressed,
     gaps
   };
@@ -10584,7 +10619,13 @@ function computeCoverage(input) {
 function shellQuote(value) {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
-function nextActions(coverage, sessionId) {
+function nextActions(coverage, sessionId, aborted) {
+  if (aborted !== void 0) {
+    return [{
+      why: `the round stopped on an account-scoped failure (${aborted}) \u2014 every provider presents the same account, so a follow-up round would spend into it`,
+      cmd: "check the account balance or spend limits, then re-run this round"
+    }];
+  }
   const session = sessionId !== void 0 ? ` --session ${sessionId}` : "";
   const actions = [];
   for (const q of coverage.queries) {
@@ -10604,8 +10645,11 @@ function nextActions(coverage, sessionId) {
       cmd: `fezoctl providers --intent search`
     });
   }
-  for (const query of coverage.droppedQueries) {
-    actions.push({ why: "not run: call budget", cmd: `fezoctl research ${shellQuote(query)}${session}` });
+  for (const dropped of coverage.droppedQueries) {
+    actions.push({
+      why: dropped.reason !== void 0 ? `not run (${dropped.reason})` : "not run: call budget",
+      cmd: `fezoctl research ${shellQuote(dropped.query)}${session}`
+    });
   }
   for (const target of coverage.unfetchedTargets) {
     actions.push({
@@ -10674,10 +10718,15 @@ function scrapeLane(candidates, excluded) {
 }
 async function runResearch(options) {
   const { plan, candidates, excluded, gateway } = options;
-  const maxCalls = Math.min(options.maxCalls ?? MAX_RESEARCH_CALLS, MAX_RESEARCH_CALLS);
+  const requestedCalls = options.maxCalls;
+  const maxCalls = Math.min(
+    Number.isFinite(requestedCalls) ? requestedCalls : MAX_RESEARCH_CALLS,
+    MAX_RESEARCH_CALLS
+  );
   const concurrency = options.concurrency ?? RESEARCH_CONCURRENCY;
   const planned = [];
   const droppedQueries = [];
+  const narrowedQueries = [];
   let budget = maxCalls;
   for (const query of plan.queries) {
     const lanes = lanesForQuery(query, plan, candidates, excluded);
@@ -10685,12 +10734,15 @@ async function runResearch(options) {
       planned.push({ query, lanes: [] });
       continue;
     }
-    if (lanes.length > budget) {
-      droppedQueries.push(query);
+    if (budget <= 0) {
+      droppedQueries.push({ query });
       continue;
     }
-    budget -= lanes.length;
-    planned.push({ query, lanes });
+    const width = Math.min(lanes.length, budget);
+    if (width < lanes.length) narrowedQueries.push({ query, requested: lanes.length, actual: width });
+    const kept = lanes.slice(0, width);
+    budget -= kept.length;
+    planned.push({ query, lanes: kept });
   }
   const fetchable = Math.max(0, budget);
   const fetchTargets = plan.targets.slice(0, fetchable);
@@ -10778,10 +10830,28 @@ async function runResearch(options) {
   const failed = ran.flatMap((r) => r.failed !== void 0 ? [r.failed] : []);
   const skipped = ran.flatMap((r) => r.skipped !== void 0 ? [r.skipped] : []);
   const aborted = ran.find((r) => r.aborted !== void 0)?.aborted ?? targetsRan.find((r) => r.aborted !== void 0)?.aborted;
+  const unstartedQueryIndexes = /* @__PURE__ */ new Set();
+  if (aborted !== void 0) {
+    planned.forEach(({ lanes }, queryIndex) => {
+      if (lanes.length === 0) return;
+      const laneSlots = plannedLanes.map((entry, laneIndex) => ({ entry, laneIndex })).filter(({ entry }) => entry.queryIndex === queryIndex);
+      if (laneSlots.every(({ laneIndex }) => laneReports[laneIndex] === void 0)) {
+        unstartedQueryIndexes.add(queryIndex);
+      }
+    });
+    for (const queryIndex of unstartedQueryIndexes) {
+      const entry = planned[queryIndex];
+      if (entry !== void 0) droppedQueries.push({ query: entry.query, reason: "round aborted" });
+    }
+  }
+  const unstartedTargets = aborted === void 0 ? [] : fetchTargets.flatMap(
+    (url, index) => targetReports[index] === void 0 ? [{ url, reason: "round aborted" }] : []
+  );
   const seen = options.seenUrls ?? /* @__PURE__ */ new Set();
   const perQuery = [];
   const suppressedUrls = /* @__PURE__ */ new Set();
   planned.forEach(({ query }, queryIndex) => {
+    if (unstartedQueryIndexes.has(queryIndex)) return;
     const laneItems = (laneItemsByQuery[queryIndex] ?? []).filter((l) => l !== void 0);
     const merged = mergeItems(laneItems, seen);
     for (const url of merged.suppressedUrls) suppressedUrls.add(url);
@@ -10852,7 +10922,8 @@ async function runResearch(options) {
     // naming only one cause would misreport the other. A budget drop carries no
     // `reason` -- nothing was attempted, so there is nothing to report but the
     // URL, and the shared "not fetched" label already says that much.
-    unfetchedTargets: [...unfetchedTargets.map((url) => ({ url })), ...failedTargets],
+    unfetchedTargets: [...unfetchedTargets.map((url) => ({ url })), ...failedTargets, ...unstartedTargets],
+    narrowedQueries,
     suppressed: suppressedUrls.size
   });
   const callsBilled = attempts.filter((a) => a.billed).length;
@@ -10869,7 +10940,7 @@ async function runResearch(options) {
     items,
     documents,
     coverage,
-    nextActions: nextActions(coverage, options.sessionId),
+    nextActions: nextActions(coverage, options.sessionId, aborted),
     billing: { callsBilled, attempts }
   };
 }
