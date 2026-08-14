@@ -161,12 +161,27 @@ did. One new field on `Recommendation`:
 indexId: string;   // 'you' | 'exa' | 'brave' | 'google-serp' | 'firecrawl' | ...
 ```
 
-`diversityOrder(intent, n)` walks the declared ranking and takes the
-highest-ranked provider of each unseen `indexId` first, then continues down the
-declared order for the remainder. Value rank still decides *within* an index;
-diversity only decides *between* them. With `n` ≥ the number of distinct
-indexes, the result is a permutation of the declared list — never a truncation
-of it.
+`indexId` is scoped to a *row*, not to a backend: `firecrawl_search` resells
+the Google SERP while `firecrawl_scrape` fetches the URL the caller named, so
+`firecrawl` is `'google-serp'` under `search` and `'firecrawl'` under `scrape`.
+The concrete resellers are `search` ranks 4-5 (`firecrawl`, `geonode`), which
+publish no index of their own.
+
+`diversityOrder(intent, n)` buckets the declared ranking by `indexId`, each
+bucket keeping declared order, and **round-robins** across the buckets in the
+declared order of each index's first provider. Value rank still decides
+*within* an index; diversity only decides *between* them. With `n` ≥ the number
+of distinct indexes, the result is a permutation of the eligible list — the
+declared list minus its deny-listed and `notRecommended` entries — never a
+truncation of it.
+
+Round-robin, and not "unseen indexes first, then the declared order for the
+remainder": the two agree until two indexes each have two or more providers,
+where for declared `a1,a2,a3,b1,b2` the latter yields `a1,b1,a2,a3,b2` and
+round-robin yields `a1,b1,a2,b2,a3`. Because `n` truncates, the property worth
+having is that *every* prefix is as index-diverse as it can be, and spending
+the 4th call on `a3` while `b2` is unasked gives that up. Recorded as a
+deviation under the plan's Task 1.
 
 ## Aggregation
 

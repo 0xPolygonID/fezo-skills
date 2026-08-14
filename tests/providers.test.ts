@@ -4,13 +4,15 @@ import { INTENTS, METHOD_INTENTS } from '../src/engine/intent.js';
 import {
   RECOMMENDATIONS,
   declaredIntentsFor,
+  diversityOrder,
   displayNameFor,
   isExcluded,
+  orderByIndexDiversity,
   recommendationFor,
   recommendationsFor,
   resolveExcludedBackends,
 } from '../src/engine/providers.js';
-import type { Tier } from '../src/engine/providers.js';
+import type { Recommendation, Tier } from '../src/engine/providers.js';
 
 // ---------------------------------------------------------------------------
 // The invariant providers.ts's own doc comment promises but nothing in
@@ -150,7 +152,14 @@ describe('RECOMMENDATIONS freezing', () => {
   });
 
   it('throws rather than silently reordering when a caller mutates a returned list', () => {
-    const bogus = { backendId: 'bogus', displayName: 'Bogus', tier: 'primary' as const, why: 'n/a', entryMethods: [] };
+    const bogus = {
+      backendId: 'bogus',
+      displayName: 'Bogus',
+      tier: 'primary' as const,
+      why: 'n/a',
+      entryMethods: [],
+      indexId: 'bogus',
+    };
     expect(() => recommendationsFor('scrape').push(bogus)).toThrow();
     expect(() => recommendationsFor('scrape').sort()).toThrow();
   });
@@ -243,5 +252,244 @@ describe('isExcluded', () => {
     const excluded = resolveExcludedBackends({ FEZO_EXCLUDED_BACKENDS: 'xro' });
     expect(isExcluded('xro', excluded)).toBe(true);
     expect(isExcluded('falai', excluded)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// indexId / diversityOrder — the fan-out breadth axis over the declared,
+// best-value ranking. See providers.ts's doc comment on `indexId` for why
+// value rank and index diversity are different axes.
+// ---------------------------------------------------------------------------
+
+// The declared map, transcribed from the plan's Task 1 table plus the two
+// amendments that task recorded (`firecrawl`/`geonode` resell the Google SERP
+// in `search`). Pinned as a literal, keyed by "intent/backendId", because
+// `indexId` is the routing input that decides what a fan-out DOESN'T buy:
+// moving a provider onto a shared index silently narrows every future round,
+// and moving one off a shared index silently widens the bill. Neither is a
+// typo-sized change, so both have to be made twice, here and in providers.ts.
+const DECLARED_INDEX_IDS: Readonly<Record<string, string>> = {
+  'search/you': 'you',
+  'search/exa': 'exa',
+  'search/brave': 'brave',
+  'search/firecrawl': 'google-serp',
+  'search/geonode': 'google-serp',
+  'scrape/scrapingdog': 'google-serp',
+  'scrape/brightdata': 'brightdata',
+  'scrape/firecrawl': 'firecrawl',
+  'scrape/geonode': 'geonode',
+  'scrape/apify': 'apify',
+  'scrape/scraperapi': 'google-serp',
+  'scrape/scrapingbee': 'google-serp',
+  'crawl/firecrawl': 'firecrawl',
+  'crawl/geonode': 'geonode',
+  'crawl/brightdata': 'brightdata',
+  'crawl/apify': 'apify',
+  'news/newsapi': 'newsapi',
+  'news/you': 'you',
+  'news/brave': 'brave',
+  'social/apify': 'apify',
+  'social/brightdata': 'brightdata',
+  'social/xro': 'x',
+  'proxy/geonode': 'geonode',
+  'proxy/brightdata': 'brightdata',
+};
+
+describe('indexId', () => {
+  it('is declared on every recommendation', () => {
+    for (const [intent, recs] of Object.entries(RECOMMENDATIONS)) {
+      for (const rec of recs) {
+        expect(rec.indexId, `${intent}/${rec.backendId}`).toBeTruthy();
+      }
+    }
+  });
+
+  it('matches the pinned declared map, row for row', () => {
+    const actual: Record<string, string> = {};
+    for (const [intent, recs] of Object.entries(RECOMMENDATIONS)) {
+      for (const rec of recs) actual[`${intent}/${rec.backendId}`] = rec.indexId;
+    }
+    expect(actual).toEqual(DECLARED_INDEX_IDS);
+  });
+
+  it('declares one index per (intent, backendId) and keeps a backend stable wherever its entry method is the same', () => {
+    // The plan's Step 3 asked for one indexId per backend across all intents.
+    // Task 1 narrowed that to per-row: a backend's entry method differs by
+    // intent, and firecrawl_search (a SERP scrape) shares an upstream that
+    // firecrawl_scrape (a fetch of the caller's own URL) does not. What
+    // survives is the weaker, true invariant -- rows that declare the SAME
+    // entryMethods must declare the same indexId, or the table is asserting
+    // that one call hits two different indexes depending on who asked.
+    const byMethods = new Map<string, Map<string, string[]>>();
+    for (const [intent, recs] of Object.entries(RECOMMENDATIONS)) {
+      for (const rec of recs) {
+        const key = `${rec.backendId}:${[...rec.entryMethods].sort().join('+')}`;
+        const seen = byMethods.get(key) ?? new Map<string, string[]>();
+        seen.set(rec.indexId, [...(seen.get(rec.indexId) ?? []), intent]);
+        byMethods.set(key, seen);
+      }
+    }
+    const conflicts = [...byMethods.entries()]
+      .filter(([, seen]) => seen.size > 1)
+      .map(([key, seen]) => {
+        const detail = [...seen.entries()].map(([id, intents]) => `${id} (${intents.join(', ')})`).join(' vs ');
+        return `${key}: ${detail}`;
+      });
+    expect(conflicts).toEqual([]);
+  });
+
+  it('marks the Google SERP resellers so a search fan-out cannot mistake five providers for five indexes', () => {
+    // The motivating case from the spec. If this ever reads 5, the reselling
+    // claim has been edited out of the table and every downstream coverage
+    // number silently overstates breadth by one.
+    const search = recommendationsFor('search');
+    expect(search).toHaveLength(5);
+    expect(new Set(search.map((r) => r.indexId)).size).toBe(4);
+    expect(search.filter((r) => r.indexId === 'google-serp').map((r) => r.backendId)).toEqual([
+      'firecrawl',
+      'geonode',
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The reordering itself, tested on synthetic lists. It cannot be tested
+// through `diversityOrder`, which reads the module table: on today's declared
+// data every repeated indexId sits at the tail of its list, so the diversity
+// order equals the declared order for every intent, deny-list and limit (see
+// the characterization test at the end of this block). These inputs are the
+// ones the table cannot currently produce -- and they are what a future
+// declared entry on a shared index will look like.
+// ---------------------------------------------------------------------------
+
+function rec(backendId: string, indexId: string): Recommendation {
+  return { backendId, displayName: backendId, tier: 'secondary', why: 'synthetic', entryMethods: [], indexId };
+}
+
+const ids = (recs: readonly Recommendation[]): string[] => recs.map((r) => r.backendId);
+
+describe('orderByIndexDiversity', () => {
+  it('promotes the first provider of an unseen index over the second of a seen one', () => {
+    const ordered = orderByIndexDiversity([rec('a1', 'a'), rec('a2', 'a'), rec('b1', 'b')], 3);
+    expect(ids(ordered)).toEqual(['a1', 'b1', 'a2']);
+  });
+
+  it('spends a truncated round on distinct indexes, not on the declared prefix', () => {
+    // The whole point of the field: at width 2 the declared order would buy
+    // index `a` twice.
+    const ordered = orderByIndexDiversity([rec('a1', 'a'), rec('a2', 'a'), rec('b1', 'b')], 2);
+    expect(ids(ordered)).toEqual(['a1', 'b1']);
+  });
+
+  it('round-robins two indexes that both repeat', () => {
+    const declared = [rec('a1', 'a'), rec('a2', 'a'), rec('b1', 'b'), rec('b2', 'b')];
+    expect(ids(orderByIndexDiversity(declared, 4))).toEqual(['a1', 'b1', 'a2', 'b2']);
+  });
+
+  it('supersedes the spec wording: the 4th call goes to the other index, not to the third of the first', () => {
+    // declared a1,a2,a3,b1,b2 -- the spec's "continue down the declared order
+    // for the remainder" would yield a1,b1,a2,a3,b2. Round-robin holds b2
+    // ahead of a3 so every prefix stays as diverse as it can be.
+    const declared = [rec('a1', 'a'), rec('a2', 'a'), rec('a3', 'a'), rec('b1', 'b'), rec('b2', 'b')];
+    expect(ids(orderByIndexDiversity(declared, 5))).toEqual(['a1', 'b1', 'a2', 'b2', 'a3']);
+  });
+
+  it('visits indexes in the declared order of each index FIRST provider', () => {
+    const declared = [rec('b1', 'b'), rec('a1', 'a'), rec('b2', 'b'), rec('a2', 'a')];
+    expect(ids(orderByIndexDiversity(declared, 4))).toEqual(['b1', 'a1', 'b2', 'a2']);
+  });
+
+  it('keeps declared rank order within one index', () => {
+    const declared = [rec('a1', 'a'), rec('a2', 'a'), rec('a3', 'a'), rec('b1', 'b')];
+    const ordered = ids(orderByIndexDiversity(declared, 99)).filter((id) => id.startsWith('a'));
+    expect(ordered).toEqual(['a1', 'a2', 'a3']);
+  });
+
+  it('returns a permutation, not a truncation, when limit reaches the input length', () => {
+    const declared = [rec('a1', 'a'), rec('a2', 'a'), rec('b1', 'b')];
+    expect([...ids(orderByIndexDiversity(declared, 3))].sort()).toEqual(['a1', 'a2', 'b1']);
+    expect([...ids(orderByIndexDiversity(declared, 99))].sort()).toEqual(['a1', 'a2', 'b1']);
+  });
+
+  it('returns nothing for a limit of zero or below, and nothing for an empty input', () => {
+    const declared = [rec('a1', 'a'), rec('b1', 'b')];
+    expect(orderByIndexDiversity(declared, 0)).toEqual([]);
+    expect(orderByIndexDiversity(declared, -1)).toEqual([]);
+    expect(orderByIndexDiversity([], 5)).toEqual([]);
+  });
+});
+
+describe('diversityOrder', () => {
+  it('takes one provider per distinct index before repeating an index', () => {
+    const ordered = diversityOrder('search', 4, []);
+    const indexes = ordered.map((r) => r.indexId);
+    expect(new Set(indexes).size).toBe(indexes.length);
+  });
+
+  it('keeps declared rank order within one index', () => {
+    const ordered = diversityOrder('search', 10, []);
+    const declared = recommendationsFor('search').filter((r) => !r.notRecommended);
+    const bySameIndex = (id: string) =>
+      ordered.filter((r) => r.indexId === id).map((r) => r.backendId);
+    for (const id of new Set(declared.map((r) => r.indexId))) {
+      const declaredOrder = declared.filter((r) => r.indexId === id).map((r) => r.backendId);
+      expect(bySameIndex(id)).toEqual(declaredOrder);
+    }
+  });
+
+  it('returns a permutation of the declared list when limit exceeds it', () => {
+    const declared = recommendationsFor('search').filter((r) => !r.notRecommended);
+    const ordered = diversityOrder('search', 99, []);
+    expect([...ordered].map((r) => r.backendId).sort()).toEqual(
+      [...declared].map((r) => r.backendId).sort(),
+    );
+  });
+
+  it('never returns a notRecommended or excluded provider', () => {
+    const ordered = diversityOrder('social', 99, ['brightdata']);
+    expect(ordered.some((r) => r.notRecommended)).toBe(false);
+    expect(ordered.some((r) => r.backendId === 'brightdata')).toBe(false);
+  });
+
+  it('permutes the ELIGIBLE list, which is smaller than the declared one once anything is filtered', () => {
+    // `social` declares apify, brightdata, xro(notRecommended). Deny-listing
+    // brightdata leaves one eligible row: the result is a permutation of that
+    // one, not of the declared three. The doc comment says eligible for this
+    // reason -- a caller checking "did we reach everyone?" against the
+    // declared list would conclude the fan-out failed.
+    const declared = recommendationsFor('social');
+    const eligible = declared.filter((r) => r.notRecommended === undefined && r.backendId !== 'brightdata');
+    const ordered = diversityOrder('social', 99, ['brightdata']);
+    expect(eligible.length).toBeLessThan(declared.length);
+    expect([...ordered].map((r) => r.backendId).sort()).toEqual([...eligible].map((r) => r.backendId).sort());
+  });
+
+  it('coincides with the declared order on every intent, deny-list and limit -- a fact about the table, pinned', () => {
+    // Today's ranking is already index-diverse-first: every repeated indexId
+    // sits at the tail of its own list, so the round-robin never has anything
+    // to promote. That makes `diversityOrder` observationally equal to a
+    // filter+slice on the SHIPPED data, which is why the reordering is tested
+    // through `orderByIndexDiversity` above instead.
+    //
+    // This test is the tripwire on that equality, not an endorsement of it.
+    // The day a declared entry puts a shared index above an unseen one, this
+    // fails -- and it should be deleted then, with the new expected order
+    // written down, because at that point the fan-out really has started
+    // choosing a different set of providers than the declared prefix.
+    for (const intent of INTENTS) {
+      const declared = recommendationsFor(intent);
+      for (let mask = 0; mask < 1 << declared.length; mask += 1) {
+        const excluded = declared.filter((_, i) => mask & (1 << i)).map((r) => r.backendId);
+        const eligible = declared.filter(
+          (r) => r.notRecommended === undefined && !isExcluded(r.backendId, excluded),
+        );
+        for (let limit = 0; limit <= declared.length + 1; limit += 1) {
+          const label = `${intent} excluded=[${excluded.join(',')}] limit=${limit}`;
+          expect(diversityOrder(intent, limit, excluded).map((r) => r.backendId), label).toEqual(
+            eligible.slice(0, limit).map((r) => r.backendId),
+          );
+        }
+      }
+    }
   });
 });

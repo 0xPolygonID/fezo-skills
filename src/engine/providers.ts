@@ -62,6 +62,33 @@ export interface Recommendation {
    * than merely against the `{backendId}_` prefix. Refresh both tables from a
    * live `GET /v1/catalog` dump. */
   entryMethods: string[];
+  /**
+   * Which underlying index THIS ROW's `entryMethods` actually query.
+   *
+   * Exists because array order in RECOMMENDATIONS ranks by BEST VALUE, which
+   * is the wrong axis for a fan-out: `search` ranks 4-5 (`firecrawl`,
+   * `geonode`) publish no index of their own — both search endpoints return
+   * Google results, the same SERP the `scrape` reseller trio wraps — so
+   * asking all five `search` providers buys four indexes, not five.
+   * `diversityOrder` uses this to spend each additional call on a source the
+   * round has not queried yet, and lets a caller report the breadth it
+   * actually bought instead of the provider count it paid for.
+   *
+   * The value is a free-form stable key, not an enum: it names a real index
+   * (`'you'`, `'exa'`, `'brave'`) or a shared upstream (`'google-serp'`).
+   * Two providers sharing a value is the whole point of the field.
+   *
+   * **Scoped to the row, not to the backend.** A backend is one `indexId` per
+   * intent, not one globally: `firecrawl_search` resells the Google SERP
+   * while `firecrawl_scrape`/`firecrawl_crawl` fetch the URL the caller
+   * named, which is Firecrawl's own retrieval and shares nothing with
+   * anyone. Collapsing those to a single per-backend value would either lie
+   * about the search row or lie about the scrape row. tests/providers.test.ts
+   * pins the whole (intent, backendId) -> indexId map for exactly this
+   * reason: a shared index is a routing decision and has to be edited
+   * deliberately, in two places.
+   */
+  indexId: string;
 }
 
 /**
@@ -88,6 +115,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'primary',
       why: 'cheapest quality AI search, clean data rights',
       entryMethods: ['you_search'],
+      indexId: 'you',
     },
     {
       backendId: 'exa',
@@ -96,6 +124,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       why: 'neural/semantic retrieval with deep research and monitors',
       when: 'semantic/neural retrieval quality matters most',
       entryMethods: ['exa_search'],
+      indexId: 'exa',
     },
     {
       backendId: 'brave',
@@ -104,6 +133,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       why: 'independent 30B+ page index; official MCP server; structured data',
       when: 'independent index / data sovereignty',
       entryMethods: ['brave_search'],
+      indexId: 'brave',
     },
     {
       backendId: 'firecrawl',
@@ -111,6 +141,11 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'fallback',
       why: 'LLM-ready markdown search as a last resort when dedicated search APIs are exhausted',
       entryMethods: ['firecrawl_search'],
+      // Not `'firecrawl'`: firecrawl_search has no index behind it, it runs a
+      // Google query and scrapes the result page into markdown. Ranked 4th on
+      // value, but it is the 1st row here that buys no new coverage over a
+      // round that already includes the same SERP.
+      indexId: 'google-serp',
     },
     {
       backendId: 'geonode',
@@ -118,6 +153,11 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'fallback',
       why: 'flat per-request search endpoint on top of the cheapest proxy floor',
       entryMethods: ['geonode_search'],
+      // Same as firecrawl above: Geonode is a proxy network, and its "search"
+      // endpoint is a SERP scrape over that floor, not a proprietary index.
+      // Cheap, so it stays declared; a 5th call to it after the 4th, though,
+      // widens the bill and not the result set.
+      indexId: 'google-serp',
     },
   ],
   // § "Still the best-value scraping API": Scrapingdog leads deliberately.
@@ -133,6 +173,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'primary',
       why: 'best-value managed scraping API; no charge for blocked requests',
       entryMethods: ['scrapingdog_scrape'],
+      indexId: 'google-serp',
     },
     {
       backendId: 'brightdata',
@@ -143,6 +184,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       // Bright Data has no `scrape` method: the single-page entry point is
       // the Web Unlocker (internal/brightdatabackend/routes.go:28).
       entryMethods: ['brightdata_unlock'],
+      indexId: 'brightdata',
     },
     {
       backendId: 'firecrawl',
@@ -150,6 +192,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'secondary',
       why: 'fastest path to production, AI-ready',
       entryMethods: ['firecrawl_scrape'],
+      indexId: 'firecrawl',
     },
     {
       backendId: 'geonode',
@@ -157,6 +200,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'secondary',
       why: 'flat $0.13/1k-request scrape endpoint; no credit multipliers',
       entryMethods: ['geonode_scrape'],
+      indexId: 'geonode',
     },
     {
       backendId: 'apify',
@@ -167,6 +211,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       // non-alnum coercion (internal/apifybackend/manifest.go:66). The
       // `runs.get`/`runs.dataset` pair are poll/fetch, not entry points.
       entryMethods: ['apify_runs_submit'],
+      indexId: 'apify',
     },
     {
       backendId: 'scraperapi',
@@ -174,6 +219,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'fallback',
       why: 'mid-tier all-rounder',
       entryMethods: ['scraperapi_scrape'],
+      indexId: 'google-serp',
     },
     {
       backendId: 'scrapingbee',
@@ -181,6 +227,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'fallback',
       why: '~31% benchmarked success; 0% on LinkedIn/Walmart/X',
       entryMethods: ['scrapingbee_scrape'],
+      indexId: 'google-serp',
     },
   ],
   crawl: [
@@ -190,6 +237,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'primary',
       why: 'fastest path to production, AI-ready',
       entryMethods: ['firecrawl_crawl'],
+      indexId: 'firecrawl',
     },
     {
       backendId: 'geonode',
@@ -197,6 +245,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'secondary',
       why: 'best value proxy; flat-rate crawl endpoint',
       entryMethods: ['geonode_crawl'],
+      indexId: 'geonode',
     },
     {
       backendId: 'brightdata',
@@ -209,6 +258,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       // not how you start one.
       why: 'async Web Scraper API (dataset collection) with the strongest anti-bot handling for hard targets',
       entryMethods: ['brightdata_scrape_async'],
+      indexId: 'brightdata',
     },
     {
       backendId: 'apify',
@@ -216,6 +266,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'fallback',
       why: 'actor marketplace; unpredictable billing',
       entryMethods: ['apify_runs_submit'],
+      indexId: 'apify',
     },
   ],
   news: [
@@ -227,6 +278,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       // internal/newsapibackend/routes.go:116,135 — `articles` for
       // individual article text, `events` for the AI-clustered story view.
       entryMethods: ['newsapi_articles', 'newsapi_events'],
+      indexId: 'newsapi',
     },
     {
       backendId: 'you',
@@ -238,6 +290,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       // endpoint with a freshness filter.
       why: 'same clean, cheap index; freshness-filtered search stands in for a dedicated news endpoint',
       entryMethods: ['you_search'],
+      indexId: 'you',
     },
     {
       backendId: 'brave',
@@ -247,6 +300,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       // internal/bravebackend/routes.go:39 — `brave_news`, not
       // `brave_search`, which returns web results.
       entryMethods: ['brave_news'],
+      indexId: 'brave',
     },
   ],
   // § TL;DR economics argument: third-party alternatives are ~30-90x cheaper
@@ -259,6 +313,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'primary',
       why: 'actor marketplace covers social scraping at a fraction of official-API cost',
       entryMethods: ['apify_runs_submit'],
+      indexId: 'apify',
     },
     {
       backendId: 'brightdata',
@@ -268,6 +323,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       // Datasets (including the Social Media scrapers) are collected via
       // the async trigger; the unlocker covers a single public profile page.
       entryMethods: ['brightdata_scrape_async', 'brightdata_unlock'],
+      indexId: 'brightdata',
     },
     {
       backendId: 'xro',
@@ -281,6 +337,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       // `xro_tweet_search` does not exist; `xro_tweet_lookup` is a by-id
       // fetch and is not a discovery entry point.
       entryMethods: ['xro_tweets_search_recent', 'xro_tweets_search_all'],
+      indexId: 'x',
     },
   ],
   // Neither backend exposes a raw proxy endpoint over this gateway — the proxy
@@ -294,6 +351,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'primary',
       why: 'best value proxy; lowest-price-guaranteed residential floor, reached through the flat-rate Scraper API',
       entryMethods: ['geonode_scrape'],
+      indexId: 'geonode',
     },
     {
       backendId: 'brightdata',
@@ -301,6 +359,7 @@ export const RECOMMENDATIONS: Record<Intent, Recommendation[]> = {
       tier: 'secondary',
       why: 'best for enterprise / hard targets; largest network, no concurrency limit, reached through the Web Unlocker',
       entryMethods: ['brightdata_unlock'],
+      indexId: 'brightdata',
     },
   ],
   // No declared recommendations — a method that classifies here is still
@@ -426,4 +485,87 @@ export function displayNameFor(backendId: string): string | undefined {
     if (found) return found.displayName;
   }
   return undefined;
+}
+
+/**
+ * The pure ordering step behind `diversityOrder`: re-order an already-filtered
+ * list so each successive entry queries an index the prefix has not used yet,
+ * then truncate to `limit`.
+ *
+ * Split out from `diversityOrder` because the table this module declares makes
+ * the two functions indistinguishable: today no intent has a repeated
+ * `indexId` anywhere except at the tail of its list, so on the real data the
+ * diversity order and the declared order coincide for every intent, every
+ * deny-list and every limit (verified exhaustively). That is a fact about the
+ * ranking, not about the algorithm -- best value happens to already be
+ * index-diverse-first -- but it means the loop below is untestable through
+ * `diversityOrder`, whose only input is an intent. Callers want
+ * `diversityOrder`; this export exists so the reordering has direct coverage
+ * on inputs the table cannot currently produce, and so it stays covered when
+ * a future entry does move a shared index up the ranking.
+ *
+ * Value rank still decides WITHIN an index (the first-listed provider of a
+ * given `indexId` is the one that represents it); diversity only decides
+ * BETWEEN indexes. Passing a `limit` at or above `recs.length` therefore
+ * returns a permutation of `recs`, never a truncation of it -- a fan-out wide
+ * enough to ask everyone still asks everyone.
+ */
+export function orderByIndexDiversity(recs: readonly Recommendation[], limit: number): Recommendation[] {
+  const byIndex = new Map<string, Recommendation[]>();
+  for (const rec of recs) {
+    const list = byIndex.get(rec.indexId);
+    if (list) list.push(rec);
+    else byIndex.set(rec.indexId, [rec]);
+  }
+  // Round-robin across index buckets, each bucket already in declared order.
+  // Insertion order of `byIndex` is the declared order of each index's FIRST
+  // provider, so the first pass visits indexes best-declared-first.
+  //
+  // Round-robin, deliberately, and not the spec's "highest-ranked provider of
+  // each unseen index first, then continue down the declared order for the
+  // remainder" (specs/2026-08-14-smart-routing-design.md § Fan-out policy).
+  // The two agree until two indexes each have two or more providers, where for
+  // declared a1,a2,a3,b1,b2 the spec yields a1,b1,a2,a3,b2 and this yields
+  // a1,b1,a2,b2,a3. Round-robin wins because `limit` truncates: the property
+  // worth having is that EVERY prefix is as index-diverse as it can be, and
+  // the spec's rule spends the 4th call on a3 while b2 -- the second-best
+  // provider of the only other index -- is still unasked. The plan's Task 1
+  // records this supersession; the spec's sentence has been amended to match.
+  const ordered: Recommendation[] = [];
+  let round = 0;
+  while (ordered.length < recs.length) {
+    let addedThisRound = false;
+    for (const bucket of byIndex.values()) {
+      const next = bucket[round];
+      if (next !== undefined) {
+        ordered.push(next);
+        addedThisRound = true;
+      }
+    }
+    if (!addedThisRound) break;
+    round += 1;
+  }
+  return ordered.slice(0, Math.max(0, limit));
+}
+
+/**
+ * The declared ranking for `intent`, re-ordered so each successive provider
+ * queries an index the round has not used yet, then truncated to `limit`.
+ *
+ * Deny-listed and `notRecommended` providers are dropped before ordering, the
+ * same rule `buildWalk` applies: a provider assessed and advised against is
+ * not a breadth opportunity.
+ *
+ * Passing a `limit` at or above the number of ELIGIBLE providers returns a
+ * permutation of the eligible list -- the declared list minus its deny-listed
+ * and `notRecommended` entries -- never a truncation of it. It is not a
+ * permutation of the declared list whenever anything was filtered, and it is
+ * the filtered set, not the declared one, that a caller should compare
+ * against when it wants to know whether the fan-out reached everyone.
+ */
+export function diversityOrder(intent: Intent, limit: number, excluded: readonly string[]): Recommendation[] {
+  const eligible = recommendationsFor(intent).filter(
+    (rec) => rec.notRecommended === undefined && !isExcluded(rec.backendId, excluded),
+  );
+  return orderByIndexDiversity(eligible, limit);
 }

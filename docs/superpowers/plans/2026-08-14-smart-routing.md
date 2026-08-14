@@ -194,6 +194,43 @@ git add src/engine/providers.ts tests/providers.test.ts
 git commit -m "feat: declare index diversity on provider recommendations"
 ```
 
+Also `git add dist/fezoctl.mjs skills/fezo/scripts/fezoctl.mjs` after
+`pnpm bundle`: `skill_contract.test.ts` gates the bundles as byte-identical to a
+fresh build of `src/`, so any change under `src/engine/` fails the suite until
+they are regenerated in the same commit.
+
+**Deviations recorded during implementation.**
+
+1. *`indexId` is per row, not per backend.* Step 3 asked for "the same value for
+   a backend across every intent it appears in", and the table above pins
+   `firecrawl -> 'firecrawl'` and `geonode -> 'geonode'`. Both are wrong for the
+   `search` rows, and the spec says so directly (§ Fan-out policy: "several
+   `search` entries resell the same Google SERP, so ranks 4-5 can return what
+   ranks 1-3 already did" — `search` ranks 4-5 *are* `firecrawl` and `geonode`).
+   `firecrawl_search` runs a Google query and scrapes the SERP into markdown;
+   `geonode_search` is a SERP scrape over a proxy floor. Neither publishes an
+   index. So both `search` rows are `'google-serp'`, and the `scrape`/`crawl`/
+   `proxy` rows keep their own values, because `firecrawl_scrape` fetches the
+   URL the *caller* named and shares nothing with anyone. A single per-backend
+   value would have to lie about one row or the other. What replaces Step 3's
+   invariant: rows declaring the same `entryMethods` must declare the same
+   `indexId` (tested), plus the full `(intent, backendId) -> indexId` map pinned
+   as a literal in `tests/providers.test.ts` so a change to a shared index has
+   to be made deliberately in two places.
+2. *Step 4's round-robin deliberately supersedes the spec's "then continues down
+   the declared order for the remainder".* See the WHY comment on the loop and
+   the amended spec paragraph: because `limit` truncates, the property worth
+   having is that every prefix is maximally index-diverse, which the spec's rule
+   gives up as soon as two indexes each have two or more providers.
+3. *The ordering step is exported as `orderByIndexDiversity(recs, limit)` and
+   `diversityOrder` delegates to it.* On the shipped table the reordering is
+   unobservable — every repeated `indexId` sits at the tail of its own list, so
+   diversity order equals declared order for every intent, every deny-list and
+   every limit (verified by exhaustive enumeration, and pinned by a
+   characterization test). That is a property of the ranking, not of the
+   algorithm, but it leaves the loop with no coverage through an intent-only
+   signature. The pure function is tested directly on synthetic lists.
+
 ---
 
 ### Task 2: The plan contract

@@ -8848,7 +8848,8 @@ var RECOMMENDATIONS = {
       displayName: "You.com",
       tier: "primary",
       why: "cheapest quality AI search, clean data rights",
-      entryMethods: ["you_search"]
+      entryMethods: ["you_search"],
+      indexId: "you"
     },
     {
       backendId: "exa",
@@ -8856,7 +8857,8 @@ var RECOMMENDATIONS = {
       tier: "secondary",
       why: "neural/semantic retrieval with deep research and monitors",
       when: "semantic/neural retrieval quality matters most",
-      entryMethods: ["exa_search"]
+      entryMethods: ["exa_search"],
+      indexId: "exa"
     },
     {
       backendId: "brave",
@@ -8864,21 +8866,32 @@ var RECOMMENDATIONS = {
       tier: "secondary",
       why: "independent 30B+ page index; official MCP server; structured data",
       when: "independent index / data sovereignty",
-      entryMethods: ["brave_search"]
+      entryMethods: ["brave_search"],
+      indexId: "brave"
     },
     {
       backendId: "firecrawl",
       displayName: "Firecrawl",
       tier: "fallback",
       why: "LLM-ready markdown search as a last resort when dedicated search APIs are exhausted",
-      entryMethods: ["firecrawl_search"]
+      entryMethods: ["firecrawl_search"],
+      // Not `'firecrawl'`: firecrawl_search has no index behind it, it runs a
+      // Google query and scrapes the result page into markdown. Ranked 4th on
+      // value, but it is the 1st row here that buys no new coverage over a
+      // round that already includes the same SERP.
+      indexId: "google-serp"
     },
     {
       backendId: "geonode",
       displayName: "Geonode",
       tier: "fallback",
       why: "flat per-request search endpoint on top of the cheapest proxy floor",
-      entryMethods: ["geonode_search"]
+      entryMethods: ["geonode_search"],
+      // Same as firecrawl above: Geonode is a proxy network, and its "search"
+      // endpoint is a SERP scrape over that floor, not a proprietary index.
+      // Cheap, so it stays declared; a 5th call to it after the 4th, though,
+      // widens the bill and not the result set.
+      indexId: "google-serp"
     }
   ],
   // § "Still the best-value scraping API": Scrapingdog leads deliberately.
@@ -8893,7 +8906,8 @@ var RECOMMENDATIONS = {
       displayName: "Scrapingdog",
       tier: "primary",
       why: "best-value managed scraping API; no charge for blocked requests",
-      entryMethods: ["scrapingdog_scrape"]
+      entryMethods: ["scrapingdog_scrape"],
+      indexId: "google-serp"
     },
     {
       backendId: "brightdata",
@@ -8903,21 +8917,24 @@ var RECOMMENDATIONS = {
       when: "hard/anti-bot targets (Cloudflare, DataDome), or when Scrapingdog success on your targets drops below ~50%",
       // Bright Data has no `scrape` method: the single-page entry point is
       // the Web Unlocker (internal/brightdatabackend/routes.go:28).
-      entryMethods: ["brightdata_unlock"]
+      entryMethods: ["brightdata_unlock"],
+      indexId: "brightdata"
     },
     {
       backendId: "firecrawl",
       displayName: "Firecrawl",
       tier: "secondary",
       why: "fastest path to production, AI-ready",
-      entryMethods: ["firecrawl_scrape"]
+      entryMethods: ["firecrawl_scrape"],
+      indexId: "firecrawl"
     },
     {
       backendId: "geonode",
       displayName: "Geonode",
       tier: "secondary",
       why: "flat $0.13/1k-request scrape endpoint; no credit multipliers",
-      entryMethods: ["geonode_scrape"]
+      entryMethods: ["geonode_scrape"],
+      indexId: "geonode"
     },
     {
       backendId: "apify",
@@ -8927,21 +8944,24 @@ var RECOMMENDATIONS = {
       // `runs.submit` -> `apify_runs_submit` via methodToToolName's
       // non-alnum coercion (internal/apifybackend/manifest.go:66). The
       // `runs.get`/`runs.dataset` pair are poll/fetch, not entry points.
-      entryMethods: ["apify_runs_submit"]
+      entryMethods: ["apify_runs_submit"],
+      indexId: "apify"
     },
     {
       backendId: "scraperapi",
       displayName: "ScraperAPI",
       tier: "fallback",
       why: "mid-tier all-rounder",
-      entryMethods: ["scraperapi_scrape"]
+      entryMethods: ["scraperapi_scrape"],
+      indexId: "google-serp"
     },
     {
       backendId: "scrapingbee",
       displayName: "ScrapingBee",
       tier: "fallback",
       why: "~31% benchmarked success; 0% on LinkedIn/Walmart/X",
-      entryMethods: ["scrapingbee_scrape"]
+      entryMethods: ["scrapingbee_scrape"],
+      indexId: "google-serp"
     }
   ],
   crawl: [
@@ -8950,14 +8970,16 @@ var RECOMMENDATIONS = {
       displayName: "Firecrawl",
       tier: "primary",
       why: "fastest path to production, AI-ready",
-      entryMethods: ["firecrawl_crawl"]
+      entryMethods: ["firecrawl_crawl"],
+      indexId: "firecrawl"
     },
     {
       backendId: "geonode",
       displayName: "Geonode",
       tier: "secondary",
       why: "best value proxy; flat-rate crawl endpoint",
-      entryMethods: ["geonode_crawl"]
+      entryMethods: ["geonode_crawl"],
+      indexId: "geonode"
     },
     {
       backendId: "brightdata",
@@ -8969,14 +8991,16 @@ var RECOMMENDATIONS = {
       // snapshot are deliberately excluded — they are how you finish a run,
       // not how you start one.
       why: "async Web Scraper API (dataset collection) with the strongest anti-bot handling for hard targets",
-      entryMethods: ["brightdata_scrape_async"]
+      entryMethods: ["brightdata_scrape_async"],
+      indexId: "brightdata"
     },
     {
       backendId: "apify",
       displayName: "Apify",
       tier: "fallback",
       why: "actor marketplace; unpredictable billing",
-      entryMethods: ["apify_runs_submit"]
+      entryMethods: ["apify_runs_submit"],
+      indexId: "apify"
     }
   ],
   news: [
@@ -8987,7 +9011,8 @@ var RECOMMENDATIONS = {
       why: "enriched entity/sentiment/event intelligence, archive depth back to 2014",
       // internal/newsapibackend/routes.go:116,135 — `articles` for
       // individual article text, `events` for the AI-clustered story view.
-      entryMethods: ["newsapi_articles", "newsapi_events"]
+      entryMethods: ["newsapi_articles", "newsapi_events"],
+      indexId: "newsapi"
     },
     {
       backendId: "you",
@@ -8998,7 +9023,8 @@ var RECOMMENDATIONS = {
       // routes.go:81-158), so the entry point is the general search
       // endpoint with a freshness filter.
       why: "same clean, cheap index; freshness-filtered search stands in for a dedicated news endpoint",
-      entryMethods: ["you_search"]
+      entryMethods: ["you_search"],
+      indexId: "you"
     },
     {
       backendId: "brave",
@@ -9007,7 +9033,8 @@ var RECOMMENDATIONS = {
       why: "independent index with a dedicated news endpoint",
       // internal/bravebackend/routes.go:39 — `brave_news`, not
       // `brave_search`, which returns web results.
-      entryMethods: ["brave_news"]
+      entryMethods: ["brave_news"],
+      indexId: "brave"
     }
   ],
   // § TL;DR economics argument: third-party alternatives are ~30-90x cheaper
@@ -9019,7 +9046,8 @@ var RECOMMENDATIONS = {
       displayName: "Apify",
       tier: "primary",
       why: "actor marketplace covers social scraping at a fraction of official-API cost",
-      entryMethods: ["apify_runs_submit"]
+      entryMethods: ["apify_runs_submit"],
+      indexId: "apify"
     },
     {
       backendId: "brightdata",
@@ -9028,7 +9056,8 @@ var RECOMMENDATIONS = {
       why: "prebuilt datasets and unlocker cover social targets the official API restricts",
       // Datasets (including the Social Media scrapers) are collected via
       // the async trigger; the unlocker covers a single public profile page.
-      entryMethods: ["brightdata_scrape_async", "brightdata_unlock"]
+      entryMethods: ["brightdata_scrape_async", "brightdata_unlock"],
+      indexId: "brightdata"
     },
     {
       backendId: "xro",
@@ -9041,7 +9070,8 @@ var RECOMMENDATIONS = {
       // internal/xrobackend/routes.go:70-71 — the search endpoints.
       // `xro_tweet_search` does not exist; `xro_tweet_lookup` is a by-id
       // fetch and is not a discovery entry point.
-      entryMethods: ["xro_tweets_search_recent", "xro_tweets_search_all"]
+      entryMethods: ["xro_tweets_search_recent", "xro_tweets_search_all"],
+      indexId: "x"
     }
   ],
   // Neither backend exposes a raw proxy endpoint over this gateway — the proxy
@@ -9054,14 +9084,16 @@ var RECOMMENDATIONS = {
       displayName: "Geonode",
       tier: "primary",
       why: "best value proxy; lowest-price-guaranteed residential floor, reached through the flat-rate Scraper API",
-      entryMethods: ["geonode_scrape"]
+      entryMethods: ["geonode_scrape"],
+      indexId: "geonode"
     },
     {
       backendId: "brightdata",
       displayName: "Bright Data",
       tier: "secondary",
       why: "best for enterprise / hard targets; largest network, no concurrency limit, reached through the Web Unlocker",
-      entryMethods: ["brightdata_unlock"]
+      entryMethods: ["brightdata_unlock"],
+      indexId: "brightdata"
     }
   ],
   // No declared recommendations — a method that classifies here is still
