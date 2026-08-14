@@ -359,7 +359,7 @@ describe('runResearch: targets', () => {
     // `'https://t.example (rate_limited)'` would destroy the one-step `scrape`
     // fallback that a failed target is deliberately delegated to.
     expect(outcome.nextActions.map((a) => a.cmd)).toContain(`fezoctl scrape 'https://t.example'`);
-    expect(outcome.nextActions.find((a) => a.cmd.startsWith('fezoctl scrape'))?.why).toBe('not fetched (rate_limited)');
+    expect(outcome.nextActions.find((a) => a.cmd?.startsWith('fezoctl scrape') === true)?.why).toBe('not fetched (rate_limited)');
   });
 
   it('reports a target no catalog provider can fetch, without billing anything', async () => {
@@ -429,13 +429,17 @@ describe('runResearch: targets', () => {
       scrapingdog: [new Response('{"content":"one"}', { status: 200 }), new Response('{"content":"two"}', { status: 200 })],
     });
     const outcome = await runResearch({
-      // Three query lanes leave 2 of the 5 calls for targets, so the first two
-      // of the three targets are fetched -- including the duplicate at index 0.
+      // Targets are reserved before queries take what is left (`clampPlan`'s
+      // stated order, which the executor now matches), so a 2-call budget buys
+      // the first two of the three targets -- including the duplicate at index
+      // 0 -- and leaves nothing for the query. The third target is the one
+      // dropped, BY POSITION: dropping by value would lose both copies of t1,
+      // one of which the round had already reserved a call for.
       plan: plan({
         intents: ['search', 'scrape'], queries: ['coffee'],
         targets: ['https://t1.example', 'https://t2.example', 'https://t1.example'],
       }),
-      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, maxCalls: 5,
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, maxCalls: 2,
     });
     expect(outcome.documents.map((d) => d.url)).toEqual(['https://t1.example', 'https://t2.example']);
     expect(outcome.coverage.unfetchedTargets).toEqual([{ url: 'https://t1.example' }]);
@@ -505,8 +509,12 @@ describe('runResearch: an aborted round reports what it never started', () => {
       candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, concurrency: 1,
     });
     for (const action of outcome.nextActions) {
-      expect(action.cmd).not.toMatch(/fezoctl research/);
-      expect(action.cmd).not.toMatch(/fezoctl scrape/);
+      // No command at all is the honest answer here; if one is ever added it
+      // must still not be a billing one.
+      if (action.cmd !== undefined) {
+        expect(action.cmd).not.toMatch(/fezoctl research/);
+        expect(action.cmd).not.toMatch(/fezoctl scrape/);
+      }
     }
     // Still actionable -- the round must say what to do, just not "spend more".
     expect(outcome.nextActions.length).toBeGreaterThan(0);
@@ -568,5 +576,62 @@ describe('runResearch: --max-calls narrows a round instead of cancelling it', ()
     // reached the comparisons unguarded would let all 36 through.
     expect(outcome.billing.attempts.length).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
     expect(outcome.coverage.droppedQueries.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Budget-ordering and abort-reporting corners found verifying the first repair.
+// ---------------------------------------------------------------------------
+
+describe('runResearch: budget ordering and fractional budgets', () => {
+  it('fetches an explicitly named target before widening a query', async () => {
+    // An explicit target is an instruction; a fan-out width is a preference.
+    // `clampPlan` states this order and the executor has to agree with it.
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results(['https://b.example'])],
+      brave: [results(['https://c.example'])],
+      scrapingdog: [new Response('{"content":"body"}', { status: 200 })],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha'], targets: ['https://t.example'], fanout: 5 }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, maxCalls: 4,
+    });
+    expect(outcome.documents.map((d) => d.url)).toEqual(['https://t.example']);
+    expect(outcome.coverage.unfetchedTargets).toEqual([]);
+    expect(outcome.billing.callsBilled).toBe(4);
+  });
+
+  it('truncates a fractional budget instead of planning zero-lane queries', async () => {
+    // 3.7 left `budget` never reaching 0 and `slice(0, 0.7)` keeping nothing,
+    // so later queries were planned with no lanes and reported as "returned no
+    // results" -- the false claim about the web this repair set removed.
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results(['https://b.example'])],
+      brave: [results(['https://c.example'])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha', 'beta', 'gamma'], fanout: 5 }), candidates: CANDIDATES,
+      excluded: [], gateway: { ...gateway, fetchFn }, maxCalls: 3.7,
+    });
+    expect(outcome.billing.attempts.length).toBe(3);
+    expect(outcome.coverage.gaps.join(' ')).not.toMatch(/"beta" returned no results/);
+    expect(outcome.coverage.droppedQueries.map((d) => d.query)).toEqual(['beta', 'gamma']);
+    for (const narrowed of outcome.coverage.narrowedQueries) {
+      expect(Number.isInteger(narrowed.actual)).toBe(true);
+    }
+  });
+
+  it('does not report an unstarted query as narrowed as well as not run', async () => {
+    const limit = () =>
+      new Response(JSON.stringify({ error: { code: 'limit_exceeded', message: 'cap' } }), { status: 402 });
+    const fetchFn = routedFetch({ you: [limit()] });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha', 'beta'], fanout: 3 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn }, maxCalls: 5, concurrency: 1,
+    });
+    expect(outcome.coverage.droppedQueries.map((d) => d.query)).toContain('beta');
+    expect(outcome.coverage.narrowedQueries.map((n) => n.query)).not.toContain('beta');
   });
 });

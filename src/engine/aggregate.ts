@@ -718,7 +718,18 @@ export interface CoverageInput {
 
 export interface NextAction {
   why: string;
-  cmd: string;
+  /**
+   * A literally runnable command, or ABSENT when the honest next step is not a
+   * command this CLI has.
+   *
+   * Optional rather than filled with prose: `cmd` is printed in command
+   * position by `renderResearch` and SKILL.md tells the agent to run what it
+   * finds there, so a sentence in this field is an instruction to shell out to
+   * its first word. The account-scoped abort action is the case -- nothing in
+   * `fezoctl` raises a spend limit or replaces a key -- and naming a real
+   * command anyway (`doctor`) would send the agent somewhere that cannot help.
+   */
+  cmd?: string;
 }
 
 function median(values: readonly number[]): number {
@@ -859,8 +870,7 @@ export function nextActions(coverage: Coverage, sessionId: string | undefined, a
   // running it anyway.
   if (aborted !== undefined) {
     return [{
-      why: `the round stopped on an account-scoped failure (${aborted}) — every provider presents the same account, so a follow-up round would spend into it`,
-      cmd: 'check the account balance or spend limits, then re-run this round',
+      why: `the round stopped on an account-scoped failure (${aborted}) — every provider presents the same account, so a follow-up round would spend into it. Check the account balance or spend limits before re-running.`,
     }];
   }
   // The id alone needs no quoting: it is validated against

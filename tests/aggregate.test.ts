@@ -814,8 +814,13 @@ describe('nextActions: an account-scoped abort', () => {
 
   it('emits nothing that would bill again', () => {
     for (const action of nextActions(coverage, 'r-1', 'insufficient_balance: out of credit')) {
-      expect(action.cmd).not.toMatch(/fezoctl research/);
-      expect(action.cmd).not.toMatch(/fezoctl scrape/);
+      // Absent entirely is the honest answer -- nothing in this CLI raises a
+      // spend limit. If a command is ever added it must still not be a billing
+      // one, so the guard checks rather than assumes.
+      if (action.cmd !== undefined) {
+        expect(action.cmd).not.toMatch(/fezoctl research/);
+        expect(action.cmd).not.toMatch(/fezoctl scrape/);
+      }
     }
   });
 
@@ -827,6 +832,6 @@ describe('nextActions: an account-scoped abort', () => {
 
   it('emits the ordinary spend-again actions when there was no abort', () => {
     const actions = nextActions(coverage, 'r-1', undefined);
-    expect(actions.some((a) => a.cmd.includes('fezoctl research'))).toBe(true);
+    expect(actions.some((a) => a.cmd?.includes('fezoctl research') === true)).toBe(true);
   });
 });

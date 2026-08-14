@@ -190,3 +190,28 @@ describe('heuristicPlanner: a residual with no content word is not a query', () 
     expect(heuristicPlanner.plan('compare rust and go').queries).toEqual(['compare rust and go']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The no-content guard applies to a LEFTOVER, never to a whole prompt.
+//
+// Gating it on `targets.length > 0` is the correctness of the guard, not a
+// refinement of it: for a URL-free prompt the "residual" is everything the user
+// typed, so suppressing it produces a plan with nothing to do -- and such a
+// round exits 2 with an empty report and no gap, no next action, and no signal
+// the research renderer prints. "the who" and "what is this" are ordinary
+// searches, and they are made entirely of the words the guard tests against.
+// ---------------------------------------------------------------------------
+
+describe('heuristicPlanner: the no-content guard needs a URL to apply', () => {
+  const urlFree = ['the who', 'what is this', 'who can do this', 'search for the page', 'list'];
+
+  it.each(urlFree)('still searches for the URL-free prompt %s', (prompt) => {
+    const p = heuristicPlanner.plan(prompt);
+    expect(p.queries).toEqual([prompt]);
+    expect(p.signals).not.toContain('residual-has-no-content');
+  });
+
+  it('still suppresses the same words once they are a leftover', () => {
+    expect(heuristicPlanner.plan('what https://example.com/a').queries).toEqual([]);
+  });
+});

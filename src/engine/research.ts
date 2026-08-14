@@ -246,9 +246,15 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   // query, in the one module whose header calls itself the absolute bound.
   // Treated as "no budget supplied" rather than as unlimited, matching
   // `clampPlan`'s rationale for the same input class on `fanout`.
+  // `Math.trunc`, not merely `Number.isFinite`: a FRACTIONAL budget is as bad
+  // as a non-finite one and fails more quietly. With 3.7, `budget` never
+  // reaches 0, `lanes.slice(0, 0.7)` keeps nothing, and every remaining query
+  // is planned with zero lanes -- so it falls through to "returned no results",
+  // reviving the exact false claim about the web that this round of repairs
+  // removed from the abort path. `clampPlan` truncates for the same reason.
   const requestedCalls = options.maxCalls;
   const maxCalls = Math.min(
-    Number.isFinite(requestedCalls) ? (requestedCalls as number) : MAX_RESEARCH_CALLS,
+    Number.isFinite(requestedCalls) ? Math.trunc(requestedCalls as number) : MAX_RESEARCH_CALLS,
     MAX_RESEARCH_CALLS,
   );
   const concurrency = options.concurrency ?? RESEARCH_CONCURRENCY;
@@ -259,7 +265,16 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   const planned: Array<{ query: string; lanes: Lane[] }> = [];
   const droppedQueries: DroppedQuery[] = [];
   const narrowedQueries: NarrowedQuery[] = [];
-  let budget = maxCalls;
+  // Targets are reserved BEFORE queries take what is left, which is the order
+  // `clampPlan` states ("Targets are bounded first and keep their budget;
+  // queries then take what is left"). Letting the query loop spend first
+  // inverted it: on `--max-calls 4` with one target and a fanout-5 query, all
+  // four calls went to the query and the URL the caller had NAMED went
+  // unfetched -- a fan-out width is a preference, an explicit target is an
+  // instruction, and the two modules disagreeing about which comes first is the
+  // three-places-must-agree hazard the review flagged.
+  const targetReserve = Math.min(plan.targets.length, maxCalls);
+  let budget = maxCalls - targetReserve;
   for (const query of plan.queries) {
     const lanes = lanesForQuery(query, plan, candidates, excluded);
     if (lanes.length === 0) { planned.push({ query, lanes: [] }); continue; }
@@ -285,9 +300,11 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   // dedupes `targets` today, but that is another module's invariant and this one
   // must not silently depend on it: the same reason the lane slots below are
   // keyed by a query's position rather than by its text.
-  const fetchable = Math.max(0, budget);
-  const fetchTargets = plan.targets.slice(0, fetchable);
-  const unfetchedTargets = plan.targets.slice(fetchable);
+  // `targetReserve`, not whatever the query loop left over: the reservation
+  // above is what the queries were already budgeted around, so reading the
+  // leftover here would spend the same calls twice.
+  const fetchTargets = plan.targets.slice(0, targetReserve);
+  const unfetchedTargets = plan.targets.slice(targetReserve);
 
   // The flat, plan-ordered list of lanes this round will run: query order
   // first, then diversity position within the query. Every slot array below is
@@ -432,6 +449,10 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   // came back is a real, if thin, answer, and the thin-coverage gap is the
   // honest description of it.
   const unstartedQueryIndexes = new Set<number>();
+  /** The same set keyed by text, for `narrowedQueries` — which carries no
+   * index. Two identical query strings in one plan would collapse here, but a
+   * narrowing entry for either of them is moot once one is unstarted. */
+  const unstartedQueries = new Set<string>();
   if (aborted !== undefined) {
     planned.forEach(({ lanes }, queryIndex) => {
       if (lanes.length === 0) return;
@@ -444,7 +465,9 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     });
     for (const queryIndex of unstartedQueryIndexes) {
       const entry = planned[queryIndex];
-      if (entry !== undefined) droppedQueries.push({ query: entry.query, reason: 'round aborted' });
+      if (entry === undefined) continue;
+      droppedQueries.push({ query: entry.query, reason: 'round aborted' });
+      unstartedQueries.add(entry.query);
     }
   }
   // Targets whose slot is still empty were never fetched, for the same reason.
@@ -582,7 +605,12 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     // `reason` -- nothing was attempted, so there is nothing to report but the
     // URL, and the shared "not fetched" label already says that much.
     unfetchedTargets: [...unfetchedTargets.map((url) => ({ url })), ...failedTargets, ...unstartedTargets],
-    narrowedQueries,
+    // A query the abort stopped before any lane started is reported as not run,
+    // and describing the width of a round that never happened alongside it is
+    // two answers to one question. The narrowing is real but moot.
+    narrowedQueries: narrowedQueries.filter(
+      (n) => !unstartedQueries.has(n.query),
+    ),
     suppressed: suppressedUrls.size,
   });
 

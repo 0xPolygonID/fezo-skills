@@ -10316,8 +10316,9 @@ var heuristicPlanner = {
     const hasContentWord = tokens.some(
       (token) => !STOP_WORDS.has(token) && !QUESTION_WORDS.has(token) && !SEARCH_VERBS.has(token)
     );
-    const queries = intents.includes("search") && residual !== "" && hasContentWord ? [residual] : [];
-    if (!hasContentWord && tokens.length > 0) signals.push("residual-has-no-content");
+    const suppressResidual = targets.length > 0 && !hasContentWord && tokens.length > 0;
+    const queries = intents.includes("search") && residual !== "" && !suppressResidual ? [residual] : [];
+    if (suppressResidual) signals.push("residual-has-no-content");
     if (queries.length === 0 && targets.length > 0) signals.push("targets-only");
     if (depth === "research" && queries.length <= 1) {
       signals.push("no-decomposition: heuristic cannot split this into sub-queries; supply --queries");
@@ -10622,8 +10623,7 @@ function shellQuote(value) {
 function nextActions(coverage, sessionId, aborted) {
   if (aborted !== void 0) {
     return [{
-      why: `the round stopped on an account-scoped failure (${aborted}) \u2014 every provider presents the same account, so a follow-up round would spend into it`,
-      cmd: "check the account balance or spend limits, then re-run this round"
+      why: `the round stopped on an account-scoped failure (${aborted}) \u2014 every provider presents the same account, so a follow-up round would spend into it. Check the account balance or spend limits before re-running.`
     }];
   }
   const session = sessionId !== void 0 ? ` --session ${sessionId}` : "";
@@ -10720,14 +10720,15 @@ async function runResearch(options) {
   const { plan, candidates, excluded, gateway } = options;
   const requestedCalls = options.maxCalls;
   const maxCalls = Math.min(
-    Number.isFinite(requestedCalls) ? requestedCalls : MAX_RESEARCH_CALLS,
+    Number.isFinite(requestedCalls) ? Math.trunc(requestedCalls) : MAX_RESEARCH_CALLS,
     MAX_RESEARCH_CALLS
   );
   const concurrency = options.concurrency ?? RESEARCH_CONCURRENCY;
   const planned = [];
   const droppedQueries = [];
   const narrowedQueries = [];
-  let budget = maxCalls;
+  const targetReserve = Math.min(plan.targets.length, maxCalls);
+  let budget = maxCalls - targetReserve;
   for (const query of plan.queries) {
     const lanes = lanesForQuery(query, plan, candidates, excluded);
     if (lanes.length === 0) {
@@ -10744,9 +10745,8 @@ async function runResearch(options) {
     budget -= kept.length;
     planned.push({ query, lanes: kept });
   }
-  const fetchable = Math.max(0, budget);
-  const fetchTargets = plan.targets.slice(0, fetchable);
-  const unfetchedTargets = plan.targets.slice(fetchable);
+  const fetchTargets = plan.targets.slice(0, targetReserve);
+  const unfetchedTargets = plan.targets.slice(targetReserve);
   const plannedLanes = planned.flatMap(
     ({ lanes }, queryIndex) => lanes.map((lane2) => ({ queryIndex, lane: lane2 }))
   );
@@ -10831,6 +10831,7 @@ async function runResearch(options) {
   const skipped = ran.flatMap((r) => r.skipped !== void 0 ? [r.skipped] : []);
   const aborted = ran.find((r) => r.aborted !== void 0)?.aborted ?? targetsRan.find((r) => r.aborted !== void 0)?.aborted;
   const unstartedQueryIndexes = /* @__PURE__ */ new Set();
+  const unstartedQueries = /* @__PURE__ */ new Set();
   if (aborted !== void 0) {
     planned.forEach(({ lanes }, queryIndex) => {
       if (lanes.length === 0) return;
@@ -10841,7 +10842,9 @@ async function runResearch(options) {
     });
     for (const queryIndex of unstartedQueryIndexes) {
       const entry = planned[queryIndex];
-      if (entry !== void 0) droppedQueries.push({ query: entry.query, reason: "round aborted" });
+      if (entry === void 0) continue;
+      droppedQueries.push({ query: entry.query, reason: "round aborted" });
+      unstartedQueries.add(entry.query);
     }
   }
   const unstartedTargets = aborted === void 0 ? [] : fetchTargets.flatMap(
@@ -10923,7 +10926,12 @@ async function runResearch(options) {
     // `reason` -- nothing was attempted, so there is nothing to report but the
     // URL, and the shared "not fetched" label already says that much.
     unfetchedTargets: [...unfetchedTargets.map((url) => ({ url })), ...failedTargets, ...unstartedTargets],
-    narrowedQueries,
+    // A query the abort stopped before any lane started is reported as not run,
+    // and describing the width of a round that never happened alongside it is
+    // two answers to one question. The narrowing is real but moot.
+    narrowedQueries: narrowedQueries.filter(
+      (n) => !unstartedQueries.has(n.query)
+    ),
     suppressed: suppressedUrls.size
   });
   const callsBilled = attempts.filter((a) => a.billed).length;
@@ -11581,7 +11589,9 @@ function renderResearch(outcome, sessionId, json) {
   }
   if (outcome.nextActions.length > 0) {
     lines.push("", "Next:");
-    for (const action of outcome.nextActions) lines.push(`  ${action.cmd}   # ${action.why}`);
+    for (const action of outcome.nextActions) {
+      lines.push(action.cmd !== void 0 ? `  ${action.cmd}   # ${action.why}` : `  ${action.why}`);
+    }
   }
   return lines.join("\n");
 }

@@ -236,11 +236,20 @@ export const heuristicPlanner: Planner = {
     // token survives all three sets, so a terse "is ... better" still searches.
     // Deciding a query is BAD is a judgement this planner has no basis to make;
     // deciding it is EMPTY is arithmetic.
+    // GATED ON `targets.length > 0`, and that gate is the whole correctness of
+    // this check. A residual is only a LEFTOVER when URLs were removed from it;
+    // for a URL-free prompt the "residual" is the entire thing the user typed,
+    // and suppressing it leaves a plan with nothing to do -- `fezoctl research
+    // "the who"` would exit 2 with an empty report and no explanation, having
+    // searched normally the day before. Folding `QUESTION_WORDS` in is what
+    // makes that reachable ("what is this" is all question words), and it is
+    // needed only for the with-URL case ("what <url>") that motivated it.
     const hasContentWord = tokens.some(
       (token) => !STOP_WORDS.has(token) && !QUESTION_WORDS.has(token) && !SEARCH_VERBS.has(token),
     );
-    const queries = intents.includes('search') && residual !== '' && hasContentWord ? [residual] : [];
-    if (!hasContentWord && tokens.length > 0) signals.push('residual-has-no-content');
+    const suppressResidual = targets.length > 0 && !hasContentWord && tokens.length > 0;
+    const queries = intents.includes('search') && residual !== '' && !suppressResidual ? [residual] : [];
+    if (suppressResidual) signals.push('residual-has-no-content');
     if (queries.length === 0 && targets.length > 0) signals.push('targets-only');
     // Stated plainly, because it is the single most important limitation of
     // this planner and the reason an agent should override it for research.

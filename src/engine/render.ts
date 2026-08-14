@@ -1070,7 +1070,12 @@ export function renderResearch(outcome: ResearchOutcome, sessionId: string | und
   }
   if (outcome.nextActions.length > 0) {
     lines.push('', 'Next:');
-    for (const action of outcome.nextActions) lines.push(`  ${action.cmd}   # ${action.why}`);
+    // An action with no `cmd` is advice, not a command, and is printed as prose
+    // — never in command position with the sentence standing in for a command,
+    // which is an instruction to run its first word.
+    for (const action of outcome.nextActions) {
+      lines.push(action.cmd !== undefined ? `  ${action.cmd}   # ${action.why}` : `  ${action.why}`);
+    }
   }
   return lines.join('\n');
 }
