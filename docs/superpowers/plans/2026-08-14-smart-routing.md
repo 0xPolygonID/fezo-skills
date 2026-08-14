@@ -1296,12 +1296,18 @@ git commit -m "feat: add per-provider response adapter overrides"
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `tests/aggregate.test.ts`:
+Extend the header import block of `tests/aggregate.test.ts` (imports belong at
+the top of the file, not stranded above the new `describe`) so it reads:
 
 ```ts
-import { RRF_K, mergeItems } from '../src/engine/aggregate.js';
+import { RRF_K, canonicalizeUrl, mergeItems, sniffItems } from '../src/engine/aggregate.js';
+import { RESPONSE_ADAPTERS, extractItems } from '../src/engine/aggregate.js';
 import type { LaneItems } from '../src/engine/aggregate.js';
+```
 
+Then append the helper and the block:
+
+```ts
 function lane(backendId: string, rank: number, urls: Array<[string, string?]>): LaneItems {
   return { backendId, rank, items: urls.map(([url, title]) => ({ url, ...(title !== undefined ? { title } : {}) })) };
 }
@@ -1322,6 +1328,21 @@ describe('mergeItems', () => {
       lane('exa', 2, [['https://example.com/a']]),
     ]);
     expect(items[0]?.duplicates).toContain('https://www.example.com/a?utm_source=x');
+  });
+
+  // The lane order is the whole point of this sibling test: with the decorated
+  // URL first it is captured by the object literal's `duplicates` initializer
+  // and the merge branch's push never runs. A later provider's original URL has
+  // to survive too, or a fan-out silently drops provenance for every provider
+  // that was not first to report a document -- the common case, since providers
+  // disagree about decoration far more often than about which page exists.
+  it("preserves a later provider's original URL on duplicates too", () => {
+    const { items } = mergeItems([
+      lane('you', 1, [['https://example.com/a']]),
+      lane('exa', 2, [['https://www.example.com/a?utm_source=x']]),
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.duplicates).toEqual(['https://www.example.com/a?utm_source=x']);
   });
 
   it('scores by reciprocal rank fusion', () => {
@@ -1345,11 +1366,125 @@ describe('mergeItems', () => {
     expect(items).toHaveLength(1);
   });
 
+  // The collapse is a judgement call, so what makes it safe is that nothing is
+  // discarded: every source URL lands on `duplicates` and every contributing
+  // provider on `providers` -- which is also what keeps the RRF score and Task
+  // 7's agreement arithmetic correct for a merged item. Counting the survivors
+  // is not enough; these are the assertions that fail if either push is lost.
+  it('keeps every source URL and every provider when it collapses across hosts', () => {
+    const { items } = mergeItems([
+      { backendId: 'you', rank: 1, items: [{ url: 'https://a.example/s?utm_source=q', title: 'Wire Story' }] },
+      { backendId: 'exa', rank: 2, items: [{ url: 'https://b.example/s', title: 'wire story!', snippet: 'sn', publishedAt: '2026-01-02' }] },
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.providers.map((p) => p.backendId).sort()).toEqual(['exa', 'you']);
+    expect(items[0]?.duplicates).toEqual(
+      expect.arrayContaining(['https://a.example/s?utm_source=q', 'https://b.example/s']),
+    );
+    expect(items[0]?.snippet).toBe('sn');
+    // `publishedAt` is asserted alongside `snippet` because the two enrichment
+    // lines are one rule, and a date lost in the collapse is not cosmetic: it is
+    // the recency signal downstream consumers read off a merged item.
+    expect(items[0]?.publishedAt).toBe('2026-01-02');
+    expect(items[0]?.score).toBeCloseTo(2 / (RRF_K + 1), 10);
+  });
+
   it('does not collapse an identical title on the same host', () => {
     const { items } = mergeItems([
       lane('you', 1, [['https://one.example/a', 'Docs'], ['https://one.example/b', 'Docs']]),
     ]);
     expect(items).toHaveLength(2);
+  });
+
+  // The same-host guard has to hold against every host already folded under a
+  // title, not just the representative's: with a cross-host item claiming the
+  // key first, checking only the representative lets the two one.example pages
+  // merge with each other through it.
+  it('does not collapse two same-host pages transitively through a cross-host twin', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [
+        ['https://two.example/x', 'Docs'],
+        ['https://one.example/a', 'Docs'],
+        ['https://one.example/b', 'Docs'],
+      ]),
+    ]);
+    expect(items).toHaveLength(2);
+  });
+
+  // An unparseable URL carries no host evidence, so it must never satisfy the
+  // cross-host condition. Returning the URL itself as a stand-in host makes the
+  // guard trivially true -- each item sits under a distinct canonical URL, so a
+  // fabricated host never collides -- and these three site-relative paths, the
+  // exact shape a SERP-scraping backend emits, collapse into one, demoting two
+  // billed results to `duplicates`.
+  it('never collapses same-title pages whose URLs carry no host evidence', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [['/news/1', 'Docs'], ['/news/2', 'Docs'], ['/news/3', 'Docs']]),
+    ]);
+    expect(items).toHaveLength(3);
+  });
+
+  // The other half of "no host evidence", and the half a catch block cannot
+  // reach: an opaque-scheme value parses *successfully* and yields hostname '',
+  // so it never touches the catch branch above. '' is a live Set member, so
+  // treating it as a host makes it differ from every real hostname and satisfies
+  // the cross-host guard on evidence we do not have. A doc id is a named input --
+  // `canonicalizeUrl`'s docstring lists it beside the relative path -- and the
+  // http item is here to prove the leak in the direction that loses a result:
+  // without the fix `doc:1234` is demoted onto the http item's `duplicates`.
+  it('never collapses same-title pages whose URLs parse but carry no host', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [['https://a.example/story', 'Docs'], ['doc:1234', 'Docs'], ['doc:5678', 'Docs']]),
+    ]);
+    expect(items).toHaveLength(3);
+  });
+
+  // An ASCII-only title key reduces any non-Latin title to '', which is a live
+  // Map key -- so unrelated articles in Russian, Chinese and Japanese would all
+  // collapse into one item, silently discarding billed results.
+  it('keeps unrelated non-Latin titles on different hosts apart', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [
+        ['https://ru.example/1', 'Новости дня'],
+        ['https://cn.example/2', '中国新闻'],
+        ['https://jp.example/3', '日本のニュース'],
+      ]),
+    ]);
+    expect(items).toHaveLength(3);
+  });
+
+  it('keeps titles that reduce to nothing apart, since an empty key is no evidence of sameness', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [['https://a.example/1', '!!!'], ['https://b.example/2', '???']]),
+    ]);
+    expect(items).toHaveLength(2);
+  });
+
+  it('still collapses the same non-Latin title across hosts', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [['https://ru-a.example/1', 'Новости дня!']]),
+      lane('exa', 2, [['https://ru-b.example/2', 'новости дня']]),
+    ]);
+    expect(items).toHaveLength(1);
+  });
+
+  // A URL-only first contributor leaves the URL standing in as the title; a real
+  // title from a later provider has to win, or the merged item shows a raw URL
+  // to the reader and is skipped by the cross-host collapse pass entirely.
+  //
+  // `snippet` and `publishedAt` are asserted here rather than in a test of their
+  // own because they are the same "keep the richest text" rule the title obeys,
+  // and they share its rationale comment in the source. Without them a
+  // text-less first contributor starves the item permanently, which would again
+  // make the merged output depend on which lane happened to arrive first.
+  it('upgrades a placeholder title when a later provider supplies a real one', () => {
+    const { items } = mergeItems([
+      { backendId: 'you', rank: 1, items: [{ url: 'https://example.com/a' }] },
+      { backendId: 'exa', rank: 2, items: [{ url: 'https://example.com/a', title: 'Real Title', snippet: 's', publishedAt: '2026-01-02' }] },
+    ]);
+    expect(items[0]?.title).toBe('Real Title');
+    expect(items[0]?.snippet).toBe('s');
+    expect(items[0]?.publishedAt).toBe('2026-01-02');
   });
 
   it('suppresses already-seen URLs and reports how many', () => {
@@ -1361,10 +1496,32 @@ describe('mergeItems', () => {
     expect(suppressed).toBe(1);
   });
 
+  // `suppressed` is a count of documents withheld, not of lane hits: the same
+  // seen page returned by two providers is still one page the caller did not get.
+  it('counts a suppressed page once however many providers returned it', () => {
+    const { items, suppressed } = mergeItems(
+      [
+        lane('you', 1, [['https://old.example'], ['https://new.example']]),
+        lane('exa', 2, [['https://www.old.example/?utm_source=z']]),
+      ],
+      new Set(['https://old.example']),
+    );
+    expect(items.map((i) => i.url)).toEqual(['https://new.example']);
+    expect(suppressed).toBe(1);
+  });
+
+  // Equal `resultRank` across two lanes is the only way to produce identical RRF
+  // scores, and so the only input that reaches the comparator's second clause --
+  // two items within one lane always differ by rank. Asserting the concrete
+  // order, not just that two calls agree: a pure function agrees with itself
+  // even with the tie-break deleted.
   it('breaks score ties on canonical URL for determinism', () => {
-    const a = mergeItems([lane('you', 1, [['https://b.example'], ['https://a.example']])]);
-    const b = mergeItems([lane('you', 1, [['https://b.example'], ['https://a.example']])]);
-    expect(a.items.map((i) => i.url)).toEqual(b.items.map((i) => i.url));
+    const { items } = mergeItems([
+      lane('you', 1, [['https://b.example']]),
+      lane('exa', 2, [['https://a.example']]),
+    ]);
+    expect(items[0]?.score).toBe(items[1]?.score);
+    expect(items.map((i) => i.url)).toEqual(['https://a.example', 'https://b.example']);
   });
 });
 ```
@@ -1417,18 +1574,54 @@ export interface LaneItems {
  */
 export const RRF_K = 60;
 
-/** Title reduced to a comparison key: case-folded, punctuation removed,
- * whitespace collapsed. Used only for the cross-host near-duplicate pass. */
+/**
+ * Title reduced to a comparison key: case-folded, punctuation removed,
+ * whitespace collapsed. Used only for the cross-host near-duplicate pass.
+ *
+ * The retained class is the Unicode letter/number properties, not `[a-z0-9]`.
+ * An ASCII-only class does not merely fail to normalize a non-Latin title, it
+ * erases it: every Cyrillic, CJK, Arabic, Greek or Hebrew title reduces to the
+ * empty string, and an empty string is a perfectly usable Map key, so unrelated
+ * non-English results would all compare equal and collapse into one item. The
+ * target is ES2023, so property escapes cost no dependency and no transpile.
+ */
 function titleKey(title: string): string {
-  return title.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+  return title.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, '').replace(/\s+/g, ' ').trim();
 }
 
-function hostOf(url: string): string {
+/**
+ * The host a URL belongs to, or `undefined` when the value carries no host
+ * evidence at all.
+ *
+ * "No host" is a first-class answer, exactly like the degenerate title key
+ * below, and for the same reason: returning any stand-in instead would be
+ * *worse* than no answer. Every item sits under a distinct canonical URL, so a
+ * fabricated host is unique by construction, which makes the "different host"
+ * test in pass 2 trivially true and disables the same-host guard for precisely
+ * the inputs it protects -- many pages of one site sharing one title.
+ *
+ * Two input classes reach that state, and `canonicalizeUrl`'s docstring names
+ * them together in one breath ("a doc id, a relative path") because providers
+ * emit both: a relative href, which the parser rejects, and an opaque-scheme
+ * value, which it accepts. Neither is a hypothesis -- the SERP-scraping backends
+ * emit site-relative links, and a doc id is what a corpus-backed provider
+ * returns when it has no web URL to give. They must be treated identically here
+ * even though only one of them throws.
+ */
+function hostOf(url: string): string | undefined {
+  let host: string;
   try {
-    return new URL(url).hostname;
+    host = new URL(url).hostname;
   } catch {
-    return url;
+    return undefined;
   }
+  // An opaque-scheme URL parses fine and has no host at all: `new URL('doc:1234')`
+  // yields hostname ''. So do `mailto:`, `urn:`, `data:` and `file:`. That is the
+  // absence of host evidence, not a host -- and '' is a perfectly usable Set
+  // member, so returning it would make '' read as a *known* host differing from
+  // every real hostname: the same fabricated-evidence failure as the catch above,
+  // reached without ever throwing.
+  return host === '' ? undefined : host;
 }
 
 /**
@@ -1441,8 +1634,14 @@ function hostOf(url: string): string {
  * 2. **Near-identical title across DIFFERENT hosts.** One wire story carried by
  *    six outlets. Restricted to cross-host pairs because a site legitimately
  *    reuses one title across many of its own pages (docs sections, paginated
- *    listings), and merging those would destroy real results. This pass is a
- *    judgement call, which is why every collapsed URL survives on `duplicates`.
+ *    listings), and merging those would destroy real results. "Different host"
+ *    means a *known* host, differing from *every* host already merged under that
+ *    title -- not just from the representative's, or the same-host pages would
+ *    sneak in transitively, and not a URL that carries no host standing in for
+ *    one (whether it failed to parse or parsed to an empty hostname), or the
+ *    guard would be satisfied by an item about which we know nothing. This
+ *    pass is a judgement call, which is why every collapsed URL survives on
+ *    `duplicates` and every contributing provider on `providers`.
  *
  * `seenUrls` (canonical) are dropped entirely -- that is what makes a
  * multi-round research session return only new material instead of re-paying
@@ -1453,13 +1652,18 @@ export function mergeItems(
   seenUrls: ReadonlySet<string> = new Set(),
 ): { items: ResearchItem[]; suppressed: number } {
   const byCanonical = new Map<string, ResearchItem>();
-  let suppressed = 0;
+  // A set, not a counter: the figure the caller reads is "pages you already had
+  // and so did not get again", which is per-document. Counting lane hits instead
+  // would multiply it by the fan-out width -- one already-seen page returned by
+  // three providers would be reported as three suppressed pages -- and the
+  // fan-out width is not a thing the caller asked about.
+  const suppressedUrls = new Set<string>();
 
   for (const lane of lanes) {
     lane.items.forEach((raw, index) => {
       const canonical = canonicalizeUrl(raw.url);
       if (seenUrls.has(canonical)) {
-        suppressed += 1;
+        suppressedUrls.add(canonical);
         return;
       }
       const hit: ProviderHit = { backendId: lane.backendId, rank: lane.rank, resultRank: index + 1 };
@@ -1480,25 +1684,57 @@ export function mergeItems(
       if (raw.url !== canonical && !existing.duplicates.includes(raw.url)) existing.duplicates.push(raw.url);
       // Keep the richest text: a provider that returned a snippet is more
       // useful than one that returned only a link, whichever arrived first.
+      //
+      // The title obeys the same rule, and has to: a title-less first
+      // contributor left the canonical URL standing in as the title, and a real
+      // title from any later provider beats that placeholder both for the reader
+      // and for pass 2, which skips an item whose title is still its own URL.
+      // Without this the dedup outcome would depend on which lane arrived first.
+      if (existing.title === existing.url && raw.title !== undefined) existing.title = raw.title;
       if (existing.snippet === undefined && raw.snippet !== undefined) existing.snippet = raw.snippet;
       if (existing.publishedAt === undefined && raw.publishedAt !== undefined) existing.publishedAt = raw.publishedAt;
     });
   }
 
   // Pass 2: cross-host title collapse.
-  const byTitle = new Map<string, ResearchItem>();
+  //
+  // Each key carries the FULL set of hosts already folded into its
+  // representative, not just the representative's own host. Comparing against
+  // one host is not a weaker version of the guard, it is a broken one: two pages
+  // on a single site merge with each other transitively, through whichever
+  // cross-host item happened to claim the key first, and which pages survive
+  // then depends on Map iteration order. That is precisely the destruction of
+  // real results this pass exists to avoid.
+  const byTitle = new Map<string, { rep: ResearchItem; hosts: Set<string> }>();
   const merged: ResearchItem[] = [];
   for (const item of byCanonical.values()) {
-    const key = item.title === item.url ? undefined : titleKey(item.title);
-    const twin = key !== undefined ? byTitle.get(key) : undefined;
-    if (twin !== undefined && hostOf(twin.url) !== hostOf(item.url)) {
-      twin.providers.push(...item.providers);
-      twin.duplicates.push(item.url, ...item.duplicates);
-      if (twin.snippet === undefined && item.snippet !== undefined) twin.snippet = item.snippet;
-      if (twin.publishedAt === undefined && item.publishedAt !== undefined) twin.publishedAt = item.publishedAt;
+    // A title that reduces to nothing is no evidence of sameness, so it must
+    // never become a merge key -- and '' is a valid Map key, so "reduces to
+    // nothing" has to be rejected explicitly rather than trusted to be absent.
+    // Two sources of one: an item still carrying its URL as a placeholder title,
+    // and a title made only of characters the key strips (pure punctuation).
+    const reduced = item.title === item.url ? '' : titleKey(item.title);
+    const key = reduced === '' ? undefined : reduced;
+    const entry = key !== undefined ? byTitle.get(key) : undefined;
+    // An item whose URL carries no host -- it failed to parse, or it parsed to
+    // an empty hostname -- has no known host, and so can neither join a key (the
+    // cross-host condition is unsatisfiable without evidence) nor claim one (a
+    // later item must not be judged "different host" against a host we never
+    // established).
+    const host = hostOf(item.url);
+    if (entry !== undefined && host !== undefined && !entry.hosts.has(host)) {
+      entry.hosts.add(host);
+      entry.rep.providers.push(...item.providers);
+      // No membership guard here, unlike the pass-1 push above: `item` and
+      // `entry.rep` sit under distinct canonical URLs, and canonicalization is a
+      // function, so no original URL can appear under both -- their duplicate
+      // sets are necessarily disjoint.
+      entry.rep.duplicates.push(item.url, ...item.duplicates);
+      if (entry.rep.snippet === undefined && item.snippet !== undefined) entry.rep.snippet = item.snippet;
+      if (entry.rep.publishedAt === undefined && item.publishedAt !== undefined) entry.rep.publishedAt = item.publishedAt;
       continue;
     }
-    if (key !== undefined && twin === undefined) byTitle.set(key, item);
+    if (key !== undefined && entry === undefined && host !== undefined) byTitle.set(key, { rep: item, hosts: new Set([host]) });
     merged.push(item);
   }
 
@@ -1506,7 +1742,7 @@ export function mergeItems(
     item.score = item.providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0);
   }
   merged.sort((a, b) => (b.score - a.score) || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
-  return { items: merged, suppressed };
+  return { items: merged, suppressed: suppressedUrls.size };
 }
 ```
 
@@ -1521,6 +1757,129 @@ Expected: PASS.
 git add src/engine/aggregate.ts tests/aggregate.test.ts
 git commit -m "feat: dedup merged results and order them by reciprocal rank fusion"
 ```
+
+**Deviations recorded during implementation.**
+
+The Step 1 and Step 3 blocks above are the corrected code -- they are what
+shipped, and what a reader rebuilding this task should build against. The
+changes each block absorbed, and why, are recorded here so implementation can
+still be reviewed against intent.
+
+1. *`titleKey` retains the Unicode letter/number properties, not `[a-z0-9]`.*
+   Step 3 originally prescribed `replace(/[^a-z0-9\s]/g, '')`. That class does
+   not merely fail to normalize a non-Latin title, it erases it: every Cyrillic,
+   CJK, Arabic, Greek and Hebrew title reduces to `''`. `''` is a perfectly
+   usable Map key, so a round returning a Russian, a Chinese and a Japanese
+   article about three unrelated subjects collapsed all three into one item and
+   demoted two billed results to `duplicates` -- silent data loss, and worst
+   exactly where the cross-host pass is most valuable (one wire story carried by
+   outlets in several scripts). Now `/[^\p{L}\p{N}\s]/gu`; the target is ES2023,
+   so property escapes cost no dependency and no transpile step. Pinned by
+   'keeps unrelated non-Latin titles on different hosts apart' and, in the other
+   direction, 'still collapses the same non-Latin title across hosts'.
+2. *A title that reduces to nothing is rejected as a merge key explicitly.*
+   Fixing (1) narrows the degenerate case but does not remove it -- a title of
+   pure punctuation (`'!!!'`) still reduces to `''`, as does an item still
+   carrying its own URL as a placeholder title. Since `''` is a live Map key,
+   "reduces to nothing" has to be tested for rather than trusted to be absent,
+   so the key is now `undefined` in that case and the item merges with nothing.
+   An empty reduction is no evidence of sameness; it is the absence of evidence.
+   Pinned by 'keeps titles that reduce to nothing apart'.
+3. *The cross-host guard holds a `Set` of every host folded under a key, not the
+   representative's host alone.* Step 3 compared `hostOf(item.url)` against the
+   representative only. That is not a weaker guard, it is a broken one: with a
+   cross-host item claiming the key first, two pages on a single site each
+   differ from the representative and so merge with each other transitively,
+   through it. Which pages survived then depended on Map iteration order -- precisely
+   the destruction of real results the pass exists to avoid. Pinned by 'does not
+   collapse two same-host pages transitively through a cross-host twin'.
+4. *Pass 1 upgrades `title`, not only `snippet` and `publishedAt`.* Step 3 left
+   the title alone, so a title-less first contributor's placeholder (the
+   canonical URL) stood permanently: the reader saw a raw URL, and pass 2 skipped
+   the item entirely because its title equals its URL. The dedup outcome
+   therefore depended on which lane happened to arrive first, which is not a
+   property this function may have. Pinned by 'upgrades a placeholder title when
+   a later provider supplies a real one'.
+5. *`suppressed` counts documents, via a `Set`, not lane hits via a counter.*
+   Step 3's `suppressed += 1` per skipped lane hit multiplied the figure by the
+   fan-out width: one already-seen page returned by three providers was reported
+   as three suppressed pages. The number the caller reads is "pages you already
+   had and so did not get again", and the fan-out width is not what they asked
+   about. Pinned by 'counts a suppressed page once however many providers
+   returned it'.
+6. *The tie-break test constructs a genuine tie and asserts a concrete order.*
+   Step 1's original compared two `mergeItems` calls against each other, which a
+   pure function satisfies with the comparator's second clause deleted, and its
+   input could not produce equal scores anyway -- two items in one lane always
+   differ by `resultRank`. Equal `resultRank` across two lanes is the only input
+   that reaches that clause, so the test now uses one and asserts the resulting
+   URL order outright.
+7. *The new test imports are hoisted into the file's header block* rather than
+   stranded mid-file above the new `describe`, matching every other test file.
+8. *`hostOf` returns `string | undefined`, and an unknown host is never
+   mergeable.* Step 3 returned the whole `url` from the catch. Because every
+   item sits under a distinct canonical URL, a fabricated host is unique by
+   construction, so `entry.hosts.has(host)` could never be true for it and the
+   same-host guard was disabled outright for any URL the parser rejects -- the
+   same silent data loss as (3), reached by another route, and hitting exactly
+   the case the guard protects. Relative hrefs are an acknowledged input, not a
+   hypothesis: `canonicalizeUrl`'s docstring names them and the SERP-scraping
+   backends emit them. "No host evidence" is now a first-class state, mirroring
+   the degenerate title key of (2): such an item neither joins a key nor claims
+   one. Pinned by 'never collapses same-title pages whose URLs carry no host
+   evidence'.
+9. *The cross-host collapse's preservation invariant is asserted, not just the
+   survivor count.* The two original cross-host tests checked only
+   `toHaveLength(1)`, so both the `providers` and the `duplicates` push inside
+   the collapse could be deleted with the suite still green -- leaving the
+   spec's § Dedup guarantee ("nothing is lost, only grouped") unconstrained, and
+   silently corrupting the merged item's RRF score and Task 7's provider-
+   agreement arithmetic. 'keeps every source URL and every provider when it
+   collapses across hosts' now pins the surviving providers, duplicates,
+   enriched snippet and fused score together.
+10. *`hostOf` treats an empty hostname as no host, not as a host.* Item (8)
+    closed only the throwing path, and that is half the input class its own
+    justification cites: `canonicalizeUrl`'s docstring names "a doc id, a
+    relative path" in one sentence, and only the relative path throws.
+    `new URL('doc:1234')` parses successfully and yields hostname `''` -- as do
+    `mailto:`, `urn:`, `data:` and `file:` -- so `''` was returned as a *known*
+    host, differing from every real hostname and satisfying the cross-host guard
+    on evidence we do not have. Exactly the fabricated-evidence failure of (8),
+    reached without ever throwing, and the module's own pass-2 comment already
+    forbade it. Damage was bounded but real: with one http item and two doc ids
+    sharing a title, the second doc id found `''` already in `entry.hosts` and
+    was spared, while the first was demoted onto the http item's `duplicates`,
+    folding its provider hit into an unrelated document's RRF score and into
+    Task 7's agreement arithmetic. `hostOf` now returns `undefined` for `''`,
+    and both its docstring and pass 2's say "carries no host" rather than
+    "unparseable", so they cover the non-throwing case too. Pinned by 'never
+    collapses same-title pages whose URLs parse but carry no host'.
+11. *The pass-1 `duplicates` merge branch and both `publishedAt` enrichments are
+    asserted.* A sweep that deleted each conditional in `mergeItems` in turn
+    found four production lines that survived the whole suite. The round-1
+    report's claim that the pass-1 `duplicates` push was already covered by
+    'preserves every original URL on duplicates' was mistaken: that test puts
+    the decorated URL on the FIRST lane, where it is captured by the object
+    literal's `duplicates: raw.url === canonical ? [] : [raw.url]` initializer,
+    so the merge branch never runs. Lane order is therefore the whole substance
+    of the new sibling test -- with the decorated URL arriving second, the spec's
+    § Canonicalization guarantee ("the original URL survives on `duplicates`")
+    finally binds for a provider that was not first to report a document, which
+    in a fan-out is the common case. The pass-1 `snippet`/`publishedAt` lines
+    left the "keep the richest text" rule unconstrained in both directions
+    despite its four-line rationale comment, and the pass-2 `publishedAt` line
+    was the twin of the snippet line (9) pinned; `publishedAt` carries the
+    recency signal downstream, so losing it in a collapse is not cosmetic.
+    Assertions were added to the existing tests that already fed the right
+    inputs -- 'upgrades a placeholder title when a later provider supplies a real
+    one' and 'keeps every source URL and every provider when it collapses across
+    hosts' -- rather than to new ones, keeping each rule pinned beside the rule
+    it shares a comment with. All four lines, and (10)'s, were verified by
+    deletion: each now turns the suite red.
+
+Items 1-7 came from code review of the first Task 6 implementation; items 8 and
+9 from review of that round of fixes; items 10 and 11 from review of the round
+after that.
 
 ---
 

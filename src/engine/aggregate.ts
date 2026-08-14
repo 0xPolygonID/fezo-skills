@@ -204,3 +204,212 @@ export function extractItems(tool: string, body: unknown): RawItem[] {
   }
   return sniffItems(body);
 }
+
+/** Which provider contributed an item, and where it sat on that provider's own list. */
+export interface ProviderHit {
+  backendId: string;
+  /** The provider's rank in the fan-out (diversity order position, 1-based). */
+  rank: number;
+  /** This item's 1-based position within that provider's own results. */
+  resultRank: number;
+}
+
+export interface ResearchItem {
+  url: string;
+  title: string;
+  snippet?: string;
+  publishedAt?: string;
+  providers: ProviderHit[];
+  score: number;
+  /** Every other original URL collapsed into this item -- nothing is discarded
+   * by dedup, only grouped, so a caller can always see what was merged. */
+  duplicates: string[];
+}
+
+/** One provider lane's contribution to a round. */
+export interface LaneItems {
+  backendId: string;
+  rank: number;
+  items: readonly RawItem[];
+}
+
+/**
+ * Reciprocal rank fusion's smoothing constant, at its standard value.
+ *
+ * RRF is used rather than any provider-reported relevance score because those
+ * scores are incomparable across providers (different scales, different
+ * meanings) and most providers omit them entirely. Rank position is the one
+ * signal every provider actually gives us.
+ */
+export const RRF_K = 60;
+
+/**
+ * Title reduced to a comparison key: case-folded, punctuation removed,
+ * whitespace collapsed. Used only for the cross-host near-duplicate pass.
+ *
+ * The retained class is the Unicode letter/number properties, not `[a-z0-9]`.
+ * An ASCII-only class does not merely fail to normalize a non-Latin title, it
+ * erases it: every Cyrillic, CJK, Arabic, Greek or Hebrew title reduces to the
+ * empty string, and an empty string is a perfectly usable Map key, so unrelated
+ * non-English results would all compare equal and collapse into one item. The
+ * target is ES2023, so property escapes cost no dependency and no transpile.
+ */
+function titleKey(title: string): string {
+  return title.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * The host a URL belongs to, or `undefined` when the value carries no host
+ * evidence at all.
+ *
+ * "No host" is a first-class answer, exactly like the degenerate title key
+ * below, and for the same reason: returning any stand-in instead would be
+ * *worse* than no answer. Every item sits under a distinct canonical URL, so a
+ * fabricated host is unique by construction, which makes the "different host"
+ * test in pass 2 trivially true and disables the same-host guard for precisely
+ * the inputs it protects -- many pages of one site sharing one title.
+ *
+ * Two input classes reach that state, and `canonicalizeUrl`'s docstring names
+ * them together in one breath ("a doc id, a relative path") because providers
+ * emit both: a relative href, which the parser rejects, and an opaque-scheme
+ * value, which it accepts. Neither is a hypothesis -- the SERP-scraping backends
+ * emit site-relative links, and a doc id is what a corpus-backed provider
+ * returns when it has no web URL to give. They must be treated identically here
+ * even though only one of them throws.
+ */
+function hostOf(url: string): string | undefined {
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return undefined;
+  }
+  // An opaque-scheme URL parses fine and has no host at all: `new URL('doc:1234')`
+  // yields hostname ''. So do `mailto:`, `urn:`, `data:` and `file:`. That is the
+  // absence of host evidence, not a host -- and '' is a perfectly usable Set
+  // member, so returning it would make '' read as a *known* host differing from
+  // every real hostname: the same fabricated-evidence failure as the catch above,
+  // reached without ever throwing.
+  return host === '' ? undefined : host;
+}
+
+/**
+ * Merges every lane's results into one ordered, deduplicated set.
+ *
+ * Two passes, in this order:
+ *
+ * 1. **Canonical URL.** Exact same document, however each provider decorated
+ *    the link. This pass is safe and always correct.
+ * 2. **Near-identical title across DIFFERENT hosts.** One wire story carried by
+ *    six outlets. Restricted to cross-host pairs because a site legitimately
+ *    reuses one title across many of its own pages (docs sections, paginated
+ *    listings), and merging those would destroy real results. "Different host"
+ *    means a *known* host, differing from *every* host already merged under that
+ *    title -- not just from the representative's, or the same-host pages would
+ *    sneak in transitively, and not a URL that carries no host standing in for
+ *    one (whether it failed to parse or parsed to an empty hostname), or the
+ *    guard would be satisfied by an item about which we know nothing. This
+ *    pass is a judgement call, which is why every collapsed URL survives on
+ *    `duplicates` and every contributing provider on `providers`.
+ *
+ * `seenUrls` (canonical) are dropped entirely -- that is what makes a
+ * multi-round research session return only new material instead of re-paying
+ * for the same links.
+ */
+export function mergeItems(
+  lanes: readonly LaneItems[],
+  seenUrls: ReadonlySet<string> = new Set(),
+): { items: ResearchItem[]; suppressed: number } {
+  const byCanonical = new Map<string, ResearchItem>();
+  // A set, not a counter: the figure the caller reads is "pages you already had
+  // and so did not get again", which is per-document. Counting lane hits instead
+  // would multiply it by the fan-out width -- one already-seen page returned by
+  // three providers would be reported as three suppressed pages -- and the
+  // fan-out width is not a thing the caller asked about.
+  const suppressedUrls = new Set<string>();
+
+  for (const lane of lanes) {
+    lane.items.forEach((raw, index) => {
+      const canonical = canonicalizeUrl(raw.url);
+      if (seenUrls.has(canonical)) {
+        suppressedUrls.add(canonical);
+        return;
+      }
+      const hit: ProviderHit = { backendId: lane.backendId, rank: lane.rank, resultRank: index + 1 };
+      const existing = byCanonical.get(canonical);
+      if (existing === undefined) {
+        byCanonical.set(canonical, {
+          url: canonical,
+          title: raw.title ?? canonical,
+          ...(raw.snippet !== undefined ? { snippet: raw.snippet } : {}),
+          ...(raw.publishedAt !== undefined ? { publishedAt: raw.publishedAt } : {}),
+          providers: [hit],
+          score: 0,
+          duplicates: raw.url === canonical ? [] : [raw.url],
+        });
+        return;
+      }
+      existing.providers.push(hit);
+      if (raw.url !== canonical && !existing.duplicates.includes(raw.url)) existing.duplicates.push(raw.url);
+      // Keep the richest text: a provider that returned a snippet is more
+      // useful than one that returned only a link, whichever arrived first.
+      //
+      // The title obeys the same rule, and has to: a title-less first
+      // contributor left the canonical URL standing in as the title, and a real
+      // title from any later provider beats that placeholder both for the reader
+      // and for pass 2, which skips an item whose title is still its own URL.
+      // Without this the dedup outcome would depend on which lane arrived first.
+      if (existing.title === existing.url && raw.title !== undefined) existing.title = raw.title;
+      if (existing.snippet === undefined && raw.snippet !== undefined) existing.snippet = raw.snippet;
+      if (existing.publishedAt === undefined && raw.publishedAt !== undefined) existing.publishedAt = raw.publishedAt;
+    });
+  }
+
+  // Pass 2: cross-host title collapse.
+  //
+  // Each key carries the FULL set of hosts already folded into its
+  // representative, not just the representative's own host. Comparing against
+  // one host is not a weaker version of the guard, it is a broken one: two pages
+  // on a single site merge with each other transitively, through whichever
+  // cross-host item happened to claim the key first, and which pages survive
+  // then depends on Map iteration order. That is precisely the destruction of
+  // real results this pass exists to avoid.
+  const byTitle = new Map<string, { rep: ResearchItem; hosts: Set<string> }>();
+  const merged: ResearchItem[] = [];
+  for (const item of byCanonical.values()) {
+    // A title that reduces to nothing is no evidence of sameness, so it must
+    // never become a merge key -- and '' is a valid Map key, so "reduces to
+    // nothing" has to be rejected explicitly rather than trusted to be absent.
+    // Two sources of one: an item still carrying its URL as a placeholder title,
+    // and a title made only of characters the key strips (pure punctuation).
+    const reduced = item.title === item.url ? '' : titleKey(item.title);
+    const key = reduced === '' ? undefined : reduced;
+    const entry = key !== undefined ? byTitle.get(key) : undefined;
+    // An item whose URL carries no host -- it failed to parse, or it parsed to
+    // an empty hostname -- has no known host, and so can neither join a key (the
+    // cross-host condition is unsatisfiable without evidence) nor claim one (a
+    // later item must not be judged "different host" against a host we never
+    // established).
+    const host = hostOf(item.url);
+    if (entry !== undefined && host !== undefined && !entry.hosts.has(host)) {
+      entry.hosts.add(host);
+      entry.rep.providers.push(...item.providers);
+      // No membership guard here, unlike the pass-1 push above: `item` and
+      // `entry.rep` sit under distinct canonical URLs, and canonicalization is a
+      // function, so no original URL can appear under both -- their duplicate
+      // sets are necessarily disjoint.
+      entry.rep.duplicates.push(item.url, ...item.duplicates);
+      if (entry.rep.snippet === undefined && item.snippet !== undefined) entry.rep.snippet = item.snippet;
+      if (entry.rep.publishedAt === undefined && item.publishedAt !== undefined) entry.rep.publishedAt = item.publishedAt;
+      continue;
+    }
+    if (key !== undefined && entry === undefined && host !== undefined) byTitle.set(key, { rep: item, hosts: new Set([host]) });
+    merged.push(item);
+  }
+
+  for (const item of merged) {
+    item.score = item.providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0);
+  }
+  merged.sort((a, b) => (b.score - a.score) || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
+  return { items: merged, suppressed: suppressedUrls.size };
+}
