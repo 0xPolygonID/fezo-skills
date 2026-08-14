@@ -167,3 +167,40 @@ export function sniffItems(body: unknown): RawItem[] {
   }
   return best;
 }
+
+/** Reads one specific provider's response body into results. */
+export type ResponseAdapter = (body: unknown) => RawItem[];
+
+/**
+ * Per-tool overrides for bodies the sniffer reads wrongly or not at all, keyed
+ * by tool name (`{backendId}_{method}`, tool-name.ts's form).
+ *
+ * DELIBERATELY EMPTY at first. Entries are added from REAL captured responses
+ * during calibration (see the plan's calibration task), never from a guess
+ * about a provider's shape: a wrong adapter is worse than no adapter, because
+ * it silently overrides a sniffer that was working.
+ *
+ * Mutable (not frozen) so tests can install a fixture adapter and remove it
+ * again; nothing in production writes to it at run time.
+ */
+export const RESPONSE_ADAPTERS: Record<string, ResponseAdapter> = {};
+
+/**
+ * The one entry point for turning a provider's body into results: adapter if
+ * one is registered for this tool, sniffer otherwise.
+ *
+ * An adapter that throws falls back to the sniffer rather than failing the
+ * round. The response was already billed; discarding it because our own
+ * transcription of a shape went stale is the worst possible trade.
+ */
+export function extractItems(tool: string, body: unknown): RawItem[] {
+  const adapter = RESPONSE_ADAPTERS[tool];
+  if (adapter !== undefined) {
+    try {
+      return adapter(body);
+    } catch {
+      return sniffItems(body);
+    }
+  }
+  return sniffItems(body);
+}

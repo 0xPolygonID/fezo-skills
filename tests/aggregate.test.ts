@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { canonicalizeUrl, sniffItems } from '../src/engine/aggregate.js';
+import { RESPONSE_ADAPTERS, extractItems } from '../src/engine/aggregate.js';
 
 describe('canonicalizeUrl', () => {
   it('yields a lowercase scheme and host regardless of input casing, but never touches the path', () => {
@@ -83,5 +84,38 @@ describe('sniffItems', () => {
   it('never throws on null or a scalar', () => {
     expect(sniffItems(null)).toEqual([]);
     expect(sniffItems(42)).toEqual([]);
+  });
+});
+
+describe('extractItems', () => {
+  it('falls back to the sniffer when no adapter is registered', () => {
+    expect(extractItems('unknown_tool', { results: [{ url: 'https://a.example' }] }).length).toBe(1);
+  });
+
+  it('prefers a registered adapter over the sniffer', () => {
+    const original = RESPONSE_ADAPTERS['fake_tool'];
+    RESPONSE_ADAPTERS['fake_tool'] = () => [{ url: 'https://from-adapter.example' }];
+    try {
+      const items = extractItems('fake_tool', { results: [{ url: 'https://from-sniffer.example' }] });
+      expect(items).toEqual([{ url: 'https://from-adapter.example' }]);
+    } finally {
+      if (original === undefined) delete RESPONSE_ADAPTERS['fake_tool'];
+      else RESPONSE_ADAPTERS['fake_tool'] = original;
+    }
+  });
+
+  it('falls back to the sniffer when an adapter throws', () => {
+    const original = RESPONSE_ADAPTERS['throwing_tool'];
+    RESPONSE_ADAPTERS['throwing_tool'] = () => { throw new Error('bad shape'); };
+    try {
+      expect(extractItems('throwing_tool', { results: [{ url: 'https://a.example' }] }).length).toBe(1);
+    } finally {
+      if (original === undefined) delete RESPONSE_ADAPTERS['throwing_tool'];
+      else RESPONSE_ADAPTERS['throwing_tool'] = original;
+    }
+  });
+
+  it('returns nothing for a body neither path can read', () => {
+    expect(extractItems('unknown_tool', { markdown: '# page' })).toEqual([]);
   });
 });
