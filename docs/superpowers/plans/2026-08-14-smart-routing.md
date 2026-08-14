@@ -1131,6 +1131,44 @@ git add src/engine/aggregate.ts tests/aggregate.test.ts
 git commit -m "feat: add response sniffing and URL canonicalization"
 ```
 
+**Deviations recorded during implementation.**
+
+1. *The trailing slash is stripped from every path, not only from the root, and
+   is computed on `parsed.pathname` before serialization.* Step 3's rule tested
+   the serialized string and guarded it with `parsed.search === ''`, so it could
+   only ever fire on a URL with no query. That made `https://example.com/a/?b=1`
+   and `https://example.com/a?b=1` canonicalize apart -- two spellings of one
+   document, kept as two items, which defeats the dedup this function exists
+   for. The string-level test cannot be fixed in place, because the query is
+   serialized *last*: for any URL carrying one, the final character is never the
+   path's slash. So the rule moved onto `parsed.pathname`, where the query is
+   not in the way, and it now applies to every path, a trailing slash being a
+   server-side directory convention rather than a distinct document. The
+   serialized strip survives for the two cases the pathname setter cannot reach
+   (the root, and an opaque path); see the WHY comment on it. Task 6's dedup
+   keys on this exact string, so the amended spec paragraph under
+   § Aggregation now states the key's shape; `tests/aggregate.test.ts` pins the
+   deep-path case and the query case, alongside the original root case.
+2. *Step 3's `parsed.protocol = parsed.protocol.toLowerCase()` is deleted as
+   dead code.* The WHATWG parser ASCII-lowercases the scheme of *every* URL it
+   accepts, special or not, so the assignment could never change anything. The
+   host lowercasing next to it is kept and is not dead, which is the asymmetry
+   worth writing down: the parser lowercases the host only for special schemes
+   (http, https, ws, ...) and leaves an opaque host verbatim, so
+   `new URL('CUSTOM://EXAMPLE.COM/Path').hostname === 'EXAMPLE.COM'`. Providers
+   hand us whatever string they stored, schemes included, so that fold has to be
+   ours. Pinned by `tests/aggregate.test.ts:12` -- the pre-existing http(s)
+   casing test asserts only what the parser already does, and so would pass with
+   the host fold removed too.
+3. *`TRACKING_PARAMS` and each `FIELD_CANDIDATES` name list are frozen.* Global
+   Constraints require declared tables to be `Object.freeze`d at module scope;
+   Step 3's block froze neither `TRACKING_PARAMS` nor the inner arrays. `as
+   const` is erased at compile time, so freezing only the outer object leaves
+   every name list open to a `.push()` from a JS consumer of the bundle -- and
+   field precedence, like the tracking-parameter table, defines a deterministic
+   transform that must not be re-orderable at run time. Same treatment, and the
+   same reasoning, as `one-step.ts`'s `ARG_CANDIDATES`.
+
 ---
 
 ### Task 5: Per-provider adapter overrides

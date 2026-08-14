@@ -209,8 +209,11 @@ calibration (Task 12), not from guesswork.
 
 **Canonicalization.** Lowercase scheme and host, strip a leading `www.`, drop
 the fragment, remove tracking parameters (`utm_*`, `gclid`, `fbclid`,
-`mc_eid`, `ref`, `ref_src`), sort remaining query parameters, normalize a bare
-trailing slash. The original URL survives on `duplicates`.
+`mc_eid`, `ref`, `ref_src`), sort remaining query parameters. A trailing slash
+is stripped from *every* path, not only from the root — it is a server-side
+directory convention, not a distinct document — and independently of any query,
+so `/a/?b=1` and `/a?b=1` yield one key. The original URL survives on
+`duplicates`. Recorded as a deviation under the plan's Task 4.
 
 **Dedup.** Same canonical URL merges. Then near-duplicate titles across
 *different* hosts merge (normalized title equality after case-folding,
