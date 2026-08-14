@@ -603,6 +603,25 @@ export interface QueryCoverage {
   agreementMedian: number;
 }
 
+/**
+ * A planned target this round returned no page for, and why.
+ *
+ * The URL stays BARE and the cause travels beside it rather than inside it,
+ * because `nextActions` shell-quotes this `url` as the sole argument of
+ * `fezoctl scrape` and promises the result is ready to run. A caller that
+ * pre-formatted `https://t.example (rate_limited)` into one string would emit a
+ * follow-up command the agent cannot run -- and that one-step `scrape` is
+ * precisely the fallback a fan-out delegates a failed target to, so destroying
+ * it costs the round its only remedy.
+ */
+export interface UnfetchedTarget {
+  url: string;
+  /** Absent when the call budget left no room to attempt the fetch at all;
+   * present when a fetch was attempted and failed, or no provider in the
+   * catalog could serve it. */
+  reason?: string;
+}
+
 export interface Coverage {
   queries: QueryCoverage[];
   served: string[];
@@ -610,7 +629,7 @@ export interface Coverage {
   skipped: string[];
   domainConcentration?: { host: string; share: number };
   droppedQueries: string[];
-  unfetchedTargets: string[];
+  unfetchedTargets: UnfetchedTarget[];
   /** Results withheld because a session had already seen them. */
   suppressed: number;
   /** Machine-computed, human-readable. The agent's cue to spend another round. */
@@ -623,7 +642,7 @@ export interface CoverageInput {
   failed: Array<{ backendId: string; reason: string }>;
   skipped: string[];
   droppedQueries: string[];
-  unfetchedTargets: string[];
+  unfetchedTargets: UnfetchedTarget[];
   suppressed: number;
 }
 
@@ -686,8 +705,13 @@ export function computeCoverage(input: CoverageInput): Coverage {
   if (input.droppedQueries.length > 0) gaps.push(`not run (call budget): ${input.droppedQueries.join(', ')}`);
   // Deliberately not "call budget": this list carries both targets dropped on
   // the budget AND targets whose fetch failed, and a label naming only one
-  // cause would misreport the other.
-  if (input.unfetchedTargets.length > 0) gaps.push(`not fetched: ${input.unfetchedTargets.join(', ')}`);
+  // cause would misreport the other. The per-target `reason` is rendered HERE,
+  // from the structured value -- this line is the one place a human reads it,
+  // and the field `nextActions` quotes has to stay a bare URL.
+  if (input.unfetchedTargets.length > 0) {
+    const rendered = input.unfetchedTargets.map((t) => (t.reason !== undefined ? `${t.url} (${t.reason})` : t.url));
+    gaps.push(`not fetched: ${rendered.join(', ')}`);
+  }
   if (domainConcentration !== undefined && domainConcentration.share > 0.6 && total >= 5) {
     gaps.push(`${String(Math.round(domainConcentration.share * 100))}% of results are from ${domainConcentration.host}`);
   }
@@ -704,7 +728,9 @@ export function computeCoverage(input: CoverageInput): Coverage {
     skipped: [...input.skipped],
     ...(domainConcentration !== undefined ? { domainConcentration } : {}),
     droppedQueries: [...input.droppedQueries],
-    unfetchedTargets: [...input.unfetchedTargets],
+    // Element-wise, like `failed` above and for the same reason: a spread alone
+    // would hand the caller's own objects back inside a finished report.
+    unfetchedTargets: input.unfetchedTargets.map((t) => ({ ...t })),
     suppressed: input.suppressed,
     gaps,
   };
@@ -769,8 +795,17 @@ export function nextActions(coverage: Coverage, sessionId: string | undefined): 
   }
   for (const target of coverage.unfetchedTargets) {
     // `--session` is deliberately absent: `scrape` is a one-step command and
-    // takes no session flag.
-    actions.push({ why: 'not fetched', cmd: `fezoctl scrape ${shellQuote(target)}` });
+    // takes no session flag. The URL is quoted ALONE -- the cause rides in
+    // `why`, which is the field free to explain, while `cmd` is the field that
+    // has to survive being pasted into a shell. Appending "(rate_limited)" to
+    // the argument instead hands the agent
+    // `fezoctl scrape 'https://t.example (rate_limited)'`: a billed fetch of an
+    // address nobody wrote, or a hard failure, in place of the one retry this
+    // action exists to offer.
+    actions.push({
+      why: target.reason !== undefined ? `not fetched (${target.reason})` : 'not fetched',
+      cmd: `fezoctl scrape ${shellQuote(target.url)}`,
+    });
   }
   return actions;
 }

@@ -11,7 +11,7 @@
 // the repository.
 
 import { canonicalizeUrl, computeCoverage, extractItems, mergeItems, nextActions, recordHit, RRF_K } from './aggregate.js';
-import type { Coverage, LaneItems, NextAction, ProviderHit, ResearchItem } from './aggregate.js';
+import type { Coverage, LaneItems, NextAction, ProviderHit, ResearchItem, UnfetchedTarget } from './aggregate.js';
 import type { ToolCandidate } from './catalog.js';
 import { resolveArgName } from './one-step.js';
 import { MAX_RESEARCH_CALLS } from './plan.js';
@@ -55,9 +55,20 @@ export interface ResearchOutcome {
   /** Set when an account-scoped code stopped the round. */
   aborted?: string;
   items: ResearchItem[];
+  documents: ResearchDocument[];
   coverage: Coverage;
   nextActions: NextAction[];
   billing: { callsBilled: number; attempts: AttemptLog[] };
+}
+
+/** One fetched target page. */
+export interface ResearchDocument {
+  url: string;
+  backendId: string;
+  /** The provider's response body, verbatim. Truncation is the renderer's
+   * decision, not this module's -- an executor that silently shortened a page
+   * would make a scrape look complete when it is not. */
+  content: string;
 }
 
 /** One planned unit of work: one query against one provider's entry method. */
@@ -174,6 +185,60 @@ async function pool<T>(tasks: ReadonlyArray<() => Promise<T>>, limit: number, sh
   return out;
 }
 
+/**
+ * The single provider that will fetch this round's targets.
+ *
+ * ONE provider per target, not `fanout` of them: breadth is what a fan-out buys
+ * for a QUERY, where each index returns a different set of links. A URL is one
+ * document -- fetching it from five providers buys five copies of the same page
+ * and bills five times. Fallback on failure is the one-step `scrape` command's
+ * job, and the coverage gap points there (which is why the gap must carry the
+ * target as a bare, runnable URL; see `UnfetchedTarget`).
+ *
+ * Takes no target: the resolved lane is the same for every URL in the round,
+ * and a `target` parameter the body never read made this function look as
+ * though it routed per address while rebuilding the tool map once per target.
+ */
+function scrapeLane(
+  candidates: readonly ToolCandidate[],
+  excluded: readonly string[],
+): { backendId: string; candidate: ToolCandidate; argName: string } | undefined {
+  const byTool = new Map(candidates.map((c) => [c.tool, c]));
+  // `Number.MAX_SAFE_INTEGER`, as `lanesForQuery` asks above: the argument is a
+  // permutation request, not a budget. `diversityOrder` never truncates at a
+  // limit above the eligible count (its docstring says so), and which provider
+  // may serve a scrape is a different quantity from how many calls this round
+  // may bill -- `MAX_RESEARCH_CALLS` here read as a provider-count cap.
+  for (const rec of diversityOrder('scrape', Number.MAX_SAFE_INTEGER, excluded)) {
+    for (const entry of rec.entryMethods) {
+      const candidate = byTool.get(entry);
+      if (candidate === undefined) continue;
+      const argName = resolveArgName(candidate.inputSchema, 'url');
+      if (argName === undefined) continue;
+      return { backendId: rec.backendId, candidate, argName };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * One target lane's own report, written into its own slot for the same reason
+ * `LaneReport` above is: a bounded pool finishes lanes -- query lanes and
+ * target lanes alike -- in whatever order the network answers, and this
+ * round's list of documents and gaps must not depend on that order.
+ */
+interface TargetReport {
+  attempts: AttemptLog[];
+  document?: ResearchDocument;
+  /** The bare target URL and, separately, why it is missing. Structured rather
+   * than pre-formatted: `computeCoverage` renders the pair into a gap line and
+   * `nextActions` quotes the URL alone into a runnable `fezoctl scrape`, and
+   * only one of those two can be served by a single joined string. */
+  failed?: UnfetchedTarget;
+  /** The account-scoped code this lane saw, if any. */
+  aborted?: string;
+}
+
 export async function runResearch(options: ResearchOptions): Promise<ResearchOutcome> {
   const { plan, candidates, excluded, gateway } = options;
   const maxCalls = Math.min(options.maxCalls ?? MAX_RESEARCH_CALLS, MAX_RESEARCH_CALLS);
@@ -192,7 +257,16 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     budget -= lanes.length;
     planned.push({ query, lanes });
   }
-  const unfetchedTargets = plan.targets.slice(Math.max(0, budget));
+  // Split by POSITION, never by value. `plan.targets.filter((t) => !unfetched.includes(t))`
+  // decides membership by string equality, so a target listed twice with only
+  // one occurrence inside the budget loses BOTH -- a call the round had already
+  // reserved and then never spent, reported afterwards as a gap. `clampPlan`
+  // dedupes `targets` today, but that is another module's invariant and this one
+  // must not silently depend on it: the same reason the lane slots below are
+  // keyed by a query's position rather than by its text.
+  const fetchable = Math.max(0, budget);
+  const fetchTargets = plan.targets.slice(0, fetchable);
+  const unfetchedTargets = plan.targets.slice(fetchable);
 
   // The flat, plan-ordered list of lanes this round will run: query order
   // first, then diversity position within the query. Every slot array below is
@@ -211,6 +285,9 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   // dedupes `queries` today, but that is another module's invariant and this
   // one must not silently depend on it.
   const laneItemsByQuery: Array<Array<LaneItems | undefined>> = planned.map(() => []);
+  // One slot per target this round will actually fetch; `unfetchedTargets` is
+  // whatever the query budget left no room for, and those never get a lane.
+  const targetReports: Array<TargetReport | undefined> = fetchTargets.map(() => undefined);
   // Live flag, read by the pool's stop check while lanes are still in flight.
   // The code this round REPORTS is picked out of the lane slots afterwards, so
   // it does not depend on whose 402 came back first.
@@ -264,16 +341,64 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     if (list !== undefined) list[lane.rank - 1] = { backendId: lane.backendId, rank: lane.rank, items };
   });
 
-  await pool(tasks, concurrency, () => abortSeen);
+  // Resolved ONCE for the round rather than inside each task: the lane does not
+  // depend on the target -- every URL goes to the same best-ranked scrape
+  // provider -- so re-resolving it per target rebuilt the tool map and re-ran
+  // `diversityOrder` for an answer that cannot change.
+  const lane = scrapeLane(candidates, excluded);
+  // Runs alongside the query lanes, in the SAME round, for the reason the spec
+  // gives targets a place in `RoutingPlan` at all: a search-and-scrape prompt
+  // should not cost two invocations. Fetching a target is still exactly one
+  // `run()` call with `maxAttempts: 1` -- the same single-candidate lane shape
+  // as a query lane, just keyed by target index instead of (query, rank).
+  const targetTasks = fetchTargets.map((target, targetIndex) => async () => {
+    if (lane === undefined) {
+      targetReports[targetIndex] = { attempts: [], failed: { url: target, reason: 'no scrape provider available' } };
+      return;
+    }
+    const report = await run({
+      baseUrl: gateway.baseUrl,
+      apiKey: gateway.apiKey,
+      candidates: [lane.candidate],
+      args: { [lane.argName]: target },
+      maxAttempts: 1,
+      ...(gateway.fetchFn !== undefined ? { fetchFn: gateway.fetchFn } : {}),
+    });
+    const targetReport: TargetReport = { attempts: [...report.attempts] };
+    targetReports[targetIndex] = targetReport;
+    for (const attempt of report.attempts) {
+      if (attempt.gatewayCode !== undefined && ABORT_CODES.has(attempt.gatewayCode)) {
+        targetReport.aborted ??= `${attempt.gatewayCode}: ${attempt.reason}`;
+        abortSeen = true;
+      }
+    }
+    if (report.outcome.kind !== 'success') {
+      const last = report.attempts[report.attempts.length - 1];
+      targetReport.failed = { url: target, reason: last?.gatewayCode ?? last?.reason ?? 'failed' };
+      return;
+    }
+    targetReport.document = { url: target, backendId: lane.backendId, content: report.outcome.result.bodyText };
+  });
+
+  await pool([...tasks, ...targetTasks], concurrency, () => abortSeen);
 
   // Read back in plan order: a lane that never ran (the pool stopped) simply
   // has no slot, which is why the holes are dropped rather than defaulted.
   const ran = laneReports.filter((r): r is LaneReport => r !== undefined);
-  const attempts = ran.flatMap((r) => r.attempts);
-  const served = new Set(ran.flatMap((r) => (r.served !== undefined ? [r.served] : [])));
+  const targetsRan = targetReports.filter((r): r is TargetReport => r !== undefined);
+  const documents = targetsRan.flatMap((r) => (r.document !== undefined ? [r.document] : []));
+  const failedTargets = targetsRan.flatMap((r) => (r.failed !== undefined ? [r.failed] : []));
+  // Query attempts before target attempts -- both slotted, neither in
+  // completion order, so this concatenation is deterministic and matches the
+  // plan's own ordering of the round's two kinds of work.
+  const attempts = [...ran.flatMap((r) => r.attempts), ...targetsRan.flatMap((r) => r.attempts)];
+  const served = new Set([
+    ...ran.flatMap((r) => (r.served !== undefined ? [r.served] : [])),
+    ...documents.map((d) => d.backendId),
+  ]);
   const failed = ran.flatMap((r) => (r.failed !== undefined ? [r.failed] : []));
   const skipped = ran.flatMap((r) => (r.skipped !== undefined ? [r.skipped] : []));
-  const aborted = ran.find((r) => r.aborted !== undefined)?.aborted;
+  const aborted = ran.find((r) => r.aborted !== undefined)?.aborted ?? targetsRan.find((r) => r.aborted !== undefined)?.aborted;
 
   const seen = options.seenUrls ?? new Set<string>();
   const perQuery: Array<{ query: string; items: ResearchItem[] }> = [];
@@ -391,16 +516,28 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     failed,
     skipped,
     droppedQueries,
-    unfetchedTargets,
+    // Both budget-dropped targets and targets whose fetch failed belong in the
+    // one gap: `computeCoverage`'s own comment on this field says a label
+    // naming only one cause would misreport the other. A budget drop carries no
+    // `reason` -- nothing was attempted, so there is nothing to report but the
+    // URL, and the shared "not fetched" label already says that much.
+    unfetchedTargets: [...unfetchedTargets.map((url) => ({ url })), ...failedTargets],
     suppressed: suppressedUrls.size,
   });
 
   const callsBilled = attempts.filter((a) => a.billed).length;
   return {
     plan,
+    // `served` unions the backends that answered a QUERY with the backends that
+    // fetched a DOCUMENT (see its construction above), so a round with targets
+    // and no queries reports `served: ['scrapingdog']` and a served scrape
+    // backend is what makes such a round a success. The `|| documents.length > 0`
+    // disjunct that used to sit here predated that union and could no longer
+    // decide the value either way.
     ok: aborted === undefined && served.size > 0,
     ...(aborted !== undefined ? { aborted } : {}),
     items,
+    documents,
     coverage,
     nextActions: nextActions(coverage, options.sessionId),
     billing: { callsBilled, attempts },

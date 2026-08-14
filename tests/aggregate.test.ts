@@ -608,7 +608,7 @@ describe('computeCoverage', () => {
     const failed = [{ backendId: 'firecrawl', reason: 'rate_limited' }];
     const skipped = ['exa'];
     const droppedQueries = ['b'];
-    const unfetchedTargets = ['https://t.example'];
+    const unfetchedTargets = [{ url: 'https://t.example', reason: 'rate_limited' }];
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://x.example', 4)] }],
       served, failed, skipped, droppedQueries, unfetchedTargets, suppressed: 0,
@@ -616,14 +616,16 @@ describe('computeCoverage', () => {
     coverage.served.push('exa');
     coverage.skipped.push('you');
     coverage.droppedQueries.push('c');
-    coverage.unfetchedTargets.push('https://u.example');
+    coverage.unfetchedTargets.push({ url: 'https://u.example' });
+    const firstTarget = coverage.unfetchedTargets[0];
+    if (firstTarget !== undefined) firstTarget.url = 'https://rewritten.example';
     coverage.failed.push({ backendId: 'you', reason: 'timeout' });
     const firstFailure = coverage.failed[0];
     if (firstFailure !== undefined) firstFailure.reason = 'rewritten';
     expect(served).toEqual(['you']);
     expect(skipped).toEqual(['exa']);
     expect(droppedQueries).toEqual(['b']);
-    expect(unfetchedTargets).toEqual(['https://t.example']);
+    expect(unfetchedTargets).toEqual([{ url: 'https://t.example', reason: 'rate_limited' }]);
     expect(failed).toEqual([{ backendId: 'firecrawl', reason: 'rate_limited' }]);
   });
 });
@@ -684,18 +686,38 @@ describe('nextActions', () => {
     const coverage = computeCoverage({
       queries: [{ query: 'a', items: [item('https://x.example', 4), item('https://y.example', 3), item('https://z.example', 3)] }],
       served: ['you'], failed: [], skipped: [],
-      droppedQueries: ['price of $BTC & gold'], unfetchedTargets: ['https://example.com/p?a=1&b=2'], suppressed: 0,
+      droppedQueries: ['price of $BTC & gold'], unfetchedTargets: [{ url: 'https://example.com/p?a=1&b=2' }], suppressed: 0,
     });
     const actions = nextActions(coverage, undefined);
     expect(actions[0]?.cmd).toBe(`fezoctl research 'price of $BTC & gold'`);
     expect(actions[1]?.cmd).toBe(`fezoctl scrape 'https://example.com/p?a=1&b=2'`);
   });
 
+  // The reason a target is missing belongs in `why` and nowhere near `cmd`:
+  // `cmd` is promised runnable, and `fezoctl scrape` is the very fallback the
+  // fan-out delegates a failed target to.
+  it('carries a failed target\'s reason in why and leaves the command runnable', () => {
+    const coverage = computeCoverage({
+      queries: [{ query: 'a', items: [item('https://x.example', 4), item('https://y.example', 3), item('https://z.example', 3)] }],
+      served: ['scrapingdog'], failed: [], skipped: [], droppedQueries: [],
+      unfetchedTargets: [{ url: 'https://t.example/a', reason: 'rate_limited' }, { url: 'https://t.example/b' }],
+      suppressed: 0,
+    });
+    expect(coverage.gaps).toContain('not fetched: https://t.example/a (rate_limited), https://t.example/b');
+    const actions = nextActions(coverage, undefined);
+    expect(actions.map((a) => a.cmd)).toEqual([
+      `fezoctl scrape 'https://t.example/a'`,
+      `fezoctl scrape 'https://t.example/b'`,
+    ]);
+    expect(actions[0]?.why).toBe('not fetched (rate_limited)');
+    expect(actions[1]?.why).toBe('not fetched');
+  });
+
   it('emits commands a POSIX shell parses back into the exact arguments', async () => {
     const { execFileSync } = await import('node:child_process');
     const coverage = computeCoverage({
       queries: [{ query: 'best $100 keyboards & "27\' monitors"', items: [] }],
-      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: ['https://example.com/p?a=1&b=2'], suppressed: 0,
+      served: ['you'], failed: [], skipped: [], droppedQueries: [], unfetchedTargets: [{ url: 'https://example.com/p?a=1&b=2' }], suppressed: 0,
     });
     const argvOf = (cmd: string): string[] =>
       execFileSync('/bin/sh', ['-c', `fezoctl() { for a in "$@"; do printf '%s\\n' "$a"; done; }; ${cmd}`], { encoding: 'utf8' })

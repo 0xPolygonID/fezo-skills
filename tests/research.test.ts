@@ -310,3 +310,148 @@ describe('runResearch', () => {
     expect(await run(0)).toEqual(['you_search', 'exa_search', 'brave_search']);
   });
 });
+
+const SCRAPE_CANDIDATES: ToolCandidate[] = [
+  ...CANDIDATES,
+  { ...candidate('scrapingdog', 'scrape'), inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } },
+  { ...candidate('firecrawl', 'scrape'), inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } },
+];
+
+describe('runResearch: targets', () => {
+  it('fetches every planned target', async () => {
+    const fetchFn = routedFetch({ scrapingdog: [new Response('{"content":"page body"}', { status: 200 })] });
+    const outcome = await runResearch({
+      plan: plan({ intents: ['scrape'], queries: [], targets: ['https://t.example'] }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.documents).toHaveLength(1);
+    expect(outcome.documents[0]?.url).toBe('https://t.example');
+    expect(outcome.ok).toBe(true);
+  });
+
+  it('fetches a target once, not once per provider', async () => {
+    const fetchFn = routedFetch({ scrapingdog: [new Response('{"content":"body"}', { status: 200 })] });
+    const outcome = await runResearch({
+      plan: plan({ intents: ['scrape'], queries: [], targets: ['https://t.example'], fanout: 5 }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.billing.attempts.filter((a) => a.billed)).toHaveLength(1);
+  });
+
+  it('reports a failed target as a gap rather than failing the round', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results([])],
+      brave: [results([])],
+      scrapingdog: [new Response(JSON.stringify({ error: { code: 'rate_limited', message: 'no' } }), { status: 429 })],
+      firecrawl: [new Response(JSON.stringify({ error: { code: 'rate_limited', message: 'no' } }), { status: 429 })],
+    });
+    const outcome = await runResearch({
+      plan: plan({ intents: ['search', 'scrape'], queries: ['coffee'], targets: ['https://t.example'] }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.ok).toBe(true);
+    expect(outcome.documents).toHaveLength(0);
+    expect(outcome.coverage.gaps.join(' ')).toMatch(/t\.example/);
+    expect(outcome.coverage.gaps.join(' ')).toMatch(/rate_limited/);
+    // The gap explains; the follow-up command has to RUN. A `cmd` carrying
+    // `'https://t.example (rate_limited)'` would destroy the one-step `scrape`
+    // fallback that a failed target is deliberately delegated to.
+    expect(outcome.nextActions.map((a) => a.cmd)).toContain(`fezoctl scrape 'https://t.example'`);
+    expect(outcome.nextActions.find((a) => a.cmd.startsWith('fezoctl scrape'))?.why).toBe('not fetched (rate_limited)');
+  });
+
+  it('reports a target no catalog provider can fetch, without billing anything', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results([])],
+      brave: [results([])],
+    });
+    const outcome = await runResearch({
+      // CANDIDATES holds no `scrape` entry method at all, so `scrapeLane`
+      // resolves nothing and the target never becomes a call.
+      plan: plan({ intents: ['search', 'scrape'], queries: ['coffee'], targets: ['https://t.example'] }),
+      candidates: CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.coverage.gaps.join(' ')).toMatch(/no scrape provider available/);
+    expect(outcome.nextActions.map((a) => a.cmd)).toContain(`fezoctl scrape 'https://t.example'`);
+    expect(outcome.billing.attempts.filter((a) => a.tool.includes('scrape'))).toHaveLength(0);
+  });
+
+  it('names the scrape backend that served in coverage', async () => {
+    const fetchFn = routedFetch({ scrapingdog: [new Response('{"content":"page body"}', { status: 200 })] });
+    const outcome = await runResearch({
+      plan: plan({ intents: ['scrape'], queries: [], targets: ['https://t.example'] }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    // A pure-target round has no query lane to put in `served`, and a round
+    // that reports nothing served while holding a document reads as a failure.
+    expect(outcome.coverage.served).toContain('scrapingdog');
+    expect(outcome.documents[0]?.content).toBe('{"content":"page body"}');
+  });
+
+  // The reason `TargetReport` is slotted by target index rather than pushed:
+  // the pool finishes lanes in whatever order the network answers, and neither
+  // the documents nor the attempt log may inherit that order.
+  it('reports documents and attempts in plan order, not completion order', async () => {
+    const run = async (delayFirst: number): Promise<{ urls: string[]; tools: string[] }> => {
+      const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        const first = String(init?.body ?? '').includes('https://t1.example');
+        const body = new Response(`{"content":"${first ? 'one' : 'two'}"}`, { status: 200 });
+        // Only the FIRST target is delayed, so at delay 20 the second target's
+        // response lands first and at delay 0 it does not.
+        return first ? new Promise<Response>((resolve) => setTimeout(() => resolve(body), delayFirst)) : body;
+      }) as unknown as typeof fetch;
+      const outcome = await runResearch({
+        plan: plan({ intents: ['scrape'], queries: [], targets: ['https://t1.example', 'https://t2.example'] }),
+        candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+      });
+      return { urls: outcome.documents.map((d) => d.url), tools: outcome.billing.attempts.map((a) => a.tool) };
+    };
+    expect(await run(20)).toEqual({
+      urls: ['https://t1.example', 'https://t2.example'],
+      tools: ['scrapingdog_scrape', 'scrapingdog_scrape'],
+    });
+    expect(await run(0)).toEqual({
+      urls: ['https://t1.example', 'https://t2.example'],
+      tools: ['scrapingdog_scrape', 'scrapingdog_scrape'],
+    });
+  });
+
+  // Two identical targets are two entries, and a value-membership split of the
+  // budget drops the in-budget occurrence along with the out-of-budget one.
+  it('spends the budget on a duplicated target by position, not by value', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results([])],
+      brave: [results([])],
+      scrapingdog: [new Response('{"content":"one"}', { status: 200 }), new Response('{"content":"two"}', { status: 200 })],
+    });
+    const outcome = await runResearch({
+      // Three query lanes leave 2 of the 5 calls for targets, so the first two
+      // of the three targets are fetched -- including the duplicate at index 0.
+      plan: plan({
+        intents: ['search', 'scrape'], queries: ['coffee'],
+        targets: ['https://t1.example', 'https://t2.example', 'https://t1.example'],
+      }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, maxCalls: 5,
+    });
+    expect(outcome.documents.map((d) => d.url)).toEqual(['https://t1.example', 'https://t2.example']);
+    expect(outcome.coverage.unfetchedTargets).toEqual([{ url: 'https://t1.example' }]);
+  });
+
+  it('runs searches and target fetches in the same round', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results(['https://b.example'])],
+      brave: [results(['https://c.example'])],
+      scrapingdog: [new Response('{"content":"body"}', { status: 200 })],
+    });
+    const outcome = await runResearch({
+      plan: plan({ intents: ['search', 'scrape'], queries: ['coffee'], targets: ['https://t.example'] }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.items.length).toBeGreaterThan(0);
+    expect(outcome.documents).toHaveLength(1);
+  });
+});
