@@ -856,9 +856,41 @@ describe('canonicalizeUrl: userinfo', () => {
 });
 
 describe('title is capped like snippet', () => {
-  it('caps a sniffed title', () => {
-    const items = sniffItems({ results: [{ url: 'https://a.example', title: 'T'.repeat(200_000) }] });
-    expect(items[0]?.title?.length).toBeLessThanOrEqual(300);
+  it('caps a sniffed title in the merged output, not on the way in', () => {
+    // The cap belongs AFTER dedup: `sniffItems` keeps the full title because
+    // identity is decided on it. Only the emitted item is bounded.
+    const raw = sniffItems({ results: [{ url: 'https://a.example', title: 'T'.repeat(200_000) }] });
+    expect(raw[0]?.title?.length).toBe(200_000);
+    const { items } = mergeItems([{ backendId: 'b', rank: 1, items: raw }]);
+    expect(items[0]?.title.length).toBeLessThanOrEqual(300);
+  });
+
+  it('does not merge distinct documents whose long titles share a boilerplate prefix', () => {
+    // The exact failure a producer-side cap caused: 368 characters of cookie
+    // banner, then different headlines. Capping before the dedup key truncated
+    // both to the same 299 characters, so two real results became one and the
+    // two providers were recorded as agreeing -- doubling the RRF score and
+    // inflating agreement_median on corroboration that never happened.
+    const boiler = 'Cookie notice. We and our partners use cookies to store and access information on a device. '.repeat(4);
+    const { items } = mergeItems([
+      { backendId: 'you', rank: 1, items: [{ url: 'https://site-a.example/story', title: `${boiler}Story A headline` }] },
+      { backendId: 'exa', rank: 2, items: [{ url: 'https://site-b.example/other', title: `${boiler}Completely different article` }] },
+    ]);
+    expect(items).toHaveLength(2);
+    for (const item of items) {
+      expect(item.providers).toHaveLength(1);
+      expect(item.title.length).toBeLessThanOrEqual(300);
+    }
+  });
+
+  it('still collapses a genuine cross-host twin whose full titles match', () => {
+    const long = 'Chip maker acquires rival in landmark deal. '.repeat(10);
+    const { items } = mergeItems([
+      { backendId: 'you', rank: 1, items: [{ url: 'https://outlet-a.example/s', title: long }] },
+      { backendId: 'exa', rank: 2, items: [{ url: 'https://outlet-b.example/s', title: long }] },
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.providers).toHaveLength(2);
   });
 
   it('caps an adapter-supplied title', () => {
@@ -879,23 +911,30 @@ describe('title is capped like snippet', () => {
     // well-formed UTF-16.
     const items = sniffItems({ results: [{ url: 'https://a.example', snippet: '𝄞'.repeat(2000) }] });
     const snippet = items[0]?.snippet ?? '';
-    // `String.prototype.isWellFormed` is ES2024 and above this project's lib
-    // target, so the check is written out: no code unit may be a high surrogate
-    // without a low surrogate following it.
-    const hasLoneSurrogate = [...snippet].some((_ch, i) => {
+    // Indexed by CODE UNIT, deliberately. An earlier version of this check
+    // iterated code POINTS while indexing units, so for an all-astral string
+    // its index never reached the truncation boundary and the assertion could
+    // not fail -- deleting the backoff in `capText` left the whole suite green.
+    let hasLoneSurrogate = false;
+    for (let i = 0; i < snippet.length; i += 1) {
       const code = snippet.charCodeAt(i);
-      if (code < 0xd800 || code > 0xdbff) return false;
-      const next = snippet.charCodeAt(i + 1);
-      return Number.isNaN(next) || next < 0xdc00 || next > 0xdfff;
-    });
+      if (code < 0xd800 || code > 0xdbff) continue;
+      const next = i + 1 < snippet.length ? snippet.charCodeAt(i + 1) : Number.NaN;
+      if (Number.isNaN(next) || next < 0xdc00 || next > 0xdfff) { hasLoneSurrogate = true; break; }
+      i += 1;
+    }
     expect(hasLoneSurrogate).toBe(false);
+    // And pin the boundary itself: the cap must land on a complete pair.
+    expect(snippet.endsWith('\u{1D11E}…')).toBe(true);
     expect(snippet.length).toBeLessThanOrEqual(SNIPPET_MAX_CHARS);
   });
 });
 
 describe('sniffItems: an array of bare URL strings', () => {
   it('reads it when no object-shaped rows were found', () => {
-    const items = sniffItems({ links: ['https://a.example', 'https://b.example'] });
+    // Under a result-shaped key: `links` is deliberately NOT one, because a
+    // `links` array is as often navigation as it is results.
+    const items = sniffItems({ results: ['https://a.example', 'https://b.example'] });
     expect(items.map((i) => i.url)).toEqual(['https://a.example', 'https://b.example']);
   });
 
@@ -926,5 +965,69 @@ describe('nextActions: no repeated commands', () => {
     });
     const providerActions = nextActions(coverage, undefined).filter((a) => a.cmd === 'fezoctl providers --intent search');
     expect(providerActions).toHaveLength(1);
+  });
+});
+
+describe('sniffUrlStrings: navigation is not a result set', () => {
+  it('reads nothing from a zero-hit SERP body', () => {
+    // The exact body the review demonstrated: no organic results, and the only
+    // URL arrays left are navigation. Reading them fabricates findings AND
+    // suppresses the honest "returned no results" gap.
+    expect(sniffItems({
+      search_metadata: { status: 'Success' },
+      organic_results: [],
+      related_searches: ['https://www.google.com/search?q=a', 'https://www.google.com/search?q=b'],
+      pagination: { other_pages: { '2': 'https://www.google.com/search?start=10' } },
+    })).toEqual([]);
+  });
+
+  it.each([
+    ['images', { images: ['https://a.example/a.jpg', 'https://a.example/b.png'] }],
+    ['pagination', { results: [], pagination: { pages: ['https://a.example/p/2', 'https://a.example/p/3'] } }],
+    ['a cursor', { data: [], next: ['https://api.example/page/2'] }],
+    ['a docs link on an error', { error: { docs: ['https://docs.example/errors'] } }],
+    ['sitelinks', { sitelinks: ['https://a.example/x', 'https://a.example/y'] }],
+  ])('reads nothing from %s', (_label, body) => {
+    expect(sniffItems(body)).toEqual([]);
+  });
+
+  it('still reads a genuine result-shaped array of URLs', () => {
+    expect(sniffItems({ results: ['https://a.example', 'https://b.example'] }).map((i) => i.url))
+      .toEqual(['https://a.example', 'https://b.example']);
+  });
+
+  it('reads a nested result-shaped array', () => {
+    expect(sniffItems({ web: { results: ['https://a.example'] } }).map((i) => i.url)).toEqual(['https://a.example']);
+  });
+
+  it('reads a top-level array, which has no competing interpretation', () => {
+    expect(sniffItems(['https://a.example', 'https://b.example'])).toHaveLength(2);
+  });
+
+  it('still never outranks object-shaped rows', () => {
+    const items = sniffItems({
+      results: [{ url: 'https://real.example', title: 'Real' }],
+      data: Array.from({ length: 50 }, (_u, i) => `https://noise${String(i)}.example`),
+    });
+    expect(items.map((i) => i.url)).toEqual(['https://real.example']);
+  });
+});
+
+describe('duplicates never records an item as its own duplicate', () => {
+  it('for a lone credentialed URL', () => {
+    const { items } = mergeItems([
+      { backendId: 'you', rank: 1, items: [{ url: 'https://user:s3cret@a.example/p', title: 'A' }] },
+    ]);
+    expect(items[0]?.url).toBe('https://a.example/p');
+    expect(items[0]?.duplicates).toEqual([]);
+    expect(JSON.stringify(items)).not.toMatch(/s3cret/);
+  });
+
+  it('for a lone URL that canonicalization rewrites in some other way', () => {
+    const { items } = mergeItems([
+      { backendId: 'you', rank: 1, items: [{ url: 'https://www.a.example/p?utm_source=x', title: 'A' }] },
+    ]);
+    // This one IS a genuine rewrite, so the original is worth recording.
+    expect(items[0]?.duplicates).toEqual(['https://www.a.example/p?utm_source=x']);
   });
 });

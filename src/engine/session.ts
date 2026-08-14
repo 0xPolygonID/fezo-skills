@@ -81,7 +81,17 @@ export function loadSession(id: string, env: Record<string, string | undefined>,
 }
 
 export function saveSession(state: SessionState, env: Record<string, string | undefined>, home: string): void {
-  const path = sessionPath(state.id, env, home);
+  // Bounded HERE, not only where the caller assembles the state. The constants
+  // and the reasoning live in this module, so the guarantee should too: a
+  // second caller -- or the same one after an edit -- must not be able to write
+  // an unbounded history by forgetting a `.slice`. Newest kept, for the reason
+  // on SESSION_MAX_SEEN_URLS.
+  const bounded: SessionState = {
+    ...state,
+    seenUrls: state.seenUrls.slice(-SESSION_MAX_SEEN_URLS),
+    queries: state.queries.slice(-SESSION_MAX_QUERIES),
+  };
+  const path = sessionPath(bounded.id, env, home);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(path, `${JSON.stringify(bounded, null, 2)}\n`, { mode: 0o600 });
 }

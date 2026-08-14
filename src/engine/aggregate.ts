@@ -223,6 +223,16 @@ function capSnippet(text: string): string {
  *
  * Larger than the snippet cap because a title is the field a reader scans, and
  * truncating a long-but-legitimate headline hurts more than carrying it.
+ *
+ * APPLIED AT THE END OF `mergeItems`, never on the way in. Capping at the
+ * producers put a truncated title into the cross-host dedup KEY, and
+ * `titleKey` strips the ellipsis -- so two distinct documents whose titles
+ * agreed for the first 299 characters collapsed into one. That is the input
+ * class the cap exists for: a provider putting whole-page text in the title,
+ * where a shared cookie or nav banner fills the opening paragraphs. The cost
+ * was two harms at once -- a real result deleted, and two providers recorded
+ * as agreeing, doubling the RRF score and inflating `agreement_median`.
+ * Identity is decided on the full title; only the emitted string is bounded.
  */
 const TITLE_MAX_CHARS = 300;
 
@@ -234,8 +244,7 @@ function toRawItem(entry: unknown): RawItem | undefined {
   if (!isRecord(entry)) return undefined;
   const url = firstString(entry, FIELD_CANDIDATES.url);
   if (url === undefined) return undefined;
-  const rawTitle = firstString(entry, FIELD_CANDIDATES.title);
-  const title = rawTitle !== undefined ? capTitle(rawTitle) : undefined;
+  const title = firstString(entry, FIELD_CANDIDATES.title);
   const full = firstString(entry, FIELD_CANDIDATES.snippet);
   const snippet = full !== undefined ? capSnippet(full) : undefined;
   const publishedAt = firstString(entry, FIELD_CANDIDATES.publishedAt);
@@ -283,32 +292,74 @@ export function sniffItems(body: unknown): RawItem[] {
 const BARE_URL = /^https?:\/\/\S+$/;
 
 /**
+ * Keys whose array value is plausibly a RESULT SET.
+ *
+ * An allow-list, not a deny-list, and that asymmetry is the whole safety of
+ * this fallback. A deny-list has to anticipate every non-result array a
+ * provider might carry -- and the first version of this code, which had no
+ * list at all, turned a zero-hit SERP body into two fabricated results by
+ * reading its `related_searches`. An allow-list fails the other way: an
+ * unrecognized key contributes nothing, the provider is honestly reported as
+ * returning nothing, and the fix is to add one name here.
+ *
+ * The arrays this deliberately does NOT read are the ones a zero-hit response
+ * is made of: `related_searches`, `pagination`, `images`, `sitelinks`, `next`,
+ * `tags`. Those are navigation and metadata; presenting them as findings is a
+ * claim about the web nobody made.
+ */
+const RESULT_ARRAY_KEYS: ReadonlySet<string> = new Set([
+  'results', 'organic_results', 'items', 'hits', 'records', 'entries', 'urls', 'data',
+]);
+// `docs` is deliberately absent despite being a real result key in some search
+// APIs: it is also where an error payload puts a documentation link, and this
+// walk has no notion of the surrounding context. Under the allow-list's
+// failure asymmetry, leaving it out costs one provider's results until someone
+// adds it deliberately, while including it turns an error body into a finding.
+
+/**
  * Reads an array of bare URL strings, the commonest non-object result shape.
  *
- * Separate from `toRawItem` and applied only as a FALLBACK, after the
- * object-shaped sweep found nothing: a body that carries real result objects
- * must never be out-scored by some longer array of strings elsewhere in it (a
- * list of related queries, a tag cloud, a set of image URLs on one article).
- * The object sweep is the higher-confidence signal and keeps its precedence.
+ * Two constraints, both load-bearing:
+ *
+ * 1. **Only under a result-shaped key** (`RESULT_ARRAY_KEYS`), or as the body's
+ *    own top-level array. Anything else is navigation, and reading it
+ *    fabricates results out of a response that honestly found nothing -- which
+ *    also suppresses the "returned no results" gap and can flip a round from
+ *    failed to ok.
+ * 2. **Only as a FALLBACK**, after the object-shaped sweep found nothing, so a
+ *    body carrying real result objects can never be out-scored by some longer
+ *    array of strings elsewhere in it.
  *
  * A result read this way has a URL and nothing else -- no title, no snippet --
- * which is exactly what such a provider gave us. Round-1's review left this
- * shape unread and asked for the decision to be taken on paper rather than
- * discovered against a billed capture; this is that decision. Reading it costs
- * nothing when it is absent and turns a billed-but-empty provider into a
- * contributing one when it is present.
+ * which is exactly what such a provider gave us.
  */
 function sniffUrlStrings(body: unknown): RawItem[] {
   let best: RawItem[] = [];
-  for (const array of collectArrays(body)) {
-    const items: RawItem[] = [];
-    for (const entry of array) {
-      if (typeof entry !== 'string') continue;
-      const trimmed = entry.trim();
-      if (BARE_URL.test(trimmed)) items.push({ url: trimmed });
+  const consider = (value: unknown, key: string | undefined, depth: number): void => {
+    if (depth > 6) return;
+    if (Array.isArray(value)) {
+      // `undefined` key means the body itself is the array: a top-level array
+      // of URLs has no competing interpretation.
+      if (key === undefined || RESULT_ARRAY_KEYS.has(key.toLowerCase())) {
+        const items: RawItem[] = [];
+        for (const entry of value) {
+          if (typeof entry !== 'string') continue;
+          const trimmed = entry.trim();
+          if (BARE_URL.test(trimmed)) items.push({ url: trimmed });
+        }
+        if (items.length > best.length) best = items;
+      }
+      // Still descend: a result array is often nested one level down
+      // (`{web: {results: [...]}}`), and the elements may be objects holding
+      // their own result arrays.
+      for (const entry of value) consider(entry, key, depth + 1);
+      return;
     }
-    if (items.length > best.length) best = items;
-  }
+    if (isRecord(value)) {
+      for (const [childKey, child] of Object.entries(value)) consider(child, childKey, depth + 1);
+    }
+  };
+  consider(body, undefined, 0);
   return best;
 }
 
@@ -522,7 +573,7 @@ function sanitizeRow(entry: unknown): RawItem | undefined {
   if (typeof url !== 'string' || url.trim() === '') return undefined;
   return {
     url,
-    ...(typeof title === 'string' ? { title: capTitle(title) } : {}),
+    ...(typeof title === 'string' ? { title } : {}),
     // Capped here as well as in `toRawItem`, so the bound is a property of
     // every item entering `mergeItems` rather than of one of its two
     // producers. This is the ADAPTER path, and adapters are hand-transcribed
@@ -607,7 +658,12 @@ export function mergeItems(
           ...(raw.publishedAt !== undefined ? { publishedAt: raw.publishedAt } : {}),
           providers: [hit],
           score: 0,
-          duplicates: raw.url === canonical ? [] : [redactUserinfo(raw.url)],
+          // Redacted FIRST, then compared. Comparing the raw URL and storing
+          // the redacted one made a credentialed URL its own duplicate: the
+          // two differ only by userinfo, so they are equal once redacted, and
+          // the item recorded a second source it never had. The sibling push
+          // below always got this right; this branch did not.
+          duplicates: redactUserinfo(raw.url) === canonical ? [] : [redactUserinfo(raw.url)],
         });
         return;
       }
@@ -688,6 +744,10 @@ export function mergeItems(
     item.score = item.providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0);
   }
   merged.sort((a, b) => (b.score - a.score) || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
+  // The title cap, applied ONCE and LAST -- after every identity decision has
+  // been made on the full title. See TITLE_MAX_CHARS for what capping earlier
+  // destroyed.
+  for (const item of merged) item.title = capTitle(item.title);
   // The SET travels alongside the count, because the per-document figure this
   // function is careful to compute is only per-document within ONE call: a
   // caller that merges per sub-query and adds the counts up reintroduces the

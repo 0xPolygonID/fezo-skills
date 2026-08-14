@@ -132,9 +132,17 @@ function lanesForQuery(
   // provider the round declined to call, not one it may replace.
   for (const rec of orderByIndexDiversity(eligible, plan.fanout)) {
     let resolved = false;
+    /** True once one of this provider's entry methods was found in the live
+     * catalog -- which separates "your gateway does not serve this provider"
+     * from "it does, but the method takes a URL rather than a query". Reporting
+     * both as "not in catalog" asserts something false about the caller's
+     * gateway and sends them looking for a registration problem they do not
+     * have. */
+    let inCatalog = false;
     for (const entry of rec.entryMethods) {
       const candidate = byTool.get(entry);
       if (candidate === undefined) continue;
+      inCatalog = true;
       const argName = resolveArgName(candidate.inputSchema, 'query');
       if (argName === undefined) continue;
       lanes.push({ query, backendId: rec.backendId, rank: lanes.length + 1, candidate, argName });
@@ -147,7 +155,7 @@ function lanesForQuery(
     // "the web is sparse" when the truth is "three of the four providers you
     // budgeted for are not on your gateway". Same vocabulary as one-step.ts's
     // `buildWalk`, so the two report an unreachable provider identically.
-    if (!resolved) skipped.push(`${rec.backendId} (not in catalog)`);
+    if (!resolved) skipped.push(`${rec.backendId} (${inCatalog ? 'no query argument' : 'not in catalog'})`);
   }
   return { lanes, skipped };
 }
@@ -287,7 +295,26 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   // unfetched -- a fan-out width is a preference, an explicit target is an
   // instruction, and the two modules disagreeing about which comes first is the
   // three-places-must-agree hazard the review flagged.
-  const targetReserve = Math.min(plan.targets.length, maxCalls);
+  // `Math.max(0, ...)` restored: the reservation rewrite dropped the floor the
+  // old `fetchable` computation carried, and a negative budget then made
+  // `slice(0, -5)` keep everything but the last five -- so a round with a
+  // negative call budget still billed. Not reachable through the CLI, which is
+  // exactly what was true of the fractional budget this module already guards.
+  // Symmetric with the search refusal below: a caller who declared intents,
+  // none of which is scrape-shaped, does not get their targets fetched. The
+  // principle was one-way before -- `--intents scrape` refused to search, but
+  // `--intents search` still billed a scrape for a URL the planner had put in
+  // `targets`. Declaring an intent is an instruction in both directions.
+  //
+  // The ordinary path is unaffected: the heuristic emits `['scrape','search']`
+  // whenever a prompt carries a URL, so only an explicit narrowing reaches this.
+  const scrapeShaped = plan.intents.some((intent) => intent === 'scrape' || intent === 'crawl');
+  const noScrapeIntent = plan.intents.length > 0 && !scrapeShaped;
+  const refusedTargets: UnfetchedTarget[] = noScrapeIntent
+    ? plan.targets.map((url) => ({ url, reason: `no scrape-shaped intent declared (intents: ${plan.intents.join(', ')})` }))
+    : [];
+  const fetchableTargets = noScrapeIntent ? [] : plan.targets;
+  const targetReserve = Math.min(fetchableTargets.length, Math.max(0, maxCalls));
   let budget = maxCalls - targetReserve;
   // A caller who declared intents, none of which a query can be served by
   // (`--intents scrape` with a query and no target), gets NO search fan-out.
@@ -336,8 +363,8 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   // `targetReserve`, not whatever the query loop left over: the reservation
   // above is what the queries were already budgeted around, so reading the
   // leftover here would spend the same calls twice.
-  const fetchTargets = plan.targets.slice(0, targetReserve);
-  const unfetchedTargets = plan.targets.slice(targetReserve);
+  const fetchTargets = fetchableTargets.slice(0, targetReserve);
+  const unfetchedTargets = fetchableTargets.slice(targetReserve);
 
   // The flat, plan-ordered list of lanes this round will run: query order
   // first, then diversity position within the query. Every slot array below is
@@ -492,9 +519,14 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
       const laneSlots = plannedLanes
         .map((entry, laneIndex) => ({ entry, laneIndex }))
         .filter(({ entry }) => entry.queryIndex === queryIndex);
-      if (laneSlots.every(({ laneIndex }) => laneReports[laneIndex] === undefined)) {
-        unstartedQueryIndexes.add(queryIndex);
-      }
+      // ZERO SERVED, not zero started. A query whose lanes were partly never
+      // sent and partly killed by the account abort has produced no evidence
+      // about the web either way, so `"…" returned no results` is the same
+      // false claim in a thinner disguise -- the spec's own decision is that
+      // unstarted work is reported as unstarted. A query with even one lane
+      // that actually answered keeps its honest thin-coverage gap.
+      const served = laneSlots.some(({ laneIndex }) => laneReports[laneIndex]?.served !== undefined);
+      if (!served) unstartedQueryIndexes.add(queryIndex);
     });
     for (const queryIndex of unstartedQueryIndexes) {
       const entry = planned[queryIndex];
@@ -637,7 +669,12 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     // naming only one cause would misreport the other. A budget drop carries no
     // `reason` -- nothing was attempted, so there is nothing to report but the
     // URL, and the shared "not fetched" label already says that much.
-    unfetchedTargets: [...unfetchedTargets.map((url) => ({ url })), ...failedTargets, ...unstartedTargets],
+    unfetchedTargets: [
+      ...unfetchedTargets.map((url) => ({ url })),
+      ...refusedTargets,
+      ...failedTargets,
+      ...unstartedTargets,
+    ],
     // A query the abort stopped before any lane started is reported as not run,
     // and describing the width of a round that never happened alongside it is
     // two answers to one question. The narrowing is real but moot.

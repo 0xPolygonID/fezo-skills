@@ -482,14 +482,16 @@ describe('runResearch: an aborted round reports what it never started', () => {
       candidates: CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, concurrency: 1,
     });
     expect(outcome.aborted).toMatch(/insufficient_balance/);
-    // 'beta' and 'gamma' never had a lane start. Saying they returned nothing
-    // is a claim about the web; the truth is a claim about this round.
-    expect(outcome.coverage.droppedQueries.map((d) => d.query)).toEqual(['beta', 'gamma']);
+    // All three carry the abort reason, on ZERO SERVED rather than zero
+    // started: 'beta' and 'gamma' never had a lane sent, and 'alpha''s single
+    // lane came back 402 without answering. None of the three produced any
+    // evidence about the web, so none may be described as having returned
+    // nothing -- that is the same false claim in a thinner disguise.
+    expect(outcome.coverage.droppedQueries.map((d) => d.query)).toEqual(['alpha', 'beta', 'gamma']);
     for (const dropped of outcome.coverage.droppedQueries) {
       expect(dropped.reason).toMatch(/abort/i);
     }
-    expect(outcome.coverage.gaps.join(' ')).not.toMatch(/"beta" returned no results/);
-    expect(outcome.coverage.gaps.join(' ')).not.toMatch(/"gamma" returned no results/);
+    expect(outcome.coverage.gaps.join(' ')).not.toMatch(/returned no results/);
   });
 
   it('reports an unstarted target instead of dropping it from the report', async () => {
@@ -594,7 +596,10 @@ describe('runResearch: budget ordering and fractional budgets', () => {
       scrapingdog: [new Response('{"content":"body"}', { status: 200 })],
     });
     const outcome = await runResearch({
-      plan: plan({ queries: ['alpha'], targets: ['https://t.example'], fanout: 5 }),
+      // Both intents declared, as the planner emits whenever a prompt carries a
+      // URL. A search-only intent list would now refuse the target outright,
+      // which is a different behaviour tested below.
+      plan: plan({ intents: ['search', 'scrape'], queries: ['alpha'], targets: ['https://t.example'], fanout: 5 }),
       candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, maxCalls: 4,
     });
     expect(outcome.documents.map((d) => d.url)).toEqual(['https://t.example']);
@@ -709,5 +714,76 @@ describe('runResearch: the call budget holds across every shape', () => {
     const ceiling = Math.min(shape.maxCalls ?? MAX_RESEARCH_CALLS, MAX_RESEARCH_CALLS);
     expect(calls).toBeLessThanOrEqual(ceiling);
     expect(outcome.billing.attempts.length).toBeLessThanOrEqual(ceiling);
+  });
+});
+
+describe('runResearch: an aborted round keeps an honest gap for a query that DID answer', () => {
+  it('reports a served-but-thin query as thin, not as not-run', async () => {
+    const limit = () =>
+      new Response(JSON.stringify({ error: { code: 'limit_exceeded', message: 'cap' } }), { status: 402 });
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [limit()],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha', 'beta'], fanout: 2 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn }, concurrency: 1,
+    });
+    // `alpha` had a lane that actually answered, so it keeps its real coverage
+    // gap; only `beta`, which never ran, is reported as not-run.
+    expect(outcome.coverage.droppedQueries.map((d) => d.query)).toEqual(['beta']);
+    expect(outcome.coverage.queries.map((q) => q.query)).toContain('alpha');
+  });
+});
+
+describe('runResearch: skipped names the real reason', () => {
+  it('distinguishes a provider that is absent from one that takes no query', async () => {
+    // `firecrawl` is inside a fanout-4 diversity order for `search`, so it is
+    // actually considered; `geonode` is not, and would be skipped for a
+    // different reason entirely.
+    const urlOnly = {
+      ...candidate('firecrawl', 'search'),
+      inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
+    };
+    const fetchFn = routedFetch({ you: [results(['https://a.example'])] });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['coffee'], fanout: 4 }),
+      candidates: [candidate('you', 'search'), urlOnly], excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    const skipped = outcome.coverage.skipped.join(' | ');
+    expect(skipped).toMatch(/firecrawl \(no query argument\)/);
+    expect(skipped).not.toMatch(/firecrawl \(not in catalog\)/);
+  });
+});
+
+describe('runResearch: declared intents are honoured in both directions', () => {
+  it('does not fetch a target when the caller declared only search', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results([])],
+      brave: [results([])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ intents: ['search'], queries: ['alpha'], targets: ['https://t.example'] }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.documents).toHaveLength(0);
+    expect(outcome.coverage.unfetchedTargets[0]?.reason).toMatch(/no scrape-shaped intent/);
+    // The searches still ran: refusing one half of a plan must not cancel the other.
+    expect(outcome.coverage.served).toContain('you');
+  });
+
+  it('still fetches when the planner declared both, which is the ordinary path', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results([])],
+      brave: [results([])],
+      scrapingdog: [new Response('{"content":"body"}', { status: 200 })],
+    });
+    const outcome = await runResearch({
+      plan: plan({ intents: ['scrape', 'search'], queries: ['alpha'], targets: ['https://t.example'] }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.documents).toHaveLength(1);
   });
 });

@@ -1029,13 +1029,18 @@ export function renderResearch(outcome: ResearchOutcome, sessionId: string | und
         duplicates: item.duplicates,
       })),
       documents: outcome.documents.map((doc) => ({ url: doc.url, backend_id: doc.backendId, content: doc.content })),
-      // Mapped, not emitted raw. Every other section of this document is
-      // snake_case (`calls_billed`, `backend_id`, `result_rank`), and
-      // `coverage` was the one place the engine's internal camelCase reached
-      // the wire -- `droppedQueries` sitting next to `calls_billed` in the same
-      // object. SKILL.md teaches agents to read `gaps`, so this is a public
-      // contract from the moment anything depends on it; it is cheaper to make
-      // it consistent now than to keep both spellings forever.
+      // Mapped, not emitted raw: `coverage` is a shape this feature invented,
+      // so its wire spelling was ours to choose, and snake_case matches the
+      // sections around it (`calls_billed`, `backend_id`, `result_rank`).
+      // SKILL.md teaches agents to read `gaps`, so this is a public contract
+      // from the moment anything depends on it -- cheaper to settle now than to
+      // carry both spellings forever.
+      //
+      // NOT a claim that the whole document is snake_case: `billing.attempts`
+      // below is `AttemptLog` verbatim (`backendId`, `httpStatus`,
+      // `gatewayCode`), which `call` and `run` have emitted in that shape since
+      // long before this feature. Renaming it is a wider contract decision
+      // about those commands, not a tidy-up belonging to this one.
       coverage: {
         queries: outcome.coverage.queries.map((q) => ({
           query: q.query,

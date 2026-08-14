@@ -10417,8 +10417,7 @@ function toRawItem(entry) {
   if (!isRecord4(entry)) return void 0;
   const url = firstString(entry, FIELD_CANDIDATES.url);
   if (url === void 0) return void 0;
-  const rawTitle = firstString(entry, FIELD_CANDIDATES.title);
-  const title = rawTitle !== void 0 ? capTitle(rawTitle) : void 0;
+  const title = firstString(entry, FIELD_CANDIDATES.title);
   const full = firstString(entry, FIELD_CANDIDATES.snippet);
   const snippet = full !== void 0 ? capSnippet(full) : void 0;
   const publishedAt = firstString(entry, FIELD_CANDIDATES.publishedAt);
@@ -10442,17 +10441,38 @@ function sniffItems(body) {
   return best.length > 0 ? best : sniffUrlStrings(body);
 }
 var BARE_URL = /^https?:\/\/\S+$/;
+var RESULT_ARRAY_KEYS = /* @__PURE__ */ new Set([
+  "results",
+  "organic_results",
+  "items",
+  "hits",
+  "records",
+  "entries",
+  "urls",
+  "data"
+]);
 function sniffUrlStrings(body) {
   let best = [];
-  for (const array of collectArrays(body)) {
-    const items = [];
-    for (const entry of array) {
-      if (typeof entry !== "string") continue;
-      const trimmed = entry.trim();
-      if (BARE_URL.test(trimmed)) items.push({ url: trimmed });
+  const consider = (value, key, depth) => {
+    if (depth > 6) return;
+    if (Array.isArray(value)) {
+      if (key === void 0 || RESULT_ARRAY_KEYS.has(key.toLowerCase())) {
+        const items = [];
+        for (const entry of value) {
+          if (typeof entry !== "string") continue;
+          const trimmed = entry.trim();
+          if (BARE_URL.test(trimmed)) items.push({ url: trimmed });
+        }
+        if (items.length > best.length) best = items;
+      }
+      for (const entry of value) consider(entry, key, depth + 1);
+      return;
     }
-    if (items.length > best.length) best = items;
-  }
+    if (isRecord4(value)) {
+      for (const [childKey, child] of Object.entries(value)) consider(child, childKey, depth + 1);
+    }
+  };
+  consider(body, void 0, 0);
   return best;
 }
 var RESPONSE_ADAPTERS = {};
@@ -10498,7 +10518,7 @@ function sanitizeRow(entry) {
   if (typeof url !== "string" || url.trim() === "") return void 0;
   return {
     url,
-    ...typeof title === "string" ? { title: capTitle(title) } : {},
+    ...typeof title === "string" ? { title } : {},
     // Capped here as well as in `toRawItem`, so the bound is a property of
     // every item entering `mergeItems` rather than of one of its two
     // producers. This is the ADAPTER path, and adapters are hand-transcribed
@@ -10533,7 +10553,12 @@ function mergeItems(lanes, seenUrls = /* @__PURE__ */ new Set()) {
           ...raw.publishedAt !== void 0 ? { publishedAt: raw.publishedAt } : {},
           providers: [hit],
           score: 0,
-          duplicates: raw.url === canonical ? [] : [redactUserinfo(raw.url)]
+          // Redacted FIRST, then compared. Comparing the raw URL and storing
+          // the redacted one made a credentialed URL its own duplicate: the
+          // two differ only by userinfo, so they are equal once redacted, and
+          // the item recorded a second source it never had. The sibling push
+          // below always got this right; this branch did not.
+          duplicates: redactUserinfo(raw.url) === canonical ? [] : [redactUserinfo(raw.url)]
         });
         return;
       }
@@ -10567,6 +10592,7 @@ function mergeItems(lanes, seenUrls = /* @__PURE__ */ new Set()) {
     item.score = item.providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0);
   }
   merged.sort((a, b) => b.score - a.score || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
+  for (const item of merged) item.title = capTitle(item.title);
   return { items: merged, suppressed: suppressedUrls.size, suppressedUrls };
 }
 var THIN_QUERY_THRESHOLD = 3;
@@ -10724,16 +10750,18 @@ function lanesForQuery(query, plan, candidates, excluded) {
   const skipped = [];
   for (const rec of orderByIndexDiversity(eligible, plan.fanout)) {
     let resolved2 = false;
+    let inCatalog = false;
     for (const entry of rec.entryMethods) {
       const candidate = byTool.get(entry);
       if (candidate === void 0) continue;
+      inCatalog = true;
       const argName = resolveArgName(candidate.inputSchema, "query");
       if (argName === void 0) continue;
       lanes.push({ query, backendId: rec.backendId, rank: lanes.length + 1, candidate, argName });
       resolved2 = true;
       break;
     }
-    if (!resolved2) skipped.push(`${rec.backendId} (not in catalog)`);
+    if (!resolved2) skipped.push(`${rec.backendId} (${inCatalog ? "no query argument" : "not in catalog"})`);
   }
   return { lanes, skipped };
 }
@@ -10778,7 +10806,11 @@ async function runResearch(options) {
   const droppedQueries = [];
   const narrowedQueries = [];
   const planSkipped = [];
-  const targetReserve = Math.min(plan.targets.length, maxCalls);
+  const scrapeShaped = plan.intents.some((intent) => intent === "scrape" || intent === "crawl");
+  const noScrapeIntent = plan.intents.length > 0 && !scrapeShaped;
+  const refusedTargets = noScrapeIntent ? plan.targets.map((url) => ({ url, reason: `no scrape-shaped intent declared (intents: ${plan.intents.join(", ")})` })) : [];
+  const fetchableTargets = noScrapeIntent ? [] : plan.targets;
+  const targetReserve = Math.min(fetchableTargets.length, Math.max(0, maxCalls));
   let budget = maxCalls - targetReserve;
   const searchShaped = plan.intents.filter((intent) => intent !== "scrape" && intent !== "crawl");
   const noSearchIntent = plan.intents.length > 0 && searchShaped.length === 0;
@@ -10803,8 +10835,8 @@ async function runResearch(options) {
     budget -= kept.length;
     planned.push({ query, lanes: kept });
   }
-  const fetchTargets = plan.targets.slice(0, targetReserve);
-  const unfetchedTargets = plan.targets.slice(targetReserve);
+  const fetchTargets = fetchableTargets.slice(0, targetReserve);
+  const unfetchedTargets = fetchableTargets.slice(targetReserve);
   const plannedLanes = planned.flatMap(
     ({ lanes }, queryIndex) => lanes.map((lane2) => ({ queryIndex, lane: lane2 }))
   );
@@ -10894,9 +10926,8 @@ async function runResearch(options) {
     planned.forEach(({ lanes }, queryIndex) => {
       if (lanes.length === 0) return;
       const laneSlots = plannedLanes.map((entry, laneIndex) => ({ entry, laneIndex })).filter(({ entry }) => entry.queryIndex === queryIndex);
-      if (laneSlots.every(({ laneIndex }) => laneReports[laneIndex] === void 0)) {
-        unstartedQueryIndexes.add(queryIndex);
-      }
+      const served2 = laneSlots.some(({ laneIndex }) => laneReports[laneIndex]?.served !== void 0);
+      if (!served2) unstartedQueryIndexes.add(queryIndex);
     });
     for (const queryIndex of unstartedQueryIndexes) {
       const entry = planned[queryIndex];
@@ -10983,7 +11014,12 @@ async function runResearch(options) {
     // naming only one cause would misreport the other. A budget drop carries no
     // `reason` -- nothing was attempted, so there is nothing to report but the
     // URL, and the shared "not fetched" label already says that much.
-    unfetchedTargets: [...unfetchedTargets.map((url) => ({ url })), ...failedTargets, ...unstartedTargets],
+    unfetchedTargets: [
+      ...unfetchedTargets.map((url) => ({ url })),
+      ...refusedTargets,
+      ...failedTargets,
+      ...unstartedTargets
+    ],
     // A query the abort stopped before any lane started is reported as not run,
     // and describing the width of a round that never happened alongside it is
     // two answers to one question. The narrowing is real but moot.
@@ -11612,13 +11648,18 @@ function renderResearch(outcome, sessionId, json) {
         duplicates: item.duplicates
       })),
       documents: outcome.documents.map((doc) => ({ url: doc.url, backend_id: doc.backendId, content: doc.content })),
-      // Mapped, not emitted raw. Every other section of this document is
-      // snake_case (`calls_billed`, `backend_id`, `result_rank`), and
-      // `coverage` was the one place the engine's internal camelCase reached
-      // the wire -- `droppedQueries` sitting next to `calls_billed` in the same
-      // object. SKILL.md teaches agents to read `gaps`, so this is a public
-      // contract from the moment anything depends on it; it is cheaper to make
-      // it consistent now than to keep both spellings forever.
+      // Mapped, not emitted raw: `coverage` is a shape this feature invented,
+      // so its wire spelling was ours to choose, and snake_case matches the
+      // sections around it (`calls_billed`, `backend_id`, `result_rank`).
+      // SKILL.md teaches agents to read `gaps`, so this is a public contract
+      // from the moment anything depends on it -- cheaper to settle now than to
+      // carry both spellings forever.
+      //
+      // NOT a claim that the whole document is snake_case: `billing.attempts`
+      // below is `AttemptLog` verbatim (`backendId`, `httpStatus`,
+      // `gatewayCode`), which `call` and `run` have emitted in that shape since
+      // long before this feature. Renaming it is a wider contract decision
+      // about those commands, not a tidy-up belonging to this one.
       coverage: {
         queries: outcome.coverage.queries.map((q) => ({
           query: q.query,
@@ -11717,9 +11758,14 @@ function loadSession(id, env, home) {
   };
 }
 function saveSession(state, env, home) {
-  const path = sessionPath(state.id, env, home);
+  const bounded = {
+    ...state,
+    seenUrls: state.seenUrls.slice(-SESSION_MAX_SEEN_URLS),
+    queries: state.queries.slice(-SESSION_MAX_QUERIES)
+  };
+  const path = sessionPath(bounded.id, env, home);
   mkdirSync2(dirname2(path), { recursive: true, mode: 448 });
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}
+  writeFileSync(path, `${JSON.stringify(bounded, null, 2)}
 `, { mode: 384 });
 }
 
