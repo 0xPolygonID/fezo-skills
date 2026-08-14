@@ -250,8 +250,21 @@ Create `tests/plan.test.ts`:
 ```ts
 import { describe, expect, it } from 'vitest';
 
-import { DEPTH_FANOUT, MAX_FANOUT, clampPlan, mergePlan, parsePlanJson } from '../src/engine/plan.js';
+import {
+  DEPTH_FANOUT,
+  MAX_FANOUT,
+  MAX_RESEARCH_CALLS,
+  PLAN_SCHEMA,
+  clampPlan,
+  mergePlan,
+  parsePlanJson,
+} from '../src/engine/plan.js';
 import type { RoutingPlan } from '../src/engine/plan.js';
+
+/** The round's billed-call count, as the spec's budget formula states it. */
+function impliedCalls(p: RoutingPlan): number {
+  return p.queries.length * p.fanout + p.targets.length;
+}
 
 function plan(overrides: Partial<RoutingPlan> = {}): RoutingPlan {
   return {
@@ -280,13 +293,56 @@ describe('mergePlan', () => {
     expect(merged.source).toBe('caller');
   });
 
+  // Pins the deviation recorded under the plan's Task 2: a flag beats the
+  // --plan-json it accompanies, the reverse of the spec's original chain.
   it('applies flags on top of a whole-plan override', () => {
     const merged = mergePlan(plan(), { plan: plan({ fanout: 2 }), fanout: 7 });
     expect(merged.fanout).toBe(7);
   });
 
-  it('returns the base untouched when there are no overrides', () => {
-    expect(mergePlan(plan(), {})).toEqual(plan());
+  it('re-derives fanout from a depth flag that carries no explicit fanout', () => {
+    expect(mergePlan(plan({ fanout: 3 }), { depth: 'research' }).fanout).toBe(DEPTH_FANOUT.research);
+  });
+
+  it('lets an explicit fanout survive a depth flag', () => {
+    expect(mergePlan(plan({ fanout: 3 }), { depth: 'research', fanout: 5 }).fanout).toBe(5);
+  });
+
+  it('keeps a fanout that no depth flag disturbs', () => {
+    expect(mergePlan(plan({ fanout: 3 }), { queries: ['tea'] }).fanout).toBe(3);
+  });
+
+  // Every caps test below is about money: fanout bills once per provider per
+  // query. The bound has to be a property of the merge, not of whichever caller
+  // remembers to clamp afterwards -- there is only ever one caller until there
+  // are two.
+  it('clamps a fanout no schema saw, because flags do not pass through the schema', () => {
+    expect(mergePlan(plan(), { fanout: 9999 }).fanout).toBe(MAX_FANOUT);
+  });
+
+  it('clamps a whole-plan override too', () => {
+    expect(mergePlan(plan(), { plan: plan({ fanout: 9999 }) }).fanout).toBe(MAX_FANOUT);
+  });
+
+  it('holds the implied call count within MAX_RESEARCH_CALLS for every merge path', () => {
+    const many = Array.from({ length: 50 }, (_, i) => `q${i}`);
+    expect(impliedCalls(mergePlan(plan(), { queries: many, fanout: 10 }))).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+    expect(impliedCalls(mergePlan(plan(), { plan: plan({ queries: many, fanout: 10 }) }))).toBeLessThanOrEqual(
+      MAX_RESEARCH_CALLS,
+    );
+    // The no-flag path returns the base as-is, and a planner is not a trusted
+    // source of a bounded plan either.
+    expect(impliedCalls(mergePlan(plan({ queries: many, fanout: 10 }), {}))).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+  });
+
+  it('copies the base rather than returning it when there are no overrides', () => {
+    const base = plan();
+    const merged = mergePlan(base, {});
+    expect(merged).toEqual(base);
+    // Identity, not just equality: downstream rendering annotates the plan it
+    // is handed, and must not be able to reach the planner's own object.
+    expect(merged).not.toBe(base);
+    expect(merged.signals).not.toBe(base.signals);
   });
 });
 
@@ -306,6 +362,63 @@ describe('parsePlanJson', () => {
   it('rejects an unknown top-level key', () => {
     expect(() => parsePlanJson({ intents: ['search'], queries: ['x'], nonsense: 1 })).toThrow();
   });
+
+  it('reports every schema problem at once, not just the first', () => {
+    // ajv-instance.ts sets `allErrors: true` so a caller with several typos in
+    // a hand-written plan needs one round-trip, not one per typo.
+    expect(() => parsePlanJson({ intents: ['telepathy'], depth: 'deep', queries: ['x'] })).toThrow(
+      /intents.*depth|depth.*intents/s,
+    );
+  });
+
+  it('derives fanout from depth when the caller gives none', () => {
+    expect(parsePlanJson({ depth: 'shallow', queries: ['x'] }).fanout).toBe(DEPTH_FANOUT.shallow);
+  });
+
+  it("forces source to 'caller' whatever the JSON claims", () => {
+    expect(parsePlanJson({ source: 'llm', queries: ['x'] }).source).toBe('caller');
+  });
+
+  it('rejects a plan with nothing to do, naming both fields', () => {
+    // --plan-json replaces the planner's plan wholesale, so a fragment like
+    // `{"depth":"research"}` would otherwise wipe the queries and bill nothing.
+    expect(() => parsePlanJson({ depth: 'research' })).toThrow(/queries/);
+    expect(() => parsePlanJson({ depth: 'research' })).toThrow(/targets/);
+    expect(() => parsePlanJson({})).toThrow(/queries/);
+  });
+
+  it('accepts a targets-only plan', () => {
+    expect(parsePlanJson({ targets: ['https://example.com'] }).targets).toEqual(['https://example.com']);
+  });
+
+  // PLAN_SCHEMA is the documented gate for caller-supplied plans, so it has to
+  // encode the cap it exists to guard: `{"fanout":9999}` used to validate and
+  // come back as 9999.
+  it('rejects a fanout above MAX_FANOUT at the schema, naming the bound', () => {
+    expect(() => parsePlanJson({ queries: ['x'], fanout: 9999 })).toThrow(/fanout/);
+    expect(parsePlanJson({ queries: ['x'], fanout: MAX_FANOUT }).fanout).toBe(MAX_FANOUT);
+  });
+});
+
+describe('PLAN_SCHEMA', () => {
+  // The validator is compiled once at module load, so any mutation of this
+  // object leaves the exported constant advertising a contract nothing
+  // enforces. The nested `enum` arrays are the part the first freeze pass
+  // missed -- and they are exactly the part that describes the contract.
+  it('is frozen all the way down, nested enum arrays included', () => {
+    expect(Object.isFrozen(PLAN_SCHEMA)).toBe(true);
+    expect(Object.isFrozen(PLAN_SCHEMA.properties)).toBe(true);
+    expect(Object.isFrozen(PLAN_SCHEMA.properties.depth.enum)).toBe(true);
+    expect(Object.isFrozen(PLAN_SCHEMA.properties.source.enum)).toBe(true);
+    expect(Object.isFrozen(PLAN_SCHEMA.properties.intents.items.enum)).toBe(true);
+    expect(Object.isFrozen(PLAN_SCHEMA.properties.queries.items)).toBe(true);
+  });
+
+  it('does not let a caller widen an enum at run time', () => {
+    const depths = PLAN_SCHEMA.properties.depth.enum as unknown as string[];
+    expect(() => depths.push('deep')).toThrow();
+    expect(depths).toEqual(['shallow', 'standard', 'research']);
+  });
 });
 
 describe('clampPlan', () => {
@@ -319,6 +432,67 @@ describe('clampPlan', () => {
 
   it('drops empty and duplicate queries', () => {
     expect(clampPlan(plan({ queries: ['a', '  ', 'a', 'b'] })).queries).toEqual(['a', 'b']);
+  });
+
+  it('trims and dedupes targets too', () => {
+    expect(clampPlan(plan({ targets: ['a', ' a ', ''] })).targets).toEqual(['a']);
+  });
+
+  it('truncates a fractional fanout rather than rounding it', () => {
+    expect(clampPlan(plan({ fanout: 2.9 })).fanout).toBe(2);
+  });
+
+  it("falls back to the depth's width for a non-finite fanout", () => {
+    // NaN would otherwise survive every bound and make the executor's
+    // `queries.length * fanout` budget NaN.
+    expect(clampPlan(plan({ fanout: NaN })).fanout).toBe(DEPTH_FANOUT.standard);
+    expect(clampPlan(plan({ fanout: Infinity, depth: 'research' })).fanout).toBe(DEPTH_FANOUT.research);
+  });
+
+  // `queries * fanout + targets` is the spec's budget formula, and until now
+  // clampPlan bounded only the last-but-one term: 50 queries at fanout 10 came
+  // back untouched as 600 implied calls, twenty-five times the cap.
+  it('bounds queries so the implied call count cannot exceed MAX_RESEARCH_CALLS', () => {
+    const clamped = clampPlan(plan({ queries: Array.from({ length: 50 }, (_, i) => `q${i}`), fanout: 10 }));
+    expect(impliedCalls(clamped)).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+    expect(clamped.queries).toEqual(['q0', 'q1']);
+  });
+
+  it('bounds targets, which bill one call each', () => {
+    const clamped = clampPlan(plan({ queries: [], targets: Array.from({ length: 100 }, (_, i) => `https://t${i}.example`) }));
+    expect(clamped.targets).toHaveLength(MAX_RESEARCH_CALLS);
+    expect(impliedCalls(clamped)).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+  });
+
+  it('bounds the two together, targets first, since a query is the multiplicative term', () => {
+    const clamped = clampPlan(
+      plan({
+        queries: Array.from({ length: 50 }, (_, i) => `q${i}`),
+        targets: Array.from({ length: 20 }, (_, i) => `https://t${i}.example`),
+        fanout: 2,
+      }),
+    );
+    expect(clamped.targets).toHaveLength(20);
+    expect(clamped.queries).toEqual(['q0', 'q1']);
+    expect(impliedCalls(clamped)).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+  });
+
+  it('leaves a plan already within budget completely alone', () => {
+    const base = plan({ queries: ['a', 'b'], targets: ['https://t.example'], fanout: 4 });
+    expect(clampPlan(base)).toEqual(base);
+  });
+
+  it('is idempotent, so applying it twice cannot shrink a plan further', () => {
+    const once = clampPlan(plan({ queries: Array.from({ length: 50 }, (_, i) => `q${i}`), fanout: 10 }));
+    expect(clampPlan(once)).toEqual(once);
+  });
+
+  it('does not alias its input', () => {
+    const base = plan({ signals: ['heuristic: search'] });
+    const clamped = clampPlan(base);
+    expect(clamped).not.toBe(base);
+    expect(clamped.signals).not.toBe(base.signals);
+    expect(clamped.signals).toEqual(['heuristic: search']);
   });
 });
 ```
@@ -342,6 +516,7 @@ Expected: FAIL — cannot resolve `../src/engine/plan.js`.
 import type { Intent } from './intent.js';
 import { INTENTS } from './intent.js';
 import { newSchemaCompiler } from './ajv-instance.js';
+import { ajvErrorsToText } from './schema.js';
 
 export type PlanDepth = 'shallow' | 'standard' | 'research';
 
@@ -375,9 +550,13 @@ export interface Planner {
   plan(prompt: string): RoutingPlan;
 }
 
-/** Field-wise overrides, in the precedence `mergePlan` implements. */
+/** Overrides, in the precedence `mergePlan` implements: a whole `--plan-json`
+ * plan replaces the planner's, then the individual flags below overwrite
+ * fields on top of it. A flag therefore always beats the JSON it accompanies. */
 export interface PlanOverrides {
-  /** A whole plan supplied by the caller (`--plan-json`). Applied first. */
+  /** A whole plan supplied by the caller (`--plan-json`). Replaces the base
+   * plan wholesale -- it is NOT merged field-wise, which is why
+   * `parsePlanJson` refuses a plan with nothing to do. */
   plan?: RoutingPlan;
   intents?: Intent[];
   queries?: string[];
@@ -393,7 +572,15 @@ export const PLAN_SCHEMA = {
     queries: { type: 'array', items: { type: 'string' } },
     targets: { type: 'array', items: { type: 'string' } },
     depth: { type: 'string', enum: ['shallow', 'standard', 'research'] },
-    fanout: { type: 'integer', minimum: 1 },
+    // `maximum` as well as `minimum`, because this schema is the documented
+    // gate for caller-supplied plans and fanout is the field that multiplies
+    // spend: `{"fanout":9999}` validating and coming back verbatim made the
+    // gate advertise a cap it did not check. Rejecting is right here rather
+    // than clamping quietly -- a caller who typed 9999 asked for a round that
+    // does not exist, and this throw becomes exit 1 during argv parsing, before
+    // anything is billed. (`clampPlan` still clamps, for the flag and planner
+    // paths that never touch a schema.)
+    fanout: { type: 'integer', minimum: 1, maximum: MAX_FANOUT },
     signals: { type: 'array', items: { type: 'string' } },
     source: { type: 'string', enum: ['heuristic', 'flags', 'caller', 'llm'] },
   },
@@ -403,6 +590,26 @@ export const PLAN_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+// Frozen for the same reason as DEPTH_FANOUT, and down to the nested property
+// schemas the way providers.ts freezes its nested rows: the validator below is
+// compiled once at module load, so a mutation of this object would leave the
+// exported constant advertising a contract nothing enforces. `as const` is a
+// compile-time annotation only and stops nothing at runtime.
+//
+// Recursive rather than a hand-written walk of the levels this schema happens
+// to have today: the first version froze each property and its `items` but not
+// their `enum` arrays -- and the enums ARE the contract, so
+// `PLAN_SCHEMA.properties.depth.enum.push('deep')` made the exported constant
+// promise a depth the compiled validator rejects. Enumerating levels is how
+// that hole appeared, and a keyword nested one level deeper (`items.items`,
+// `properties.x.properties`) would open it again. This walk cannot miss one.
+function freezeDeep(value: unknown): void {
+  if (value === null || typeof value !== 'object') return;
+  for (const nested of Object.values(value as Record<string, unknown>)) freezeDeep(nested);
+  Object.freeze(value);
+}
+freezeDeep(PLAN_SCHEMA);
+
 const validatePlanSchema = newSchemaCompiler().compile(PLAN_SCHEMA);
 
 /**
@@ -411,31 +618,59 @@ const validatePlanSchema = newSchemaCompiler().compile(PLAN_SCHEMA);
  * Throws on anything invalid, and the caller (cli.ts) turns that into exit
  * code 1 during argv parsing -- before any candidate is selected or billed,
  * the same contract `--args-json` already follows.
+ *
+ * Absent fields are filled from defaults here rather than inherited from the
+ * planner, because `mergePlan` substitutes the *whole* result for the base
+ * plan. That is why the completed plan is then checked for having anything to
+ * do at all: see the throw at the bottom.
  */
 export function parsePlanJson(raw: unknown): RoutingPlan {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('--plan-json must be a JSON object');
   }
   if (!validatePlanSchema(raw)) {
-    const first = validatePlanSchema.errors?.[0];
-    const where = first?.instancePath !== undefined && first.instancePath !== '' ? first.instancePath : 'plan';
-    throw new Error(`--plan-json is not a valid plan: ${where} ${first?.message ?? 'failed validation'}`);
+    // Every error, not just the first: ajv-instance.ts sets `allErrors: true`
+    // specifically so a hand-written --plan-json with three typos reports all
+    // three in one go instead of costing the caller three round-trips.
+    throw new Error(`--plan-json is not a valid plan: ${ajvErrorsToText(validatePlanSchema.errors)}`);
   }
   const partial = raw as Partial<RoutingPlan>;
   const depth = partial.depth ?? 'standard';
-  return {
+  const plan: RoutingPlan = {
     intents: partial.intents ?? ['search'],
     queries: partial.queries ?? [],
     targets: partial.targets ?? [],
     depth,
     fanout: partial.fanout ?? DEPTH_FANOUT[depth],
     signals: partial.signals ?? [],
+    // Always 'caller', whatever the JSON claims: this plan arrived from the
+    // command line, and `source` records who actually won the merge rather
+    // than what the document says about itself.
     source: 'caller',
   };
+  // A plan with neither queries nor targets can never do anything, and because
+  // this object replaces the planner's, accepting one would wipe the
+  // heuristic's queries and produce an empty round at exit 0 -- exactly the
+  // "round the caller did not ask for" that PLAN_SCHEMA is closed to prevent,
+  // only quieter. The message spells out the replace-not-merge semantics
+  // because the mistake it catches is a caller expecting a field-wise merge.
+  if (plan.queries.length === 0 && plan.targets.length === 0) {
+    throw new Error(
+      '--plan-json has no queries and no targets: a plan needs at least one of them ' +
+        "(note that --plan-json replaces the planner's whole plan, it does not merge field-wise -- " +
+        'use --depth/--fanout/--queries to adjust one field)',
+    );
+  }
+  return plan;
 }
 
 /**
- * Applies overrides in precedence order: whole plan, then individual flags.
+ * A whole `--plan-json` plan replaces the base, then individual flags
+ * overwrite fields on top of it -- so a flag always wins over the JSON it
+ * accompanies. This inverts the spec's stated `--plan-json > flags` chain,
+ * deliberately: a flag is the more specific instruction, and under the other
+ * order every flag typed next to a `--plan-json` would be silently ignored.
+ * Recorded as a deviation under the plan's Task 2.
  *
  * `source` records who actually won, so an output document always says where
  * its routing came from -- a misroute is otherwise indistinguishable from a
@@ -449,24 +684,56 @@ export function mergePlan(base: RoutingPlan, overrides: PlanOverrides): RoutingP
     overrides.targets !== undefined ||
     overrides.depth !== undefined ||
     overrides.fanout !== undefined;
-  if (!flagged) return out;
+  // Clamped on the no-op path too, and the copy comes with it: the returned
+  // plan is never the same object as its input, so a downstream renderer that
+  // annotates the plan it was handed cannot reach back and mutate the
+  // planner's own. Clamping here rather than leaving it to the caller is the
+  // point -- see `clampPlan`'s docstring: a planner is not a trusted source of
+  // a bounded plan either, and `--plan-json` reaches this function having
+  // passed a schema that bounds `fanout` but knows nothing of
+  // `queries.length * fanout`.
+  if (!flagged) return clampPlan(out);
   const depth = overrides.depth ?? out.depth;
   out = {
     ...out,
     intents: overrides.intents ?? out.intents,
     queries: overrides.queries ?? out.queries,
     targets: overrides.targets ?? out.targets,
+    signals: [...out.signals],
     depth,
     // A depth flag with no explicit fanout re-derives the width, so
     // `--depth research` widens the round the way a caller expects.
     fanout: overrides.fanout ?? (overrides.depth !== undefined ? DEPTH_FANOUT[depth] : out.fanout),
     source: 'flags',
   };
-  return out;
+  return clampPlan(out);
 }
 
-/** Enforces the hard bounds and removes degenerate input. Applied after every
- * merge, so no path -- planner, flags, or caller JSON -- can exceed a cap. */
+/**
+ * Enforces the hard bounds and removes degenerate input.
+ *
+ * What this guarantees, exactly: on the returned plan, `1 <= fanout <=
+ * MAX_FANOUT` and `queries.length * fanout + targets.length <=
+ * MAX_RESEARCH_CALLS` -- the spec's budget formula, so the plan cannot IMPLY a
+ * round beyond the cap. Enforcing the round's actual spend as it happens
+ * (counting attempts, honouring `--max-calls`, reporting what was dropped)
+ * belongs to the executor, which is the only thing that knows what a lane cost.
+ *
+ * `mergePlan` applies this to everything it returns, so a plan that came
+ * through the merge holds the bound BY CONSTRUCTION rather than by a caller
+ * remembering -- which is what the previous docstring claimed and no code did.
+ * It is idempotent, so applying it again anywhere is free.
+ *
+ * Truncation order when the budget is short: targets are kept and whole queries
+ * are dropped. That is the spec's own rule (§ Fan-out policy truncates "whole
+ * queries first"), and it follows from the arithmetic -- a target is exactly
+ * one call and was named literally by the caller, while a query costs `fanout`
+ * calls, so dropping one query buys back up to ten targets' worth of budget.
+ * Truncation here is silent by necessity (a pure function has nowhere to
+ * report); the executor compares the plan it runs against the one it was given
+ * and reports the difference, because a cap mistaken for full coverage is the
+ * failure this whole module exists to avoid.
+ */
 export function clampPlan(plan: RoutingPlan): RoutingPlan {
   const dedupe = (values: readonly string[]): string[] => {
     const seen = new Set<string>();
@@ -479,12 +746,32 @@ export function clampPlan(plan: RoutingPlan): RoutingPlan {
     }
     return out;
   };
+  // A non-finite width falls back to the depth's declared width rather than
+  // propagating NaN: `Math.min(MAX, Math.max(1, Math.trunc(NaN)))` is NaN, and
+  // a NaN fanout would make `queries.length * fanout` NaN and defeat the
+  // MAX_RESEARCH_CALLS accounting below -- `NaN <= 24` is false, but so is
+  // `NaN > 24`, so a NaN would slip through the budget test in whichever
+  // direction it was written. This function is documented as the last line of
+  // defence, so it does not rely on a caller it cannot see.
+  const fanout = Number.isFinite(plan.fanout)
+    ? Math.min(MAX_FANOUT, Math.max(1, Math.trunc(plan.fanout)))
+    : DEPTH_FANOUT[plan.depth];
+  // Targets are bounded first and keep their budget; queries then take what is
+  // left, at `fanout` calls each. See the docstring for why that order. The
+  // floor cannot starve a query-only plan: with no targets and the widest legal
+  // fanout it still leaves `floor(24/10) = 2` queries.
+  const targets = dedupe(plan.targets).slice(0, MAX_RESEARCH_CALLS);
+  const maxQueries = Math.floor((MAX_RESEARCH_CALLS - targets.length) / fanout);
   return {
     ...plan,
     intents: [...new Set(plan.intents)],
-    queries: dedupe(plan.queries),
-    targets: dedupe(plan.targets),
-    fanout: Math.min(MAX_FANOUT, Math.max(1, Math.trunc(plan.fanout))),
+    queries: dedupe(plan.queries).slice(0, maxQueries),
+    targets,
+    // Copied so the returned plan shares no array with its input; every other
+    // array here is rebuilt anyway, and an advisory list is exactly the thing
+    // a renderer is tempted to append to.
+    signals: [...plan.signals],
+    fanout,
   };
 }
 ```
@@ -502,6 +789,11 @@ git commit -m "feat: add the routing plan contract"
 ```
 
 **Deviations recorded during implementation.**
+
+The Step 1 and Step 3 blocks above are the corrected code -- they are what
+shipped, and what a reader rebuilding this task should build against. The
+changes each block absorbed, and why, are recorded here so implementation can
+still be reviewed against intent.
 
 1. *The spec's precedence chain is inverted: explicit flags beat `--plan-json`,
    not the other way round.* Step 3's `mergePlan` applies `overrides.plan`
@@ -545,6 +837,40 @@ git commit -m "feat: add the routing plan contract"
    `clampPlan` never return an object (or a `signals` array) aliased to their
    input, so downstream rendering can annotate the plan it is handed without
    reaching back into the planner's own.
+4. *The spend caps are now enforced instead of merely declared.* Review found
+   `MAX_RESEARCH_CALLS` with zero references outside its own declaration, a
+   schema with no `maximum` on `fanout` (`{"queries":["x"],"fanout":9999}`
+   validated and came back as 9999), a `mergePlan` that clamped nothing, and a
+   `clampPlan` whose docstring asserted "no path -- planner, flags, or caller
+   JSON -- can exceed a cap" while bounding only `fanout`: 50 queries at fanout
+   10 survived as 600 implied billed calls, twenty-five times the cap. Four
+   changes, all in this module. (a) `PLAN_SCHEMA.properties.fanout` gains
+   `maximum: MAX_FANOUT`, so the documented gate for caller-supplied plans
+   encodes the cap it exists to guard, and rejects rather than clamps -- exit 1
+   during argv parsing, before anything is billed, because a caller who typed
+   9999 asked for a round that does not exist. (b) `mergePlan` returns
+   `clampPlan(...)` on both its paths, so the bound is a property of the merge
+   rather than of whichever caller remembers; a planner is not a trusted source
+   of a bounded plan either, and the flag path never touches a schema at all.
+   (c) `clampPlan` bounds `queries.length` and `targets.length` so
+   `queries * fanout + targets <= MAX_RESEARCH_CALLS` -- the spec's own budget
+   formula -- keeping targets and dropping whole queries, which is the spec's
+   truncation order and follows from the arithmetic (a target is one call and
+   was named literally; a query costs `fanout`). The floor cannot starve a
+   query-only plan: `floor(24/10) = 2` queries survive at the widest legal
+   fanout. (d) The docstring now states what is actually true, and says plainly
+   that enforcing a round's real spend as it happens remains Task 9's job.
+   Pinned by `tests/plan.test.ts`'s three `mergePlan` cap tests and four
+   `clampPlan` budget tests, each of which failed before the change.
+5. *`PLAN_SCHEMA`'s freeze is recursive.* Item 3(b)'s hand-written walk froze
+   each property and its `items` but not their `enum` arrays, so
+   `PLAN_SCHEMA.properties.depth.enum.push('deep')` succeeded and left the
+   exported constant advertising a depth the compiled validator rejects -- the
+   exact hazard its own comment describes, and a breach of the Global
+   Constraint on frozen tables. Enumerating levels is how the hole appeared, so
+   `freezeDeep` walks the whole object instead: a keyword nested one level
+   deeper cannot reopen it. Pinned by 'is frozen all the way down, nested enum
+   arrays included' and 'does not let a caller widen an enum at run time'.
 
 ---
 
@@ -903,11 +1229,17 @@ Create `tests/aggregate.test.ts`:
 ```ts
 import { describe, expect, it } from 'vitest';
 
-import { canonicalizeUrl, sniffItems } from '../src/engine/aggregate.js';
+import { SNIPPET_MAX_CHARS, canonicalizeUrl, sniffItems } from '../src/engine/aggregate.js';
 
 describe('canonicalizeUrl', () => {
-  it('lowercases scheme and host but never the path', () => {
+  it('yields a lowercase scheme and host regardless of input casing, but never touches the path', () => {
     expect(canonicalizeUrl('HTTPS://Example.COM/Path')).toBe('https://example.com/Path');
+  });
+
+  // The http(s) casing above is folded by the URL parser itself; an opaque host
+  // is not, so this is the case that actually exercises our own lowercasing.
+  it('lowercases the host of a non-special scheme, which the parser leaves verbatim', () => {
+    expect(canonicalizeUrl('CUSTOM://EXAMPLE.COM/Path')).toBe('custom://example.com/Path');
   });
 
   it('strips a leading www.', () => {
@@ -928,8 +1260,39 @@ describe('canonicalizeUrl', () => {
     expect(canonicalizeUrl('https://example.com/')).toBe('https://example.com');
   });
 
+  it('normalizes a trailing slash on a deep path too, not just the root', () => {
+    expect(canonicalizeUrl('https://example.com/docs/guide/')).toBe('https://example.com/docs/guide');
+  });
+
+  // The dedup invariant: a query must not decide whether the slash rule fires.
+  it('normalizes a trailing slash on a path that carries a query', () => {
+    expect(canonicalizeUrl('https://example.com/a/?b=1')).toBe(canonicalizeUrl('https://example.com/a?b=1'));
+    expect(canonicalizeUrl('https://example.com/a/?b=1')).toBe('https://example.com/a?b=1');
+  });
+
   it('returns an unparseable value unchanged rather than throwing', () => {
     expect(canonicalizeUrl('not a url')).toBe('not a url');
+  });
+
+  // `source` and `referrer` are ordinary English words, and on real sites they
+  // select content (a feed variant, a localized edition) rather than describing
+  // a click. Stripping them merges two genuinely different documents and demotes
+  // a billed result to `duplicates` -- the one failure mode canonicalization must
+  // never have, since over-merging loses data while under-merging only fails to
+  // save some.
+  it('keeps content-selecting parameters that merely look like tracking', () => {
+    expect(canonicalizeUrl('https://example.com/item?id=5&source=rss')).toBe(
+      'https://example.com/item?id=5&source=rss',
+    );
+    expect(canonicalizeUrl('https://example.com/item?referrer=nav')).toBe('https://example.com/item?referrer=nav');
+  });
+
+  // The vendor-namespaced click ids beyond the spec's list stay stripped: none
+  // of them can select content, so removing them only ever helps the dedup.
+  it('still strips vendor click ids that cannot select content', () => {
+    expect(canonicalizeUrl('https://example.com/a?msclkid=1&igshid=2&yclid=3&dclid=4&_hsenc=5&_hsmi=6&mc_cid=7&b=2')).toBe(
+      'https://example.com/a?b=2',
+    );
   });
 });
 
@@ -971,6 +1334,21 @@ describe('sniffItems', () => {
     expect(sniffItems(null)).toEqual([]);
     expect(sniffItems(42)).toEqual([]);
   });
+
+  // `content` is a snippet candidate and a Firecrawl-family body puts the whole
+  // page's markdown in it, so without a cap one fanout-8 round emits a
+  // multi-megabyte JSON document. The cap is on the item, not on the document,
+  // so the bound holds however many providers answer.
+  it('truncates an oversized snippet to the declared cap', () => {
+    const [item] = sniffItems({ results: [{ url: 'https://a.example', content: 'x'.repeat(200_000) }] });
+    expect(item?.snippet?.length).toBeLessThanOrEqual(SNIPPET_MAX_CHARS + 1);
+    expect(item?.snippet?.startsWith('x'.repeat(SNIPPET_MAX_CHARS))).toBe(true);
+  });
+
+  it('leaves a snippet inside the cap exactly as it found it', () => {
+    const [item] = sniffItems({ results: [{ url: 'https://a.example', description: 'short and complete' }] });
+    expect(item?.snippet).toBe('short and complete');
+  });
 });
 ```
 
@@ -1002,12 +1380,35 @@ export interface RawItem {
   publishedAt?: string;
 }
 
-/** Query parameters that identify a click, not a document. Removing them is
- * what makes the same page found via two providers dedupe to one item. */
+/**
+ * Query parameters that identify a click, not a document. Removing them is
+ * what makes the same page found via two providers dedupe to one item.
+ *
+ * Every entry beyond the spec's list (`utm_*`, `gclid`, `fbclid`, `mc_eid`,
+ * `ref`, `ref_src`) is a VENDOR-NAMESPACED click id -- `msclkid` (Microsoft),
+ * `mc_cid` (Mailchimp campaign), `igshid` (Instagram), `yclid` (Yandex),
+ * `dclid` (DoubleClick), `_hsenc`/`_hsmi` (HubSpot). None of them can select
+ * content: no server branches on them, so dropping them can only ever merge two
+ * spellings of one document, never two documents. Recorded as a deviation under
+ * the plan's Task 4.
+ *
+ * `source` and `referrer` are deliberately ABSENT, and must not be added back.
+ * They are ordinary English words, and real sites route on them (a feed
+ * variant, a localized edition, a print view), so stripping them merges pages
+ * that are genuinely different and demotes a billed result onto `duplicates`.
+ * The asymmetry decides it: failing to merge two spellings costs a duplicate
+ * row a caller can see, while merging two documents destroys one of them
+ * silently.
+ */
 const TRACKING_PARAMS = [
   'gclid', 'fbclid', 'msclkid', 'mc_eid', 'mc_cid', 'igshid',
-  'ref', 'ref_src', 'referrer', 'source', 'yclid', 'dclid', '_hsenc', '_hsmi',
+  'ref', 'ref_src', 'yclid', 'dclid', '_hsenc', '_hsmi',
 ];
+// Frozen for the same reason heuristic.ts freezes RECENCY_PHRASES: this table
+// defines a deterministic transform, and a table a caller could push to at run
+// time would make that determinism a property of nothing -- the same document
+// would canonicalize two ways in one process.
+Object.freeze(TRACKING_PARAMS);
 
 /**
  * Field names carrying each part of a result, in preference order.
@@ -1023,7 +1424,26 @@ const FIELD_CANDIDATES = {
   snippet: ['snippet', 'description', 'summary', 'text', 'content', 'excerpt', 'abstract'],
   publishedAt: ['published_at', 'publishedAt', 'published_date', 'publishedDate', 'datePublished', 'date', 'pubDate'],
 } as const;
+// Both levels, as in one-step.ts's ARG_CANDIDATES: `as const` is erased at
+// compile time, so freezing only the outer object leaves each name list open to
+// a `.push()` from a JS consumer of the bundle or anything that got past the
+// type. Field precedence is a contract; it must not be re-orderable at run time.
+for (const names of Object.values(FIELD_CANDIDATES)) Object.freeze(names);
 Object.freeze(FIELD_CANDIDATES);
+
+/**
+ * Longest snippet kept on a `RawItem`, in characters.
+ *
+ * A snippet is a preview, not a document: a real SERP snippet is 150-300
+ * characters, so 500 keeps every genuine one intact. The cap exists because
+ * `content` is a snippet candidate and the Firecrawl-family backends put a
+ * whole page's markdown in it -- a 200,000-character "snippet" is reachable
+ * today, and one `research` round at fanout 8 across such providers emits a
+ * multi-megabyte `--json` document that no agent can read and every consumer
+ * has to buffer. Capping per item rather than per document keeps the bound
+ * true however many providers answer.
+ */
+export const SNIPPET_MAX_CHARS = 500;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -1052,7 +1472,11 @@ export function canonicalizeUrl(url: string): string {
   } catch {
     return url;
   }
-  parsed.protocol = parsed.protocol.toLowerCase();
+  // The scheme needs no folding: the WHATWG parser ASCII-lowercases it for
+  // every scheme. The host does, though -- the parser only lowercases the host
+  // of *special* schemes (http, https, ws, ...), and leaves an opaque host
+  // verbatim, so `custom://EXAMPLE.COM` survives parsing with its case intact.
+  // Providers hand us whatever string they stored, schemes included.
   parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
   parsed.hash = '';
   const params = [...parsed.searchParams.entries()]
@@ -1060,9 +1484,29 @@ export function canonicalizeUrl(url: string): string {
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   parsed.search = '';
   for (const [key, value] of params) parsed.searchParams.append(key, value);
+  // A trailing slash on *any* path is a server-side directory convention, not a
+  // distinct document, so it is stripped everywhere rather than only at the
+  // root. Done on the pathname rather than on the serialized string because a
+  // string-level test sees the query last and so would never fire for a URL
+  // that carries one -- which is exactly how `/a/?b=1` and `/a?b=1` came to
+  // canonicalize apart, defeating the dedup this function exists for.
+  if (parsed.pathname.endsWith('/') && parsed.pathname !== '/') {
+    parsed.pathname = parsed.pathname.slice(0, -1);
+  }
   let out = parsed.toString();
-  // A bare trailing slash on the root path is not a different document.
-  if (out.endsWith('/') && parsed.search === '' ) out = out.slice(0, -1);
+  // Two cases still arrive here with a trailing slash, and neither can be handled
+  // above. The root path is the one slash the pathname setter cannot remove --
+  // assigning '' yields '/' again -- so it is trimmed off the serialized form
+  // instead. And a URL with an *opaque* path (`custom:opaque/path/`, `data:...`)
+  // has no writable pathname at all: the setter is a silent no-op there, so the
+  // pathname-level rule never ran. Trimming the string is safe because the
+  // urlencoded serializer escapes a '/' inside a parameter value as %2F, so a
+  // final slash is always the path's own. It does leave one gap the rule above
+  // has no way to close: an opaque path that also carries a query keeps its
+  // slash (`custom:opaque/path/?b=1`), so the every-path invariant holds only
+  // for schemes with a hierarchical path -- which is every URL a search or
+  // scrape provider returns.
+  if (out.endsWith('/')) out = out.slice(0, -1);
   return out;
 }
 
@@ -1087,7 +1531,13 @@ function toRawItem(entry: unknown): RawItem | undefined {
   const url = firstString(entry, FIELD_CANDIDATES.url);
   if (url === undefined) return undefined;
   const title = firstString(entry, FIELD_CANDIDATES.title);
-  const snippet = firstString(entry, FIELD_CANDIDATES.snippet);
+  const full = firstString(entry, FIELD_CANDIDATES.snippet);
+  // The ellipsis is the whole point of not slicing silently: a truncated
+  // preview that ends mid-sentence with no marker reads as a provider that
+  // returned a broken snippet, and someone then goes looking for a bug in the
+  // provider rather than finding this cap.
+  const snippet =
+    full !== undefined && full.length > SNIPPET_MAX_CHARS ? `${full.slice(0, SNIPPET_MAX_CHARS)}…` : full;
   const publishedAt = firstString(entry, FIELD_CANDIDATES.publishedAt);
   return {
     url,
@@ -1168,6 +1618,38 @@ git commit -m "feat: add response sniffing and URL canonicalization"
    field precedence, like the tracking-parameter table, defines a deterministic
    transform that must not be re-orderable at run time. Same treatment, and the
    same reasoning, as `one-step.ts`'s `ARG_CANDIDATES`.
+4. *`TRACKING_PARAMS` exceeds the spec's list, deliberately and now on the
+   record -- minus `source` and `referrer`, which are dropped.* Step 3's table
+   silently added nine names to the spec's `utm_*`, `gclid`, `fbclid`,
+   `mc_eid`, `ref`, `ref_src`, with no deviation recorded. Seven are kept and
+   justified per entry, because none of them can select content -- no server
+   branches on a click id: `msclkid` (Microsoft Ads), `mc_cid` (Mailchimp
+   campaign, the sibling of the spec's `mc_eid`), `igshid` (Instagram share),
+   `yclid` (Yandex), `dclid` (DoubleClick), `_hsenc`/`_hsmi` (HubSpot email).
+   Stripping those can only merge two spellings of one document. `source` and
+   `referrer` are removed: they are ordinary English words, and real sites route
+   on `source` (a feed variant, a localized edition, a print view), so
+   `https://example.com/item?id=5&source=rss` and `?id=5` were being merged into
+   one item. The asymmetry decides it -- failing to merge costs a visible
+   duplicate row, while merging two genuinely different documents destroys one
+   of them silently and demotes a billed result onto `duplicates`. The spec's
+   § Canonicalization paragraph is amended with both halves, and the code
+   carries a "must not be added back" note so the next reader does not restore
+   the symmetry. Pinned by 'keeps content-selecting parameters that merely look
+   like tracking' and its sibling 'still strips vendor click ids that cannot
+   select content'.
+5. *A snippet is capped at `SNIPPET_MAX_CHARS = 500` in `toRawItem`.* `content`
+   is a snippet candidate and the Firecrawl-family backends put a whole page's
+   markdown in it, so a 200,000-character snippet was reachable today and a
+   `research` round at fanout 8 across such providers emits a multi-megabyte
+   `--json` document that no agent can read and every consumer has to buffer.
+   500 keeps every genuine SERP snippet (150-300 characters) intact, and the cap
+   is per item so the bound holds however many providers answer. Truncation
+   appends an ellipsis rather than slicing silently: an unmarked mid-sentence
+   cut reads as a broken provider response and sends the next reader hunting a
+   bug that is not there. Recorded in the spec under § Adapters. Pinned by
+   'truncates an oversized snippet to the declared cap' and, in the other
+   direction, 'leaves a snippet inside the cap exactly as it found it'.
 
 ---
 
@@ -1183,11 +1665,18 @@ git commit -m "feat: add response sniffing and URL canonicalization"
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `tests/aggregate.test.ts`:
+Extend the header import block of `tests/aggregate.test.ts` (imports belong at
+the top of the file, not stranded above the new `describe`) with the adapter
+entry points and the `RawItem` type the tests below cast through:
 
 ```ts
 import { RESPONSE_ADAPTERS, extractItems } from '../src/engine/aggregate.js';
+import type { RawItem } from '../src/engine/aggregate.js';
+```
 
+Then append the block:
+
+```ts
 describe('extractItems', () => {
   it('falls back to the sniffer when no adapter is registered', () => {
     expect(extractItems('unknown_tool', { results: [{ url: 'https://a.example' }] }).length).toBe(1);
@@ -1218,6 +1707,34 @@ describe('extractItems', () => {
 
   it('returns nothing for a body neither path can read', () => {
     expect(extractItems('unknown_tool', { markdown: '# page' })).toEqual([]);
+  });
+
+  // The likeliest mistake in a hand-transcribed adapter is not a throw, it is a
+  // silent `undefined` return from a shape that did not match. A non-array
+  // return used to travel out of here unexamined and become `lane.items`, where
+  // `mergeItems`'s `forEach` threw -- destroying EVERY lane's already-billed
+  // results, not just the lane with the bad adapter.
+  it('falls back to the sniffer when an adapter returns a non-array', () => {
+    const original = RESPONSE_ADAPTERS['sloppy_tool'];
+    RESPONSE_ADAPTERS['sloppy_tool'] = (() => undefined) as unknown as (body: unknown) => RawItem[];
+    try {
+      const items = extractItems('sloppy_tool', { results: [{ url: 'https://a.example' }] });
+      expect(items).toEqual([{ url: 'https://a.example' }]);
+    } finally {
+      if (original === undefined) delete RESPONSE_ADAPTERS['sloppy_tool'];
+      else RESPONSE_ADAPTERS['sloppy_tool'] = original;
+    }
+  });
+
+  it('falls back to the sniffer when an adapter returns null', () => {
+    const original = RESPONSE_ADAPTERS['null_tool'];
+    RESPONSE_ADAPTERS['null_tool'] = (() => null) as unknown as (body: unknown) => RawItem[];
+    try {
+      expect(extractItems('null_tool', { results: [{ url: 'https://a.example' }] }).length).toBe(1);
+    } finally {
+      if (original === undefined) delete RESPONSE_ADAPTERS['null_tool'];
+      else RESPONSE_ADAPTERS['null_tool'] = original;
+    }
   });
 });
 ```
@@ -1256,12 +1773,22 @@ export const RESPONSE_ADAPTERS: Record<string, ResponseAdapter> = {};
  * An adapter that throws falls back to the sniffer rather than failing the
  * round. The response was already billed; discarding it because our own
  * transcription of a shape went stale is the worst possible trade.
+ *
+ * A non-array return is treated exactly like a throw, and has to be: adapters
+ * are hand-transcribed from captured responses, so `return body.results` on a
+ * body that turned out to have no `results` -- yielding `undefined`, not an
+ * exception -- is the single likeliest transcription mistake there is. Left
+ * unchecked it becomes `lane.items`, where `mergeItems`'s `forEach` throws and
+ * takes down EVERY lane's already-paid-for results, not just this one. The
+ * `Array.isArray` test is a type guard as much as a value check: `RawItem[]` is
+ * a compile-time promise an adapter is under no runtime obligation to keep.
  */
 export function extractItems(tool: string, body: unknown): RawItem[] {
   const adapter = RESPONSE_ADAPTERS[tool];
   if (adapter !== undefined) {
     try {
-      return adapter(body);
+      const out: unknown = adapter(body);
+      return Array.isArray(out) ? (out as RawItem[]) : sniffItems(body);
     } catch {
       return sniffItems(body);
     }
@@ -1282,6 +1809,25 @@ git add src/engine/aggregate.ts tests/aggregate.test.ts
 git commit -m "feat: add per-provider response adapter overrides"
 ```
 
+**Deviations recorded during implementation.**
+
+The Step 1 and Step 3 blocks above are the corrected code -- they are what
+shipped. The change each absorbed, and why, is recorded here.
+
+1. *A non-array adapter return is treated exactly like a throw.* Step 3 guarded
+   `adapter(body)` against throwing but returned whatever it produced. Adapters
+   are hand-transcribed from captured responses (Task 14), where the likeliest
+   mistake is not an exception but `return body.results` on a body that has no
+   `results` -- a silent `undefined`. That value became `lane.items`, and
+   `mergeItems`'s `forEach` then threw a `TypeError` that escaped the whole
+   merge and discarded EVERY lane's already-paid-for results, not just the lane
+   with the bad adapter -- the precise opposite of the trade this function's own
+   docstring argues for. Now `const out: unknown = adapter(body); return
+   Array.isArray(out) ? out : sniffItems(body)`, which is a type guard as much
+   as a value check: `RawItem[]` is a compile-time promise an adapter is under
+   no runtime obligation to keep. Pinned by 'falls back to the sniffer when an
+   adapter returns a non-array' and '... returns null'.
+
 ---
 
 ### Task 6: Dedup and reciprocal rank fusion
@@ -1300,9 +1846,9 @@ Extend the header import block of `tests/aggregate.test.ts` (imports belong at
 the top of the file, not stranded above the new `describe`) so it reads:
 
 ```ts
-import { RRF_K, canonicalizeUrl, mergeItems, sniffItems } from '../src/engine/aggregate.js';
+import { RRF_K, SNIPPET_MAX_CHARS, canonicalizeUrl, mergeItems, sniffItems } from '../src/engine/aggregate.js';
 import { RESPONSE_ADAPTERS, extractItems } from '../src/engine/aggregate.js';
-import type { LaneItems } from '../src/engine/aggregate.js';
+import type { LaneItems, RawItem } from '../src/engine/aggregate.js';
 ```
 
 Then append the helper and the block:
@@ -1515,6 +2061,80 @@ describe('mergeItems', () => {
   // two items within one lane always differ by rank. Asserting the concrete
   // order, not just that two calls agree: a pure function agrees with itself
   // even with the tie-break deleted.
+  // `providers` carries one entry per backend, and RRF depends on it: the
+  // spec's ordering rationale is "appearing high on several lists beats
+  // appearing first on one", so a backend counted twice reads as agreement
+  // between two providers that does not exist. A lane returning the same
+  // document twice (pagination, a decorated duplicate) is the cheap way to
+  // reach it.
+  it('counts one backend once when its own lane returns the same document twice', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [['https://example.com/a'], ['https://www.example.com/a?utm_source=x']]),
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.providers).toHaveLength(1);
+    // The best (lowest) resultRank survives, so a document a provider ranked
+    // first is not demoted by the same provider also listing it further down.
+    expect(items[0]?.providers[0]?.resultRank).toBe(1);
+    expect(items[0]?.score).toBeCloseTo(1 / (RRF_K + 1), 10);
+  });
+
+  // The other route to a duplicated backend, and the one that pays best: pass 2
+  // folds every same-title item into the representative, including several from
+  // a single lane.
+  it('counts one backend once when the cross-host title collapse folds three of its own results', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [
+        ['https://a.example/s', 'Wire Story'],
+        ['https://b.example/s', 'Wire Story'],
+        ['https://c.example/s', 'Wire Story'],
+      ]),
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.providers).toHaveLength(1);
+    expect(items[0]?.score).toBeCloseTo(1 / (RRF_K + 1), 10);
+  });
+
+  // The ordering consequence, stated as the spec states it: real agreement
+  // between two providers must outrank one provider's own redundancy. Before
+  // the distinct-backend fusion the single-lane triple scored 0.0484 against
+  // the genuine pair's 0.0328 and took the top slot.
+  it('ranks a genuine two-provider agreement above one provider repeating itself', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [
+        ['https://a.example/s', 'Wire Story'],
+        ['https://b.example/s', 'Wire Story'],
+        ['https://c.example/s', 'Wire Story'],
+        ['https://real.example/x', 'Genuine Agreement'],
+      ]),
+      lane('exa', 2, [['https://real.example/x', 'Genuine Agreement']]),
+    ]);
+    expect(items[0]?.url).toBe('https://real.example/x');
+    expect(items[0]?.providers.map((p) => p.backendId).sort()).toEqual(['exa', 'you']);
+  });
+
+  // An adapter is hand-transcribed from a captured response, so an item missing
+  // the one field the whole pipeline keys on is a live possibility. Such an item
+  // used to be scored and emitted with `url: undefined`, violating
+  // `ResearchItem.url: string` inside the output document -- worse than a throw,
+  // because nothing announces it.
+  it('skips an item whose url is missing or empty rather than emitting one with no url', () => {
+    const { items } = mergeItems([
+      {
+        backendId: 'you',
+        rank: 1,
+        items: [
+          { title: 'no url' } as unknown as RawItem,
+          { url: '   ', title: 'blank url' },
+          { url: 42 } as unknown as RawItem,
+          { url: 'https://real.example/a', title: 'Real' },
+        ],
+      },
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.url).toBe('https://real.example/a');
+  });
+
   it('breaks score ties on canonical URL for determinism', () => {
     const { items } = mergeItems([
       lane('you', 1, [['https://b.example']]),
@@ -1536,13 +2156,53 @@ Expected: FAIL — `mergeItems` and `RRF_K` are not exported.
 Append to `src/engine/aggregate.ts`:
 
 ```ts
-/** Which provider contributed an item, and where it sat on that provider's own list. */
+/**
+ * Which provider contributed an item, and where it sat on that provider's own list.
+ *
+ * INVARIANT, on every `ProviderHit[]` this module produces: **at most one entry
+ * per `backendId`**, carrying that backend's best (lowest) `resultRank`.
+ * `providers.length` is therefore literally the number of distinct providers
+ * that returned the document, which is what both the RRF score and Task 7's
+ * agreement arithmetic read it as. Two paths would otherwise duplicate a
+ * backend -- one lane returning the same canonical URL twice, and the pass-2
+ * title collapse folding several of one lane's items together -- and either
+ * turns one provider's redundancy into fabricated agreement. `recordHit` is the
+ * only way to extend such an array; see its comment.
+ */
 export interface ProviderHit {
   backendId: string;
   /** The provider's rank in the fan-out (diversity order position, 1-based). */
   rank: number;
   /** This item's 1-based position within that provider's own results. */
   resultRank: number;
+}
+
+/**
+ * Adds `hit` under the one-entry-per-backend invariant declared on `ProviderHit`.
+ *
+ * The best (lowest) `resultRank` wins, because that is what the RRF term means:
+ * how highly this provider ranked the document. A provider that listed a page
+ * first and again at position 9 ranked it first; taking the later position, or
+ * summing both, would score its own redundancy as either a demotion or an
+ * endorsement. `rank` moves with `resultRank` rather than being kept
+ * independently, so the surviving hit is one provider's actual answer and not a
+ * splice of two.
+ *
+ * A linear scan, not a Map: `providers` is bounded by the fan-out width
+ * (`MAX_FANOUT = 10`), so the scan is cheaper than the Map it would replace and
+ * keeps the array's order -- first-contributing backend first -- which is what
+ * makes the emitted document byte-stable for a given lane order.
+ */
+function recordHit(providers: ProviderHit[], hit: ProviderHit): void {
+  const existing = providers.find((p) => p.backendId === hit.backendId);
+  if (existing === undefined) {
+    providers.push(hit);
+    return;
+  }
+  if (hit.resultRank < existing.resultRank) {
+    existing.rank = hit.rank;
+    existing.resultRank = hit.resultRank;
+  }
 }
 
 export interface ResearchItem {
@@ -1646,6 +2306,17 @@ function hostOf(url: string): string | undefined {
  * `seenUrls` (canonical) are dropped entirely -- that is what makes a
  * multi-round research session return only new material instead of re-paying
  * for the same links.
+ *
+ * **`lanes` ORDER IS PART OF THE INPUT, and the caller owns it.** This function
+ * is pure and deterministic *given its argument*, but not order-independent: in
+ * both passes the first-seen item becomes the representative, so which of two
+ * merged URLs survives -- and therefore what the output document says -- is
+ * decided by lane position. A bounded concurrency pool appends lanes in
+ * COMPLETION order by default, which is a race, so the executor must assemble
+ * this array in a deterministic order (plan order: query, then diversity
+ * position) rather than in the order the network answered. Sorting here instead
+ * was rejected: a lane's identity is `(query, diversity rank)` and this module
+ * is deliberately not told about queries.
  */
 export function mergeItems(
   lanes: readonly LaneItems[],
@@ -1661,6 +2332,16 @@ export function mergeItems(
 
   for (const lane of lanes) {
     lane.items.forEach((raw, index) => {
+      // `RawItem.url` is a compile-time promise, and an adapter is the one
+      // producer that can break it: hand-written from a captured response, it
+      // may hand back rows whose url key was named something else. Such a row
+      // used to be scored and emitted with `url: undefined` -- violating
+      // `ResearchItem.url: string` inside the output document, standing in as
+      // the Map key and the placeholder title, and announcing nothing. Skipped
+      // rather than repaired, because an item with no URL cannot be deduped,
+      // cited or fetched; the index still advances, so the surviving items keep
+      // the provider's own ranking.
+      if (typeof raw.url !== 'string' || raw.url.trim() === '') return;
       const canonical = canonicalizeUrl(raw.url);
       if (seenUrls.has(canonical)) {
         suppressedUrls.add(canonical);
@@ -1680,7 +2361,10 @@ export function mergeItems(
         });
         return;
       }
-      existing.providers.push(hit);
+      // Via `recordHit`, not `push`: this same lane may have listed the same
+      // document twice (pagination, a decorated duplicate), and a backend
+      // counted twice reads downstream as two providers agreeing.
+      recordHit(existing.providers, hit);
       if (raw.url !== canonical && !existing.duplicates.includes(raw.url)) existing.duplicates.push(raw.url);
       // Keep the richest text: a provider that returned a snippet is more
       // useful than one that returned only a link, whichever arrived first.
@@ -1724,7 +2408,11 @@ export function mergeItems(
     const host = hostOf(item.url);
     if (entry !== undefined && host !== undefined && !entry.hosts.has(host)) {
       entry.hosts.add(host);
-      entry.rep.providers.push(...item.providers);
+      // The second place a backend can be counted twice, and the one that pays
+      // best: one lane's own results for a wire story carried by six outlets
+      // all fold in here, so a plain `push(...)` scored a single provider as
+      // six. `recordHit` per hit keeps the invariant and the best rank.
+      for (const hit of item.providers) recordHit(entry.rep.providers, hit);
       // No membership guard here, unlike the pass-1 push above: `item` and
       // `entry.rep` sit under distinct canonical URLs, and canonicalization is a
       // function, so no original URL can appear under both -- their duplicate
@@ -1738,6 +2426,13 @@ export function mergeItems(
     merged.push(item);
   }
 
+  // One term per DISTINCT backend, which is what `ProviderHit`'s invariant
+  // makes this reduce mean: RRF's premise is that appearing high on several
+  // lists beats appearing first on one, so the sum has to run over lists, not
+  // over hits. Summed over hits, one provider returning a wire story from three
+  // outlets scored 0.0484 and outranked a real two-provider agreement at
+  // 0.0328 -- the ranking signal inverted by the redundancy it was supposed to
+  // see through.
   for (const item of merged) {
     item.score = item.providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0);
   }
@@ -1876,10 +2571,54 @@ still be reviewed against intent.
     hosts' -- rather than to new ones, keeping each rule pinned beside the rule
     it shares a comment with. All four lines, and (10)'s, were verified by
     deletion: each now turns the suite red.
+12. *RRF fuses over DISTINCT backends: `ProviderHit[]` now carries at most one
+    entry per `backendId`, holding that backend's best (lowest) `resultRank`.*
+    Two paths let one lane enter `item.providers` several times -- a provider
+    returning the same canonical URL twice (pagination, a decorated duplicate),
+    and pass 2 folding several of one lane's same-title items into the
+    representative -- and the score summed over hits rather than over lists.
+    Measured on the shipped code: one provider's three same-title results scored
+    0.0484 and outranked a genuine two-provider agreement at 0.0328. That
+    inverts the spec's stated ordering rationale ("appearing high on several
+    lists beats appearing first on one, which makes provider agreement a ranking
+    signal for free") by reading one provider's redundancy as agreement, and it
+    would have inflated Task 7's `agreementMedian` -- which reads the same array
+    -- suppressing the follow-up commands a caller depends on to know another
+    round is worth paying for. The invariant is stated on `ProviderHit` and
+    enforced at both push sites through one helper, `recordHit`, rather than by
+    deduping at the scoring step: the array is read by more than the score, so
+    it has to be right, not merely summed correctly. The best rank wins because
+    that is what the RRF term means -- a provider that listed a page first and
+    again at position 9 ranked it first -- and `rank` moves with `resultRank` so
+    the surviving hit is one provider's actual answer rather than a splice of
+    two. Pinned by three tests: one per duplication path, plus the ordering
+    consequence stated as the spec states it. Fixing this before Task 7 rather
+    than after is deliberate; afterwards it would have to be fixed twice.
+13. *An item whose `url` is not a non-empty string is skipped, not scored.* An
+    adapter returning `[{title:'no url'}]` produced a ranked `ResearchItem` with
+    `url: undefined` -- violating the declared `ResearchItem.url: string` inside
+    the emitted document, standing in as the Map key and the placeholder title,
+    and announcing nothing. Worse than the `TypeError` of Task 5's deviation,
+    because nothing announces it. Skipped rather than repaired: an item with no
+    URL cannot be deduped, cited or fetched. The lane index still advances, so
+    surviving items keep the provider's own ranking. Pinned by 'skips an item
+    whose url is missing or empty rather than emitting one with no url'.
+14. *`mergeItems`'s docstring states the lane-ordering requirement it imposes on
+    its caller.* Both passes make the first-seen item the representative, so
+    which of two merged URLs survives is decided by lane position: swapping two
+    lanes flips the surviving URL. The function is pure and deterministic given
+    its argument, and its header said so honestly -- but nothing told the caller
+    that appending lanes in COMPLETION order, which is exactly what a bounded
+    concurrency pool does by default, makes the output document a race. Sorting
+    inside `mergeItems` was rejected: a lane's identity is `(query, diversity
+    rank)` and this module is deliberately not told about queries. Documented
+    here and in the spec's § Dedup so Task 9 has to satisfy it, with its own
+    test named in Task 9's step list. No code change, and so no failing-first
+    test -- the behaviour being documented is the current behaviour.
 
 Items 1-7 came from code review of the first Task 6 implementation; items 8 and
 9 from review of that round of fixes; items 10 and 11 from review of the round
-after that.
+after that; items 12-14 from the comprehensive final review of Tasks 1-6.
 
 ---
 
@@ -2480,6 +3219,49 @@ describe('runResearch', () => {
     expect(outcome.items.map((i) => i.url)).toEqual(['https://new.example']);
     expect(outcome.coverage.suppressed).toBe(1);
   });
+
+  // `mergeItems` makes the FIRST-SEEN item the representative of a merge, so
+  // the lane array's order decides which of two cross-host twins appears in the
+  // output document. A bounded pool completes lanes in whatever order the
+  // network answers, so the executor must slot lanes by diversity rank, not
+  // append them on completion -- otherwise this round's document is a race.
+  // Delaying the first lane is the whole test: with appending, `you`'s URL wins
+  // when it answers first and `exa`'s wins when it answers second.
+  it('orders lanes by plan position, not by which provider answered first', async () => {
+    const slow = async (body: Response, ms: number): Promise<Response> =>
+      new Promise((resolve) => setTimeout(() => resolve(body), ms));
+    const run = async (delayYou: number): Promise<string | undefined> => {
+      const fetchFn = vi.fn(async (url: string | URL) => {
+        const asString = String(url);
+        if (asString.includes('/v1/you/')) return slow(results(['https://you.example/s']), delayYou);
+        if (asString.includes('/v1/exa/')) return results(['https://exa.example/s']);
+        return results([]);
+      }) as unknown as typeof fetch;
+      const outcome = await runResearch({
+        plan: plan({ fanout: 2 }), candidates: CANDIDATES, excluded: [],
+        gateway: { ...gateway, fetchFn },
+      });
+      return outcome.items[0]?.url;
+    };
+    expect(await run(20)).toBe(await run(0));
+  });
+
+  // The one-entry-per-backend invariant on `ProviderHit` (aggregate.ts) has to
+  // survive the cross-query union: one backend answering two sub-queries with
+  // the same document is one provider, not two agreeing.
+  it('counts a backend once when it returns the same document for two queries', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://same.example/a']), results(['https://same.example/a'])],
+      exa: [results([]), results([])],
+      brave: [results([]), results([])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['one', 'two'] }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn },
+    });
+    const item = outcome.items.find((i) => i.url === 'https://same.example/a');
+    expect(item?.providers.filter((p) => p.backendId === 'you')).toHaveLength(1);
+  });
 });
 ```
 
@@ -2636,7 +3418,9 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   const failed: Array<{ backendId: string; reason: string }> = [];
   const served = new Set<string>();
   const skipped: string[] = [];
-  const laneItemsByQuery = new Map<string, LaneItems[]>();
+  // Sparse by design: a lane writes its own slot (see the write below), so a
+  // failed lane leaves a hole rather than shifting its neighbours.
+  const laneItemsByQuery = new Map<string, Array<LaneItems | undefined>>();
   let aborted: string | undefined;
 
   const tasks = planned.flatMap(({ query, lanes }) =>
@@ -2675,8 +3459,15 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
         body = undefined;
       }
       const items = extractItems(lane.candidate.tool, body);
+      // Written into the lane's OWN slot, never appended: the pool completes
+      // lanes in whatever order the network answers, and `mergeItems` makes the
+      // first-seen item the representative of a merge (its docstring says so in
+      // as many words), so appending would let a race decide which of two
+      // merged URLs appears in the output document. Slotting by diversity rank
+      // makes the array plan-ordered whatever the completion order was. Holes
+      // (failed lanes) are compacted at the read below.
       const list = laneItemsByQuery.get(query) ?? [];
-      list.push({ backendId: lane.backendId, rank: lane.rank, items });
+      list[lane.rank - 1] = { backendId: lane.backendId, rank: lane.rank, items };
       laneItemsByQuery.set(query, list);
     }),
   );
@@ -2687,7 +3478,8 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   const perQuery: Array<{ query: string; items: ResearchItem[] }> = [];
   let suppressed = 0;
   for (const { query } of planned) {
-    const merged = mergeItems(laneItemsByQuery.get(query) ?? [], seen);
+    const laneItems = (laneItemsByQuery.get(query) ?? []).filter((l): l is LaneItems => l !== undefined);
+    const merged = mergeItems(laneItems, seen);
     suppressed += merged.suppressed;
     perQuery.push({ query, items: merged.items });
   }
@@ -2703,8 +3495,22 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   for (const { items } of perQuery) {
     for (const item of items) {
       const existing = attributionByUrl.get(item.url);
-      if (existing === undefined) attributionByUrl.set(item.url, item);
-      else existing.providers.push(...item.providers);
+      if (existing === undefined) {
+        attributionByUrl.set(item.url, item);
+        continue;
+      }
+      // `ProviderHit`'s one-entry-per-backend invariant holds across the
+      // cross-query union too, and this is the third place that can break it:
+      // one backend serving two sub-queries that both returned this document is
+      // still one provider agreeing once, and a plain `push(...)` would score
+      // the fan-out's own breadth as agreement. Best (lowest) `resultRank`
+      // wins, exactly as aggregate.ts's `recordHit` does it -- export that
+      // helper rather than keeping this copy if a fourth site ever appears.
+      for (const hit of item.providers) {
+        const held = existing.providers.find((p) => p.backendId === hit.backendId);
+        if (held === undefined) existing.providers.push(hit);
+        else if (hit.resultRank < held.resultRank) { held.rank = hit.rank; held.resultRank = hit.resultRank; }
+      }
     }
   }
   const items = combined.items.map((item) => attributionByUrl.get(item.url) ?? item);

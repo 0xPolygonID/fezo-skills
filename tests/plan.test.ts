@@ -1,7 +1,20 @@
 import { describe, expect, it } from 'vitest';
 
-import { DEPTH_FANOUT, MAX_FANOUT, clampPlan, mergePlan, parsePlanJson } from '../src/engine/plan.js';
+import {
+  DEPTH_FANOUT,
+  MAX_FANOUT,
+  MAX_RESEARCH_CALLS,
+  PLAN_SCHEMA,
+  clampPlan,
+  mergePlan,
+  parsePlanJson,
+} from '../src/engine/plan.js';
 import type { RoutingPlan } from '../src/engine/plan.js';
+
+/** The round's billed-call count, as the spec's budget formula states it. */
+function impliedCalls(p: RoutingPlan): number {
+  return p.queries.length * p.fanout + p.targets.length;
+}
 
 function plan(overrides: Partial<RoutingPlan> = {}): RoutingPlan {
   return {
@@ -47,6 +60,29 @@ describe('mergePlan', () => {
 
   it('keeps a fanout that no depth flag disturbs', () => {
     expect(mergePlan(plan({ fanout: 3 }), { queries: ['tea'] }).fanout).toBe(3);
+  });
+
+  // Every caps test below is about money: fanout bills once per provider per
+  // query. The bound has to be a property of the merge, not of whichever caller
+  // remembers to clamp afterwards -- there is only ever one caller until there
+  // are two.
+  it('clamps a fanout no schema saw, because flags do not pass through the schema', () => {
+    expect(mergePlan(plan(), { fanout: 9999 }).fanout).toBe(MAX_FANOUT);
+  });
+
+  it('clamps a whole-plan override too', () => {
+    expect(mergePlan(plan(), { plan: plan({ fanout: 9999 }) }).fanout).toBe(MAX_FANOUT);
+  });
+
+  it('holds the implied call count within MAX_RESEARCH_CALLS for every merge path', () => {
+    const many = Array.from({ length: 50 }, (_, i) => `q${i}`);
+    expect(impliedCalls(mergePlan(plan(), { queries: many, fanout: 10 }))).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+    expect(impliedCalls(mergePlan(plan(), { plan: plan({ queries: many, fanout: 10 }) }))).toBeLessThanOrEqual(
+      MAX_RESEARCH_CALLS,
+    );
+    // The no-flag path returns the base as-is, and a planner is not a trusted
+    // source of a bounded plan either.
+    expect(impliedCalls(mergePlan(plan({ queries: many, fanout: 10 }), {}))).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
   });
 
   it('copies the base rather than returning it when there are no overrides', () => {
@@ -104,6 +140,55 @@ describe('parsePlanJson', () => {
   it('accepts a targets-only plan', () => {
     expect(parsePlanJson({ targets: ['https://example.com'] }).targets).toEqual(['https://example.com']);
   });
+
+  // PLAN_SCHEMA is the documented gate for caller-supplied plans, so it has to
+  // encode the cap it exists to guard: `{"fanout":9999}` used to validate and
+  // come back as 9999.
+  it('rejects a fanout above MAX_FANOUT at the schema, naming the bound', () => {
+    expect(() => parsePlanJson({ queries: ['x'], fanout: 9999 })).toThrow(/fanout/);
+    expect(parsePlanJson({ queries: ['x'], fanout: MAX_FANOUT }).fanout).toBe(MAX_FANOUT);
+  });
+
+  // The budget invariant has to hold on this function's OWN output, not only
+  // once `mergePlan` has run: nothing in the type system says a caller reaches
+  // the merge, and a 500-query plan at fanout 10 implies 5000 billed calls.
+  it('returns a plan already inside the call budget, not one that relies on a later merge', () => {
+    const parsed = parsePlanJson({
+      queries: Array.from({ length: 500 }, (_, i) => `q${i}`),
+      fanout: MAX_FANOUT,
+    });
+    expect(impliedCalls(parsed)).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+    expect(parsed.queries.length).toBeGreaterThan(0);
+  });
+
+  // The nothing-to-do check counts what would actually be run. Counting raw
+  // array length instead let a whitespace-only query pass here and then be
+  // stripped, producing exactly the empty round at exit 0 the check exists for.
+  it('rejects a plan whose only queries are whitespace', () => {
+    expect(() => parsePlanJson({ queries: ['   ', '\t'] })).toThrow(/queries/);
+    expect(() => parsePlanJson({ queries: ['   '], targets: [' '] })).toThrow(/targets/);
+  });
+});
+
+describe('PLAN_SCHEMA', () => {
+  // The validator is compiled once at module load, so any mutation of this
+  // object leaves the exported constant advertising a contract nothing
+  // enforces. The nested `enum` arrays are the part the first freeze pass
+  // missed -- and they are exactly the part that describes the contract.
+  it('is frozen all the way down, nested enum arrays included', () => {
+    expect(Object.isFrozen(PLAN_SCHEMA)).toBe(true);
+    expect(Object.isFrozen(PLAN_SCHEMA.properties)).toBe(true);
+    expect(Object.isFrozen(PLAN_SCHEMA.properties.depth.enum)).toBe(true);
+    expect(Object.isFrozen(PLAN_SCHEMA.properties.source.enum)).toBe(true);
+    expect(Object.isFrozen(PLAN_SCHEMA.properties.intents.items.enum)).toBe(true);
+    expect(Object.isFrozen(PLAN_SCHEMA.properties.queries.items)).toBe(true);
+  });
+
+  it('does not let a caller widen an enum at run time', () => {
+    const depths = PLAN_SCHEMA.properties.depth.enum as unknown as string[];
+    expect(() => depths.push('deep')).toThrow();
+    expect(depths).toEqual(['shallow', 'standard', 'research']);
+  });
 });
 
 describe('clampPlan', () => {
@@ -132,6 +217,44 @@ describe('clampPlan', () => {
     // `queries.length * fanout` budget NaN.
     expect(clampPlan(plan({ fanout: NaN })).fanout).toBe(DEPTH_FANOUT.standard);
     expect(clampPlan(plan({ fanout: Infinity, depth: 'research' })).fanout).toBe(DEPTH_FANOUT.research);
+  });
+
+  // `queries * fanout + targets` is the spec's budget formula, and until now
+  // clampPlan bounded only the last-but-one term: 50 queries at fanout 10 came
+  // back untouched as 600 implied calls, twenty-five times the cap.
+  it('bounds queries so the implied call count cannot exceed MAX_RESEARCH_CALLS', () => {
+    const clamped = clampPlan(plan({ queries: Array.from({ length: 50 }, (_, i) => `q${i}`), fanout: 10 }));
+    expect(impliedCalls(clamped)).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+    expect(clamped.queries).toEqual(['q0', 'q1']);
+  });
+
+  it('bounds targets, which bill one call each', () => {
+    const clamped = clampPlan(plan({ queries: [], targets: Array.from({ length: 100 }, (_, i) => `https://t${i}.example`) }));
+    expect(clamped.targets).toHaveLength(MAX_RESEARCH_CALLS);
+    expect(impliedCalls(clamped)).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+  });
+
+  it('bounds the two together, targets first, since a query is the multiplicative term', () => {
+    const clamped = clampPlan(
+      plan({
+        queries: Array.from({ length: 50 }, (_, i) => `q${i}`),
+        targets: Array.from({ length: 20 }, (_, i) => `https://t${i}.example`),
+        fanout: 2,
+      }),
+    );
+    expect(clamped.targets).toHaveLength(20);
+    expect(clamped.queries).toEqual(['q0', 'q1']);
+    expect(impliedCalls(clamped)).toBeLessThanOrEqual(MAX_RESEARCH_CALLS);
+  });
+
+  it('leaves a plan already within budget completely alone', () => {
+    const base = plan({ queries: ['a', 'b'], targets: ['https://t.example'], fanout: 4 });
+    expect(clampPlan(base)).toEqual(base);
+  });
+
+  it('is idempotent, so applying it twice cannot shrink a plan further', () => {
+    const once = clampPlan(plan({ queries: Array.from({ length: 50 }, (_, i) => `q${i}`), fanout: 10 }));
+    expect(clampPlan(once)).toEqual(once);
   });
 
   it('does not alias its input', () => {

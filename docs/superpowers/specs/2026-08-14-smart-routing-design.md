@@ -150,6 +150,26 @@ targets`; the executor truncates deterministically (whole queries first, then
 lowest-diversity providers) and **reports what it dropped** — silent truncation
 reads as full coverage when it isn't.
 
+`clampPlan` holds the same formula as a property of the plan itself: it bounds
+`fanout`, `queries.length` and `targets.length` so no plan can *imply* a round
+beyond the cap, and `mergePlan` applies it to everything it returns, so the
+bound holds by construction on the planner, flag and `--plan-json` paths alike.
+Enforcing what a round actually spends as it spends it stays the executor's
+job — it is the only thing that knows what a lane cost.
+
+**`fanout` is a per-query TOTAL across intents, not per intent.** The heuristic
+emits several intents routinely, not exceptionally (`['search','news']` for any
+recency cue, `['scrape','search']` for a URL plus prose), so this has to be
+stated or the budget formula has no intent term to omit. One query at fanout 4
+with intents `['search','news']` buys 4 provider calls, not 8: the providers for
+every declared intent are ordered for diversity and the first `fanout` of that
+combined list are called. Multi-intent therefore changes *which* providers a
+query reaches, never *how many* — which is what keeps `queries × fanout +
+targets` true, and keeps a caller's spend independent of how many intents the
+heuristic happened to infer from their prose. `'scrape'` appearing in `intents`
+alongside `targets` remains redundant under "targets are fetched once, not
+fanned out"; the targets list is what is fetched.
+
 **Targets are fetched once, not fanned out.** Breadth is what a fan-out buys
 for a *query*, where each index returns a different set of links. A URL is one
 document: fetching it from five providers buys five copies of the same page and
@@ -205,11 +225,23 @@ A provider whose shape the sniffer cannot read yields zero items and is
 
 **Adapters.** `RESPONSE_ADAPTERS: Record<string, Adapter>` keyed by tool name,
 consulted before the sniffer. Seeded from real captured responses during
-calibration (Task 12), not from guesswork.
+calibration (Task 14), not from guesswork. An adapter that throws *or returns a
+non-array* falls back to the sniffer: the response is already billed, and the
+likeliest transcription mistake is a silent `undefined`, not an exception.
+
+**A snippet is capped** at `SNIPPET_MAX_CHARS = 500`. `content` is a snippet
+candidate and the Firecrawl-family backends put a whole page's markdown in it,
+so without a per-item cap one `research` round emits a multi-megabyte document.
+Recorded as a deviation under the plan's Task 4.
 
 **Canonicalization.** Lowercase scheme and host, strip a leading `www.`, drop
 the fragment, remove tracking parameters (`utm_*`, `gclid`, `fbclid`,
-`mc_eid`, `ref`, `ref_src`), sort remaining query parameters. A trailing slash
+`mc_eid`, `ref`, `ref_src`, plus the vendor-namespaced click ids `msclkid`,
+`mc_cid`, `igshid`, `yclid`, `dclid`, `_hsenc`, `_hsmi` — none of which any
+server branches on), sort remaining query parameters. Parameters that merely
+look like tracking but genuinely select content — `source`, `referrer` — are
+**not** stripped: over-merging destroys a document silently, while
+under-merging costs a visible duplicate row. A trailing slash
 is stripped from *every* path, not only from the root — it is a server-side
 directory convention, not a distinct document — and independently of any query,
 so `/a/?b=1` and `/a?b=1` yield one key. The original URL survives on
@@ -221,8 +253,19 @@ punctuation stripping, and whitespace collapse) — catching one wire story
 carried by six outlets. The surviving item keeps every source URL and every
 contributing provider, so nothing is lost, only grouped.
 
+Both passes make the **first-seen** item the representative, so `mergeItems`'s
+output depends on the order of the lane array it is handed. The executor must
+therefore assemble lanes in plan order (query, then diversity position), never
+in completion order — a bounded concurrency pool appends in completion order by
+default, which would make the emitted document a race.
+
 **Ordering: reciprocal rank fusion.** `score = Σ 1/(RRF_K + resultRank_i)`
-over contributing providers, `RRF_K = 60`. No provider-reported score is used
+over **distinct** contributing providers, `RRF_K = 60`. `providers[]` carries at
+most one entry per `backendId`, holding that backend's best `resultRank`: both
+merge passes can otherwise fold several of one lane's results into one item, and
+a provider counted twice turns its own redundancy into fabricated agreement —
+inverting the ordering property below and inflating the coverage arithmetic a
+caller pays for. No provider-reported score is used
 — they are incomparable across providers and often absent. Appearing high on
 several lists beats appearing first on one, which makes provider agreement a
 ranking signal for free. Ties break on canonical URL for determinism.
@@ -283,8 +326,9 @@ fezoctl research "<prompt>" [--intents a,b] [--queries "q1" --queries "q2"]
 
 ## Testing
 
-- `plan.test.ts` — merge precedence, schema rejection, exit-1 timing.
-- `heuristic.test.ts` — table-driven prompt → plan; no network.
+- `plan.test.ts` — merge precedence, schema rejection, cap enforcement,
+  exit-1 timing.
+- `heuristic-planner.test.ts` — table-driven prompt → plan; no network.
 - `aggregate.test.ts` — sniffer shapes, adapter override precedence,
   canonicalization, dedup, RRF ordering, coverage arithmetic.
 - `session.test.ts` — temp-dir round trip, id validation, 0600 mode.

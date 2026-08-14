@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
-import { RRF_K, canonicalizeUrl, mergeItems, sniffItems } from '../src/engine/aggregate.js';
+import { RRF_K, SNIPPET_MAX_CHARS, canonicalizeUrl, mergeItems, sniffItems } from '../src/engine/aggregate.js';
 import { RESPONSE_ADAPTERS, extractItems } from '../src/engine/aggregate.js';
-import type { LaneItems } from '../src/engine/aggregate.js';
+import type { LaneItems, RawItem } from '../src/engine/aggregate.js';
 
 describe('canonicalizeUrl', () => {
   it('yields a lowercase scheme and host regardless of input casing, but never touches the path', () => {
@@ -46,6 +46,27 @@ describe('canonicalizeUrl', () => {
   it('returns an unparseable value unchanged rather than throwing', () => {
     expect(canonicalizeUrl('not a url')).toBe('not a url');
   });
+
+  // `source` and `referrer` are ordinary English words, and on real sites they
+  // select content (a feed variant, a localized edition) rather than describing
+  // a click. Stripping them merges two genuinely different documents and demotes
+  // a billed result to `duplicates` -- the one failure mode canonicalization must
+  // never have, since over-merging loses data while under-merging only fails to
+  // save some.
+  it('keeps content-selecting parameters that merely look like tracking', () => {
+    expect(canonicalizeUrl('https://example.com/item?id=5&source=rss')).toBe(
+      'https://example.com/item?id=5&source=rss',
+    );
+    expect(canonicalizeUrl('https://example.com/item?referrer=nav')).toBe('https://example.com/item?referrer=nav');
+  });
+
+  // The vendor-namespaced click ids beyond the spec's list stay stripped: none
+  // of them can select content, so removing them only ever helps the dedup.
+  it('still strips vendor click ids that cannot select content', () => {
+    expect(canonicalizeUrl('https://example.com/a?msclkid=1&igshid=2&yclid=3&dclid=4&_hsenc=5&_hsmi=6&mc_cid=7&b=2')).toBe(
+      'https://example.com/a?b=2',
+    );
+  });
 });
 
 describe('sniffItems', () => {
@@ -86,6 +107,23 @@ describe('sniffItems', () => {
     expect(sniffItems(null)).toEqual([]);
     expect(sniffItems(42)).toEqual([]);
   });
+
+  // `content` is a snippet candidate and a Firecrawl-family body puts the whole
+  // page's markdown in it, so without a cap one fanout-8 round emits a
+  // multi-megabyte JSON document. The cap is on the item, not on the document,
+  // so the bound holds however many providers answer.
+  it('truncates an oversized snippet to the declared cap', () => {
+    const [item] = sniffItems({ results: [{ url: 'https://a.example', content: 'x'.repeat(200_000) }] });
+    // The cap is on the emitted string, ellipsis included: the marker costs a
+    // character of text rather than being added on top of a full-length slice.
+    expect(item?.snippet?.length).toBe(SNIPPET_MAX_CHARS);
+    expect(item?.snippet).toBe(`${'x'.repeat(SNIPPET_MAX_CHARS - 1)}…`);
+  });
+
+  it('leaves a snippet inside the cap exactly as it found it', () => {
+    const [item] = sniffItems({ results: [{ url: 'https://a.example', description: 'short and complete' }] });
+    expect(item?.snippet).toBe('short and complete');
+  });
 });
 
 describe('extractItems', () => {
@@ -118,6 +156,34 @@ describe('extractItems', () => {
 
   it('returns nothing for a body neither path can read', () => {
     expect(extractItems('unknown_tool', { markdown: '# page' })).toEqual([]);
+  });
+
+  // The likeliest mistake in a hand-transcribed adapter is not a throw, it is a
+  // silent `undefined` return from a shape that did not match. A non-array
+  // return used to travel out of here unexamined and become `lane.items`, where
+  // `mergeItems`'s `forEach` threw -- destroying EVERY lane's already-billed
+  // results, not just the lane with the bad adapter.
+  it('falls back to the sniffer when an adapter returns a non-array', () => {
+    const original = RESPONSE_ADAPTERS['sloppy_tool'];
+    RESPONSE_ADAPTERS['sloppy_tool'] = (() => undefined) as unknown as (body: unknown) => RawItem[];
+    try {
+      const items = extractItems('sloppy_tool', { results: [{ url: 'https://a.example' }] });
+      expect(items).toEqual([{ url: 'https://a.example' }]);
+    } finally {
+      if (original === undefined) delete RESPONSE_ADAPTERS['sloppy_tool'];
+      else RESPONSE_ADAPTERS['sloppy_tool'] = original;
+    }
+  });
+
+  it('falls back to the sniffer when an adapter returns null', () => {
+    const original = RESPONSE_ADAPTERS['null_tool'];
+    RESPONSE_ADAPTERS['null_tool'] = (() => null) as unknown as (body: unknown) => RawItem[];
+    try {
+      expect(extractItems('null_tool', { results: [{ url: 'https://a.example' }] }).length).toBe(1);
+    } finally {
+      if (original === undefined) delete RESPONSE_ADAPTERS['null_tool'];
+      else RESPONSE_ADAPTERS['null_tool'] = original;
+    }
   });
 });
 
@@ -321,6 +387,124 @@ describe('mergeItems', () => {
     );
     expect(items.map((i) => i.url)).toEqual(['https://new.example']);
     expect(suppressed).toBe(1);
+  });
+
+  // `providers` carries one entry per backend, and RRF depends on it: the
+  // spec's ordering rationale is "appearing high on several lists beats
+  // appearing first on one", so a backend counted twice reads as agreement
+  // between two providers that does not exist. A lane returning the same
+  // document twice (pagination, a decorated duplicate) is the cheap way to
+  // reach it.
+  it('counts one backend once when its own lane returns the same document twice', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [['https://example.com/a'], ['https://www.example.com/a?utm_source=x']]),
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.providers).toHaveLength(1);
+    // The best (lowest) resultRank survives, so a document a provider ranked
+    // first is not demoted by the same provider also listing it further down.
+    expect(items[0]?.providers[0]?.resultRank).toBe(1);
+    expect(items[0]?.score).toBeCloseTo(1 / (RRF_K + 1), 10);
+  });
+
+  // The other route to a duplicated backend, and the one that pays best: pass 2
+  // folds every same-title item into the representative, including several from
+  // a single lane.
+  it('counts one backend once when the cross-host title collapse folds three of its own results', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [
+        ['https://a.example/s', 'Wire Story'],
+        ['https://b.example/s', 'Wire Story'],
+        ['https://c.example/s', 'Wire Story'],
+      ]),
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.providers).toHaveLength(1);
+    expect(items[0]?.score).toBeCloseTo(1 / (RRF_K + 1), 10);
+  });
+
+  // The ordering consequence, stated as the spec states it: real agreement
+  // between two providers must outrank one provider's own redundancy. Before
+  // the distinct-backend fusion the single-lane triple scored 0.0484 against
+  // the genuine pair's 0.0328 and took the top slot.
+  it('ranks a genuine two-provider agreement above one provider repeating itself', () => {
+    const { items } = mergeItems([
+      lane('you', 1, [
+        ['https://a.example/s', 'Wire Story'],
+        ['https://b.example/s', 'Wire Story'],
+        ['https://c.example/s', 'Wire Story'],
+        ['https://real.example/x', 'Genuine Agreement'],
+      ]),
+      lane('exa', 2, [['https://real.example/x', 'Genuine Agreement']]),
+    ]);
+    expect(items[0]?.url).toBe('https://real.example/x');
+    expect(items[0]?.providers.map((p) => p.backendId).sort()).toEqual(['exa', 'you']);
+  });
+
+  // An adapter is hand-transcribed from a captured response, so an item missing
+  // the one field the whole pipeline keys on is a live possibility. Such an item
+  // used to be scored and emitted with `url: undefined`, violating
+  // `ResearchItem.url: string` inside the output document -- worse than a throw,
+  // because nothing announces it.
+  it('skips an item whose url is missing or empty rather than emitting one with no url', () => {
+    const { items } = mergeItems([
+      {
+        backendId: 'you',
+        rank: 1,
+        items: [
+          { title: 'no url' } as unknown as RawItem,
+          { url: '   ', title: 'blank url' },
+          { url: 42 } as unknown as RawItem,
+          { url: 'https://real.example/a', title: 'Real' },
+        ],
+      },
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.url).toBe('https://real.example/a');
+  });
+
+  // `extractItems` only guarantees that an adapter returned an ARRAY, so a
+  // transcription slip like `(body) => [body.result]` against a renamed key
+  // delivers a lane whose ELEMENTS are undefined. Dereferencing one used to
+  // throw straight out of `mergeItems`, which runs after every lane is billed --
+  // so one bad row destroyed a healthy lane's paid-for results too.
+  it('skips null and undefined rows without losing another lane already billed', () => {
+    const { items } = mergeItems([
+      { backendId: 'good', rank: 1, items: [{ url: 'https://paid.example/1', title: 'Paid' }] },
+      {
+        backendId: 'bad',
+        rank: 2,
+        items: [undefined, null, { url: 'https://real.example/a', title: 'Real' }] as unknown as RawItem[],
+      },
+    ]);
+    expect(items.map((i) => i.url).sort()).toEqual(['https://paid.example/1', 'https://real.example/a']);
+  });
+
+  // The same class of breakage one field over, and it reached a different site:
+  // a non-string title threw inside `titleKey` during pass 2, with the same
+  // whole-round blast radius. The url is what the pipeline keys on, so a bad
+  // title costs only the title -- the item still survives, under the placeholder.
+  it('falls back to the canonical URL when an adapter hands back a non-string title', () => {
+    const { items } = mergeItems([
+      { backendId: 'x', rank: 1, items: [{ url: 'https://a.example', title: 42 }] as unknown as RawItem[] },
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.title).toBe('https://a.example');
+  });
+
+  // Non-throwing variant of the same hole: a non-string optional field used to
+  // reach the emitted document, so `--json` stdout carried an object where
+  // `ResearchItem.snippet?: string` promises a string.
+  it('drops a non-string snippet or publishedAt rather than emitting it', () => {
+    const { items } = mergeItems([
+      {
+        backendId: 'x',
+        rank: 1,
+        items: [{ url: 'https://a.example', snippet: {}, publishedAt: 7 }] as unknown as RawItem[],
+      },
+    ]);
+    expect(items[0]?.snippet).toBeUndefined();
+    expect(items[0]?.publishedAt).toBeUndefined();
   });
 
   // Equal `resultRank` across two lanes is the only way to produce identical RRF

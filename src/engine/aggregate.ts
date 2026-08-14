@@ -18,11 +18,29 @@ export interface RawItem {
   publishedAt?: string;
 }
 
-/** Query parameters that identify a click, not a document. Removing them is
- * what makes the same page found via two providers dedupe to one item. */
+/**
+ * Query parameters that identify a click, not a document. Removing them is
+ * what makes the same page found via two providers dedupe to one item.
+ *
+ * Every entry beyond the spec's list (`utm_*`, `gclid`, `fbclid`, `mc_eid`,
+ * `ref`, `ref_src`) is a VENDOR-NAMESPACED click id -- `msclkid` (Microsoft),
+ * `mc_cid` (Mailchimp campaign), `igshid` (Instagram), `yclid` (Yandex),
+ * `dclid` (DoubleClick), `_hsenc`/`_hsmi` (HubSpot). None of them can select
+ * content: no server branches on them, so dropping them can only ever merge two
+ * spellings of one document, never two documents. Recorded as a deviation under
+ * the plan's Task 4.
+ *
+ * `source` and `referrer` are deliberately ABSENT, and must not be added back.
+ * They are ordinary English words, and real sites route on them (a feed
+ * variant, a localized edition, a print view), so stripping them merges pages
+ * that are genuinely different and demotes a billed result onto `duplicates`.
+ * The asymmetry decides it: failing to merge two spellings costs a duplicate
+ * row a caller can see, while merging two documents destroys one of them
+ * silently.
+ */
 const TRACKING_PARAMS = [
   'gclid', 'fbclid', 'msclkid', 'mc_eid', 'mc_cid', 'igshid',
-  'ref', 'ref_src', 'referrer', 'source', 'yclid', 'dclid', '_hsenc', '_hsmi',
+  'ref', 'ref_src', 'yclid', 'dclid', '_hsenc', '_hsmi',
 ];
 // Frozen for the same reason heuristic.ts freezes RECENCY_PHRASES: this table
 // defines a deterministic transform, and a table a caller could push to at run
@@ -50,6 +68,24 @@ const FIELD_CANDIDATES = {
 // type. Field precedence is a contract; it must not be re-orderable at run time.
 for (const names of Object.values(FIELD_CANDIDATES)) Object.freeze(names);
 Object.freeze(FIELD_CANDIDATES);
+
+/**
+ * Longest snippet kept on a `RawItem`, in characters.
+ *
+ * The bound is on the emitted string, ellipsis included, not on the text
+ * retained beneath it -- a cap a caller can read off the output is worth more
+ * than one that is a character short of what it says.
+ *
+ * A snippet is a preview, not a document: a real SERP snippet is 150-300
+ * characters, so 500 keeps every genuine one intact. The cap exists because
+ * `content` is a snippet candidate and the Firecrawl-family backends put a
+ * whole page's markdown in it -- a 200,000-character "snippet" is reachable
+ * today, and one `research` round at fanout 8 across such providers emits a
+ * multi-megabyte `--json` document that no agent can read and every consumer
+ * has to buffer. Capping per item rather than per document keeps the bound
+ * true however many providers answer.
+ */
+export const SNIPPET_MAX_CHARS = 500;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -137,7 +173,17 @@ function toRawItem(entry: unknown): RawItem | undefined {
   const url = firstString(entry, FIELD_CANDIDATES.url);
   if (url === undefined) return undefined;
   const title = firstString(entry, FIELD_CANDIDATES.title);
-  const snippet = firstString(entry, FIELD_CANDIDATES.snippet);
+  const full = firstString(entry, FIELD_CANDIDATES.snippet);
+  // The ellipsis is the whole point of not slicing silently: a truncated
+  // preview that ends mid-sentence with no marker reads as a provider that
+  // returned a broken snippet, and someone then goes looking for a bug in the
+  // provider rather than finding this cap. It costs one character of text
+  // rather than being added on top, so the emitted string honours the cap the
+  // constant declares instead of overrunning it by one.
+  const snippet =
+    full !== undefined && full.length > SNIPPET_MAX_CHARS
+      ? `${full.slice(0, SNIPPET_MAX_CHARS - 1)}…`
+      : full;
   const publishedAt = firstString(entry, FIELD_CANDIDATES.publishedAt);
   return {
     url,
@@ -192,12 +238,22 @@ export const RESPONSE_ADAPTERS: Record<string, ResponseAdapter> = {};
  * An adapter that throws falls back to the sniffer rather than failing the
  * round. The response was already billed; discarding it because our own
  * transcription of a shape went stale is the worst possible trade.
+ *
+ * A non-array return is treated exactly like a throw, and has to be: adapters
+ * are hand-transcribed from captured responses, so `return body.results` on a
+ * body that turned out to have no `results` -- yielding `undefined`, not an
+ * exception -- is the single likeliest transcription mistake there is. Left
+ * unchecked it becomes `lane.items`, where `mergeItems`'s `forEach` throws and
+ * takes down EVERY lane's already-paid-for results, not just this one. The
+ * `Array.isArray` test is a type guard as much as a value check: `RawItem[]` is
+ * a compile-time promise an adapter is under no runtime obligation to keep.
  */
 export function extractItems(tool: string, body: unknown): RawItem[] {
   const adapter = RESPONSE_ADAPTERS[tool];
   if (adapter !== undefined) {
     try {
-      return adapter(body);
+      const out: unknown = adapter(body);
+      return Array.isArray(out) ? (out as RawItem[]) : sniffItems(body);
     } catch {
       return sniffItems(body);
     }
@@ -205,13 +261,53 @@ export function extractItems(tool: string, body: unknown): RawItem[] {
   return sniffItems(body);
 }
 
-/** Which provider contributed an item, and where it sat on that provider's own list. */
+/**
+ * Which provider contributed an item, and where it sat on that provider's own list.
+ *
+ * INVARIANT, on every `ProviderHit[]` this module produces: **at most one entry
+ * per `backendId`**, carrying that backend's best (lowest) `resultRank`.
+ * `providers.length` is therefore literally the number of distinct providers
+ * that returned the document, which is what both the RRF score and Task 7's
+ * agreement arithmetic read it as. Two paths would otherwise duplicate a
+ * backend -- one lane returning the same canonical URL twice, and the pass-2
+ * title collapse folding several of one lane's items together -- and either
+ * turns one provider's redundancy into fabricated agreement. `recordHit` is the
+ * only way to extend such an array; see its comment.
+ */
 export interface ProviderHit {
   backendId: string;
   /** The provider's rank in the fan-out (diversity order position, 1-based). */
   rank: number;
   /** This item's 1-based position within that provider's own results. */
   resultRank: number;
+}
+
+/**
+ * Adds `hit` under the one-entry-per-backend invariant declared on `ProviderHit`.
+ *
+ * The best (lowest) `resultRank` wins, because that is what the RRF term means:
+ * how highly this provider ranked the document. A provider that listed a page
+ * first and again at position 9 ranked it first; taking the later position, or
+ * summing both, would score its own redundancy as either a demotion or an
+ * endorsement. `rank` moves with `resultRank` rather than being kept
+ * independently, so the surviving hit is one provider's actual answer and not a
+ * splice of two.
+ *
+ * A linear scan, not a Map: `providers` is bounded by the fan-out width
+ * (`MAX_FANOUT = 10`), so the scan is cheaper than the Map it would replace and
+ * keeps the array's order -- first-contributing backend first -- which is what
+ * makes the emitted document byte-stable for a given lane order.
+ */
+function recordHit(providers: ProviderHit[], hit: ProviderHit): void {
+  const existing = providers.find((p) => p.backendId === hit.backendId);
+  if (existing === undefined) {
+    providers.push(hit);
+    return;
+  }
+  if (hit.resultRank < existing.resultRank) {
+    existing.rank = hit.rank;
+    existing.resultRank = hit.resultRank;
+  }
 }
 
 export interface ResearchItem {
@@ -294,6 +390,42 @@ function hostOf(url: string): string | undefined {
 }
 
 /**
+ * One lane row reduced to the fields this module may actually rely on, or
+ * `undefined` when the row carries nothing usable.
+ *
+ * `RawItem` is a compile-time promise, and an adapter is the one producer that
+ * can break it: hand-transcribed from a captured response, `body.results.map(r
+ * => ({url: r.url, title: r.title}))` against a body whose keys were renamed
+ * yields rows that are `undefined`, or whose `title` is a number, or whose
+ * `snippet` is an object. `extractItems` only checks that the adapter returned
+ * an ARRAY -- element-wise the contents are still whatever the provider had --
+ * so the elements have to be checked here, once, at the only place they enter.
+ *
+ * The blast radius is why this is a guard and not an assumption: `mergeItems`
+ * runs after every lane has been billed, so one bad row throwing out of it
+ * (`raw.url` on `undefined`, `title.toLowerCase` on a number in pass 2)
+ * destroys EVERY other lane's paid-for results, not just this one.
+ *
+ * A row with no usable url is dropped rather than repaired -- an item with no
+ * URL cannot be deduped, cited or fetched -- while a bad optional field only
+ * costs that field, because a title or snippet is not what the pipeline keys
+ * on. `url` is passed through untrimmed: `canonicalizeUrl` already tolerates
+ * surrounding whitespace, and `duplicates` must report the string the provider
+ * actually sent.
+ */
+function sanitizeRow(entry: unknown): RawItem | undefined {
+  if (!isRecord(entry)) return undefined;
+  const { url, title, snippet, publishedAt } = entry;
+  if (typeof url !== 'string' || url.trim() === '') return undefined;
+  return {
+    url,
+    ...(typeof title === 'string' ? { title } : {}),
+    ...(typeof snippet === 'string' ? { snippet } : {}),
+    ...(typeof publishedAt === 'string' ? { publishedAt } : {}),
+  };
+}
+
+/**
  * Merges every lane's results into one ordered, deduplicated set.
  *
  * Two passes, in this order:
@@ -315,6 +447,17 @@ function hostOf(url: string): string | undefined {
  * `seenUrls` (canonical) are dropped entirely -- that is what makes a
  * multi-round research session return only new material instead of re-paying
  * for the same links.
+ *
+ * **`lanes` ORDER IS PART OF THE INPUT, and the caller owns it.** This function
+ * is pure and deterministic *given its argument*, but not order-independent: in
+ * both passes the first-seen item becomes the representative, so which of two
+ * merged URLs survives -- and therefore what the output document says -- is
+ * decided by lane position. A bounded concurrency pool appends lanes in
+ * COMPLETION order by default, which is a race, so the executor must assemble
+ * this array in a deterministic order (plan order: query, then diversity
+ * position) rather than in the order the network answered. Sorting here instead
+ * was rejected: a lane's identity is `(query, diversity rank)` and this module
+ * is deliberately not told about queries.
  */
 export function mergeItems(
   lanes: readonly LaneItems[],
@@ -329,7 +472,15 @@ export function mergeItems(
   const suppressedUrls = new Set<string>();
 
   for (const lane of lanes) {
-    lane.items.forEach((raw, index) => {
+    lane.items.forEach((entry, index) => {
+      // Validated before anything is read off it, and validated ONCE: see
+      // `sanitizeRow` for why an adapter's rows cannot be trusted element-wise
+      // and what a bad one used to cost. Everything below this line works on
+      // the sanitized row, so no later site has to re-check a field. The index
+      // still advances over a dropped row, so the surviving items keep the
+      // provider's own ranking.
+      const raw = sanitizeRow(entry);
+      if (raw === undefined) return;
       const canonical = canonicalizeUrl(raw.url);
       if (seenUrls.has(canonical)) {
         suppressedUrls.add(canonical);
@@ -349,7 +500,10 @@ export function mergeItems(
         });
         return;
       }
-      existing.providers.push(hit);
+      // Via `recordHit`, not `push`: this same lane may have listed the same
+      // document twice (pagination, a decorated duplicate), and a backend
+      // counted twice reads downstream as two providers agreeing.
+      recordHit(existing.providers, hit);
       if (raw.url !== canonical && !existing.duplicates.includes(raw.url)) existing.duplicates.push(raw.url);
       // Keep the richest text: a provider that returned a snippet is more
       // useful than one that returned only a link, whichever arrived first.
@@ -393,7 +547,11 @@ export function mergeItems(
     const host = hostOf(item.url);
     if (entry !== undefined && host !== undefined && !entry.hosts.has(host)) {
       entry.hosts.add(host);
-      entry.rep.providers.push(...item.providers);
+      // The second place a backend can be counted twice, and the one that pays
+      // best: one lane's own results for a wire story carried by six outlets
+      // all fold in here, so a plain `push(...)` scored a single provider as
+      // six. `recordHit` per hit keeps the invariant and the best rank.
+      for (const hit of item.providers) recordHit(entry.rep.providers, hit);
       // No membership guard here, unlike the pass-1 push above: `item` and
       // `entry.rep` sit under distinct canonical URLs, and canonicalization is a
       // function, so no original URL can appear under both -- their duplicate
@@ -407,6 +565,13 @@ export function mergeItems(
     merged.push(item);
   }
 
+  // One term per DISTINCT backend, which is what `ProviderHit`'s invariant
+  // makes this reduce mean: RRF's premise is that appearing high on several
+  // lists beats appearing first on one, so the sum has to run over lists, not
+  // over hits. Summed over hits, one provider returning a wire story from three
+  // outlets scored 0.0484 and outranked a real two-provider agreement at
+  // 0.0328 -- the ranking signal inverted by the redundancy it was supposed to
+  // see through.
   for (const item of merged) {
     item.score = item.providers.reduce((sum, hit) => sum + 1 / (RRF_K + hit.resultRank), 0);
   }
