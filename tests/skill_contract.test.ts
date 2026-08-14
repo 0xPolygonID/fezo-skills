@@ -29,7 +29,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { runCli } from '../src/cli.js';
-import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS } from '../src/engine/steering.js';
+import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS, RESEARCH_DESCRIPTIONS } from '../src/engine/steering.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..');
@@ -484,6 +484,37 @@ describe('skills/fezo/SKILL.md generated content', () => {
     // The capabilities no one-step command covers (news/social/proxy) are only
     // reachable this way, so the step that routes there must name the command.
     expect(procedure).toContain('`providers --intent <intent>`');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 13: the `research` contract. Same "these agree" principle as the
+// ONE_STEP_DESCRIPTIONS block above, but the descriptions are asserted
+// against the RAW file (`skillMd`), not `skillMdFlat`: `plan`/`research`'s
+// sentences are deliberately embedded unwrapped (see gen-skill.mjs's
+// renderResearchSection), so a wrapped copy sneaking back in would mean the
+// exact sentence no longer appears anywhere in the file and this test would
+// catch it. The regex assertions below check the harder-to-verify-by-eye
+// property: that the section actually tells the agent to decompose a
+// research-depth prompt itself and to act on reported coverage gaps, not just
+// that the section exists.
+// ---------------------------------------------------------------------------
+
+describe('SKILL.md research contract', () => {
+  it('documents every research command description verbatim', () => {
+    for (const description of Object.values(RESEARCH_DESCRIPTIONS)) {
+      expect(skillMd).toContain(description);
+    }
+  });
+
+  it('tells the agent to plan explicitly for research-depth prompts', () => {
+    expect(skillMd).toMatch(/--queries/);
+    expect(skillMd).toMatch(/decompos/i);
+  });
+
+  it('tells the agent to act on coverage gaps', () => {
+    expect(skillMd).toMatch(/gaps/);
+    expect(skillMd).toMatch(/--session/);
   });
 });
 

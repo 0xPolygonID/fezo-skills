@@ -1,0 +1,4 @@
+{
+  "plan": "Show what routing a prompt would get — intents, queries, depth, fan-out width — without calling anything.",
+  "research": "Fan one prompt out to several providers at once and return one deduplicated, source-attributed result set with a coverage report."
+}

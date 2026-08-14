@@ -4573,7 +4573,11 @@ git commit -m "feat: calibrate response adapters against captured provider bodie
 After Task 14, verify end to end against a live gateway:
 
 ```bash
-node dist/fezoctl.mjs plan "compare pricing of vercel.com and netlify.com"
+# Full URLs, not bare domains: the heuristic detects http(s) URLs only, on the
+# stated ground that a bare "vercel.com" is more often a topic than a fetch
+# target and guessing wrong spends a call on the wrong intent. A bare-domain
+# prompt correctly plans as a search.
+node dist/fezoctl.mjs plan "compare https://vercel.com/pricing and https://netlify.com/pricing"
 node dist/fezoctl.mjs research "state of solid-state battery commercialisation" --depth research --session v-1 --json
 node dist/fezoctl.mjs research "solid-state battery pilot production lines 2026" --session v-1 --json
 ```

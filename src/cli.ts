@@ -87,7 +87,7 @@ import { classifyFailure, run } from './engine/retry.js';
 import type { ValidationResult } from './engine/schema.js';
 import { SchemaValidatorCache, validateArgs } from './engine/schema.js';
 import { loadSession, saveSession, validateSessionId } from './engine/session.js';
-import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS } from './engine/steering.js';
+import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS, RESEARCH_COMMANDS, RESEARCH_DESCRIPTIONS } from './engine/steering.js';
 import { findCandidateByToolName } from './engine/tool-name.js';
 
 // ---------------------------------------------------------------------------
@@ -429,14 +429,14 @@ const HELP_WRAP_COLUMNS = 78;
  * splicing three ~150-column sentences into a hand-wrapped paragraph is what
  * this block previously did, which read as one interrupted sentence.
  */
-function oneStepHelpBlock(): string {
-  const labelWidth = Math.max(...ONE_STEP_COMMANDS.map((name) => name.length));
+function descriptionHelpBlock(names: readonly string[], descriptions: Record<string, string>): string {
+  const labelWidth = Math.max(...names.map((name) => name.length));
   const indent = ' '.repeat(2 + labelWidth + 2);
   const lines: string[] = [];
-  for (const name of ONE_STEP_COMMANDS) {
+  for (const name of names) {
     let line = `  ${name.padEnd(labelWidth)}  `;
     let placed = false;
-    for (const word of ONE_STEP_DESCRIPTIONS[name].split(' ')) {
+    for (const word of (descriptions[name] ?? '').split(' ')) {
       // An over-long word still goes on an empty line rather than producing a
       // blank line followed by the same over-long word — hence the `placed`
       // guard instead of a pure width test.
@@ -451,6 +451,24 @@ function oneStepHelpBlock(): string {
     lines.push(line);
   }
   return lines.join('\n');
+}
+
+/** The three one-step command descriptions as their own labelled block. */
+function oneStepHelpBlock(): string {
+  return descriptionHelpBlock(ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS);
+}
+
+/**
+ * The two routing command descriptions, same treatment and same reason.
+ *
+ * Rendered from `RESEARCH_DESCRIPTIONS` rather than restated here: that table's
+ * docstring promises `--help` and `skills/fezo/SKILL.md` cannot describe
+ * `plan`/`research` differently, and a hand-written paragraph in this file --
+ * which is what stood here first -- makes that promise false the moment either
+ * copy is edited alone.
+ */
+function researchHelpBlock(): string {
+  return descriptionHelpBlock(RESEARCH_COMMANDS, RESEARCH_DESCRIPTIONS);
 }
 
 const HELP_TEXT = `fezoctl — discover and call Fezo gateway tools from the live catalog
@@ -523,12 +541,12 @@ already in flight, which would discard a result already billed) and reports
 whichever candidate answered last. Deny-listed and not-recommended providers
 are never attempted by any of the three commands.
 
-research fans one prompt out to several providers at once and returns a
-single deduplicated, source-attributed result set with a coverage report.
-\`plan\` shows what routing a prompt would get without calling anything. Depth
-sets the width (shallow 2, standard 4, research 8 providers per query);
---session <id> makes a follow-up round exclude what an earlier round already
-returned.
+${researchHelpBlock()}
+
+Depth sets the fan-out width (shallow 2, standard 4, research 8 providers per
+query), and every provider in that width is a billed call. --session <id>
+makes a follow-up round exclude what an earlier round already returned, so a
+multi-round investigation does not re-pay for links it already has.
 
 What each one is for (the same sentences skills/fezo/SKILL.md uses):
 

@@ -10884,6 +10884,12 @@ var one_step_descriptions_default = {
   crawl: 'Discover and collect many pages from one site in a single call. Picks the best-value provider for "crawl" and falls back down the ranking on a block or a rate limit.'
 };
 
+// src/engine/research-descriptions.json
+var research_descriptions_default = {
+  plan: "Show what routing a prompt would get \u2014 intents, queries, depth, fan-out width \u2014 without calling anything.",
+  research: "Fan one prompt out to several providers at once and return one deduplicated, source-attributed result set with a coverage report."
+};
+
 // src/engine/steering.ts
 function successFooter(provider, intent, rank) {
   return `Served by ${provider} (rank ${String(rank)} of ${intent}). For a different provider, more options, or a capability no one-step command covers (news, social, proxy), run \`fezoctl providers --intent ${intent}\`.`;
@@ -10895,6 +10901,10 @@ var ONE_STEP_COMMANDS = ["web-search", "scrape", "crawl"];
 var ONE_STEP_DESCRIPTIONS = one_step_descriptions_default;
 Object.freeze(ONE_STEP_DESCRIPTIONS);
 Object.freeze(ONE_STEP_COMMANDS);
+var RESEARCH_COMMANDS = ["plan", "research"];
+var RESEARCH_DESCRIPTIONS = research_descriptions_default;
+Object.freeze(RESEARCH_DESCRIPTIONS);
+Object.freeze(RESEARCH_COMMANDS);
 
 // src/engine/render.ts
 function toJson(value) {
@@ -11700,14 +11710,14 @@ var EXIT_USAGE = 1;
 var EXIT_OPERATIONAL = 2;
 var DEFAULT_PROVIDERS_LIMIT = 5;
 var HELP_WRAP_COLUMNS = 78;
-function oneStepHelpBlock() {
-  const labelWidth = Math.max(...ONE_STEP_COMMANDS.map((name) => name.length));
+function descriptionHelpBlock(names, descriptions) {
+  const labelWidth = Math.max(...names.map((name) => name.length));
   const indent = " ".repeat(2 + labelWidth + 2);
   const lines = [];
-  for (const name of ONE_STEP_COMMANDS) {
+  for (const name of names) {
     let line = `  ${name.padEnd(labelWidth)}  `;
     let placed = false;
-    for (const word of ONE_STEP_DESCRIPTIONS[name].split(" ")) {
+    for (const word of (descriptions[name] ?? "").split(" ")) {
       if (placed && line.length + 1 + word.length > HELP_WRAP_COLUMNS) {
         lines.push(line);
         line = indent + word;
@@ -11719,6 +11729,12 @@ function oneStepHelpBlock() {
     lines.push(line);
   }
   return lines.join("\n");
+}
+function oneStepHelpBlock() {
+  return descriptionHelpBlock(ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS);
+}
+function researchHelpBlock() {
+  return descriptionHelpBlock(RESEARCH_COMMANDS, RESEARCH_DESCRIPTIONS);
 }
 var HELP_TEXT = `fezoctl \u2014 discover and call Fezo gateway tools from the live catalog
 
@@ -11790,12 +11806,12 @@ already in flight, which would discard a result already billed) and reports
 whichever candidate answered last. Deny-listed and not-recommended providers
 are never attempted by any of the three commands.
 
-research fans one prompt out to several providers at once and returns a
-single deduplicated, source-attributed result set with a coverage report.
-\`plan\` shows what routing a prompt would get without calling anything. Depth
-sets the width (shallow 2, standard 4, research 8 providers per query);
---session <id> makes a follow-up round exclude what an earlier round already
-returned.
+${researchHelpBlock()}
+
+Depth sets the fan-out width (shallow 2, standard 4, research 8 providers per
+query), and every provider in that width is a billed call. --session <id>
+makes a follow-up round exclude what an earlier round already returned, so a
+multi-round investigation does not re-pay for links it already has.
 
 What each one is for (the same sentences skills/fezo/SKILL.md uses):
 
