@@ -369,6 +369,33 @@ answered inconsistently, and each is now enforced by code and a test:
   file is read and rewritten every round, and the oldest entries are the ones a
   follow-up is least likely to re-encounter.
 
+## Task 14 outcome: the sniffer needed no adapters
+
+Run against the live gateway on 2026-08-14, capturing one real response per
+search-shaped entry method (`build/capture-responses.mjs`, 7 tools, 6 billed
+calls; `newsapi_articles` failed pre-flight — see below).
+
+**`RESPONSE_ADAPTERS` stays empty.** The generic sniffer read every captured
+body — You.com, Exa, Brave (web and news), Firecrawl, Geonode — producing
+well-formed URLs and plausible result counts for all six. That is the outcome
+the adapter mechanism was designed to make unnecessary, and it is now pinned by
+`tests/aggregate-fixtures.test.ts`, which fails loudly the day a provider's
+shape drifts out of the sniffer's reach.
+
+**One real gap the capture found**, which no synthetic test would have:
+`newsapi_articles` declares `keyword` as `{type: 'array', items: {type:
+'string'}}`. `resolveArgName` matches on name alone, so the fan-out built
+`{keyword: "..."}`, which fails that method's own schema at pre-flight — the
+rank-1 `news` provider was unreachable while still consuming a budgeted slot.
+The executor now sends a single query as a one-element array when the schema
+declares one. Not a guess: the schema says array-of-string and the property is
+a declared query synonym, so only arity was ever in question.
+
+A live `--depth research` round then reached **six providers on six billed
+calls and returned 51 deduplicated, attributed items**, with cross-provider
+agreement visible in the top-ranked results; a second round in the same session
+returned 1 new item and suppressed 49.
+
 ## Testing
 
 - `plan.test.ts` — merge precedence, schema rejection, cap enforcement,

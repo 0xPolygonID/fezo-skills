@@ -10734,6 +10734,12 @@ function nextActions(coverage, sessionId, aborted) {
 
 // src/engine/research.ts
 var RESEARCH_CONCURRENCY = 6;
+function isArrayTyped(inputSchema, property) {
+  const props = inputSchema.properties;
+  const declared = props?.[property];
+  if (declared === null || typeof declared !== "object") return false;
+  return declared.type === "array";
+}
 function lanesForQuery(query, plan, candidates, excluded) {
   const byTool = new Map(candidates.map((c) => [c.tool, c]));
   const intents = plan.intents.filter((intent) => intent !== "scrape" && intent !== "crawl");
@@ -10757,7 +10763,14 @@ function lanesForQuery(query, plan, candidates, excluded) {
       inCatalog = true;
       const argName = resolveArgName(candidate.inputSchema, "query");
       if (argName === void 0) continue;
-      lanes.push({ query, backendId: rec.backendId, rank: lanes.length + 1, candidate, argName });
+      lanes.push({
+        query,
+        backendId: rec.backendId,
+        rank: lanes.length + 1,
+        candidate,
+        argName,
+        argIsArray: isArrayTyped(candidate.inputSchema, argName)
+      });
       resolved2 = true;
       break;
     }
@@ -10849,7 +10862,7 @@ async function runResearch(options) {
       baseUrl: gateway.baseUrl,
       apiKey: gateway.apiKey,
       candidates: [lane2.candidate],
-      args: { [lane2.argName]: lane2.query },
+      args: { [lane2.argName]: lane2.argIsArray ? [lane2.query] : lane2.query },
       maxAttempts: 1,
       ...gateway.fetchFn !== void 0 ? { fetchFn: gateway.fetchFn } : {}
     });

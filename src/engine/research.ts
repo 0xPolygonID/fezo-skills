@@ -78,6 +78,37 @@ interface Lane {
   rank: number;
   candidate: ToolCandidate;
   argName: string;
+  /** True when the resolved argument is declared `type: "array"`, so the
+   * caller's single query string must be sent as a one-element array. */
+  argIsArray: boolean;
+}
+
+/**
+ * Whether `property` on `inputSchema` is declared as an array.
+ *
+ * Exists because `resolveArgName` matches on NAME alone, and at least one
+ * ranked provider names its query argument something ARG_CANDIDATES knows while
+ * typing it as an array: `newsapi_articles` declares
+ * `keyword: {type: 'array', items: {type: 'string'}}`. Sending it a bare string
+ * fails that method's own schema at pre-flight, so the lane is skipped and
+ * `newsapi` -- rank 1 for `news` -- is unreachable from a fan-out that
+ * nonetheless budgeted a slot for it. Found by capturing real responses
+ * (build/capture-responses.mjs), which is exactly what that exercise is for.
+ *
+ * one-step.ts's ARG_CANDIDATES doc anticipated this case and chose to
+ * fail-closed rather than guess. Wrapping is not a guess here: the schema says
+ * array-of-string and the property is a declared query synonym, so the only
+ * open question was arity. Deliberately NOT applied to one-step.ts, whose
+ * ranked walk is a shipped, separately-reviewed path.
+ *
+ * Read defensively: `inputSchema` is `object`-typed catalog data, ultimately
+ * backend-supplied.
+ */
+function isArrayTyped(inputSchema: object, property: string): boolean {
+  const props = (inputSchema as { properties?: Record<string, unknown> }).properties;
+  const declared = props?.[property];
+  if (declared === null || typeof declared !== 'object') return false;
+  return (declared as { type?: unknown }).type === 'array';
 }
 
 /** Resolves the provider lanes for one query, in diversity order. */
@@ -145,7 +176,10 @@ function lanesForQuery(
       inCatalog = true;
       const argName = resolveArgName(candidate.inputSchema, 'query');
       if (argName === undefined) continue;
-      lanes.push({ query, backendId: rec.backendId, rank: lanes.length + 1, candidate, argName });
+      lanes.push({
+        query, backendId: rec.backendId, rank: lanes.length + 1, candidate, argName,
+        argIsArray: isArrayTyped(candidate.inputSchema, argName),
+      });
       resolved = true;
       break;
     }
@@ -400,7 +434,7 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
       baseUrl: gateway.baseUrl,
       apiKey: gateway.apiKey,
       candidates: [lane.candidate],
-      args: { [lane.argName]: lane.query },
+      args: { [lane.argName]: lane.argIsArray ? [lane.query] : lane.query },
       maxAttempts: 1,
       ...(gateway.fetchFn !== undefined ? { fetchFn: gateway.fetchFn } : {}),
     });

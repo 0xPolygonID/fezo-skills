@@ -1,0 +1,67 @@
+{
+  "requestId": "1227874da5183fb52968093c9f0d8c26",
+  "resolvedSearchType": "",
+  "results": [
+    {
+      "id": "https://link.springer.com/article/10.1007/s43937-026-00166-z",
+      "title": "A comparative and technological review of energy storage technologies for renewable power systems | Discover Energy | Springer Nature Link",
+      "url": "https://link.springer.com/article/10.1007/s43937-026-00166-z",
+      "publishedDate": "2026-07-14T00:00:00.000Z"
+    },
+    {
+      "id": "https://www.irena.org/energy-transition/Technology/Energy-Storage",
+      "title": "Energy Storage",
+      "url": "https://www.irena.org/energy-transition/Technology/Energy-Storage"
+    },
+    {
+      "id": "https://www.epa.gov/energy/electricity-storage",
+      "title": "Electricity Storage | US EPA",
+      "url": "https://www.epa.gov/energy/electricity-storage",
+      "publishedDate": "2026-07-14T00:00:00.000Z"
+    },
+    {
+      "id": "https://www.irena.org/Energy-Transition/Technology/Energy-Storage",
+      "title": "Energy Storage - IRENA",
+      "url": "https://www.irena.org/Energy-Transition/Technology/Energy-Storage"
+    },
+    {
+      "id": "https://www.iea.org/reports/global-energy-review-2026/technology-battery-storage",
+      "title": "Technology: Battery storage – Global Energy Review 2026 – Analysis - IEA",
+      "url": "https://www.iea.org/reports/global-energy-review-2026/technology-battery-storage"
+    },
+    {
+      "id": "https://www.iso.org/renewable-energy/storage",
+      "title": "Energy storage: Powering the future of renewable energy - ISO",
+      "url": "https://www.iso.org/renewable-energy/storage"
+    },
+    {
+      "id": "https://www.mdpi.com/1996-1073/18/3/466",
+      "title": "Long-Duration Energy Storage: A Critical Enabler for Renewable Integration and Decarbonization",
+      "url": "https://www.mdpi.com/1996-1073/18/3/466"
+    },
+    {
+      "id": "https://www.nationalgrid.com/stories/energy-explained/what-is-renewable-energy-storage",
+      "title": "What is renewable energy storage (and why is it ... - National Grid",
+      "url": "https://www.nationalgrid.com/stories/energy-explained/what-is-renewable-energy-storage"
+    },
+    {
+      "id": "https://www.pv-magazine.com/2026/06/09/the-different-options-for-energy-storage/",
+      "title": "The different options for energy storage - pv magazine Global",
+      "url": "https://www.pv-magazine.com/2026/06/09/the-different-options-for-energy-storage/",
+      "publishedDate": "2026-06-09T00:00:00.000Z",
+      "author": "International Electrotechnical Commission (ICE)"
+    },
+    {
+      "id": "https://www.mdpi.com/2071-1050/14/10/5985",
+      "title": "Recent Advances in Energy Storage Systems for Renewable Source Grid Integration: A Comprehensive Review",
+      "url": "https://www.mdpi.com/2071-1050/14/10/5985"
+    }
+  ],
+  "searchTime": 746.7,
+  "costDollars": {
+    "total": 0.007,
+    "search": {
+      "neural": 0.007
+    }
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "success": true,
+  "data": {
+    "web": [
+      {
+        "url": "https://climate.uchicago.edu/news/solving-renewable-energys-sticky-storage-problem/",
+        "title": "Solving renewable energy's sticky storage problem",
+        "description": "Shirley Meng explains the limitations of lithium-ion batteries and explores better alternatives for long-term energy storage in Knowable ...",
+        "position": 1
+      },
+      {
+        "url": "https://cleanpower.org/facts/clean-energy-storage/",
+        "title": "Energy Storage Facts and Information",
+        "description": "Energy storage is the only grid technology that can both store and discharge energy. By storing energy when there is excess supply of renewable energy compared ...",
+        "position": 2
+      },
+      {
+        "url": "https://www.sciencedirect.com/science/article/pii/S2772427125000324",
+        "title": "Storage solutions for renewable energy: A review",
+        "description": "by E Enasel · 2025 · Cited by 170 — This review investigates the integration of renewable energy systems with diverse energy storage technologies to enhance reliability and sustainability.",
+        "position": 3
+      },
+      {
+        "url": "https://www.irena.org/Energy-Transition/Technology/Energy-Storage",
+        "title": "Energy Storage",
+        "description": "Energy storage systems allow energy consumption to be separated in time from the production of energy, whether it be electrical or thermal energy.",
+        "position": 4
+      },
+      {
+        "url": "https://www.nationalgrid.com/stories/energy-explained/what-is-renewable-energy-storage",
+        "title": "What is renewable energy storage (and why is it important ...",
+        "description": "Establishing a new grid supply point near Little Horsted, connected to UK Power Networks' Lewes substation via new underground electricity cables.",
+        "position": 5
+      },
+      {
+        "url": "https://www.enel.com/learning-hub/storage",
+        "title": "Energy storage",
+        "description": "Energy storage systems allow you to maximize the power of various clean energy sources: discover how the process works and what the benefits are!",
+        "position": 6
+      },
+      {
+        "url": "https://www.cfr.org/education/learn/reading/energy-storage-climate-change",
+        "title": "Why Energy Storage is Essential for a Green Transition",
+        "description": "Pumped hydropower is the most widely used energy storage technique today, accounting for more than 90 percent of the world's energy storage.",
+        "position": 7
+      },
+      {
+        "url": "https://blog.rgbsi.com/6-storage-technologies-renewable-energy",
+        "title": "6 Key Storage Technologies for Renewable Energy",
+        "description": "6 Key Storage Technologies for Renewable Energy · 1. Batteries · 2. Pumped Hydropower · 3. Hydrogen · 4. Flywheels · 5. Compressed Air Energy Storage (CAES) · 6 ...",
+        "position": 8
+      },
+      {
+        "url": "https://www.constellation.com/energy-101/energy-innovation/energy-storage.html",
+        "title": "What Is Energy Storage & How Does It Work? - Constellation",
+        "description": "Renewable energy is often intermittent, meaning that it must be stored when it's produced for use later when it is needed. Advances in energy storage may reduce ...",
+        "position": 9
+      },
+      {
+        "url": "https://www.swri.org/markets/energy-environment/power-generation-utilities/conventional-power-generation/energy-storage-systems",
+        "title": "Energy Storage Systems | Southwest Research Institute",
+        "description": "Energy storage systems may include lithium-ion battery banks used with photovoltaic solar arrays, tanks of molten salt that store heat from concentrating solar ...",
+        "position": 10
+      }
+    ]
+  },
+  "creditsUsed": 2,
+  "id": "01a00113-b4be-7568-8659-248efc603e71"
+}
