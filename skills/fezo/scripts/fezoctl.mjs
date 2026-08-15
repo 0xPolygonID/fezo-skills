@@ -10390,7 +10390,7 @@ function canonicalizeUrl(url) {
   } catch {
     return url;
   }
-  parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  parsed.hostname = parsed.hostname.toLowerCase().replace(/^(?:www\.)+/, "");
   parsed.hash = "";
   parsed.username = "";
   parsed.password = "";

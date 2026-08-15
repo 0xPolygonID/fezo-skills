@@ -130,7 +130,19 @@ export function canonicalizeUrl(url: string): string {
   // of *special* schemes (http, https, ws, ...), and leaves an opaque host
   // verbatim, so `custom://EXAMPLE.COM` survives parsing with its case intact.
   // Providers hand us whatever string they stored, schemes included.
-  parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  // ALL leading `www.` labels, not one. `replace(/^www\./, '')` strips a single
+  // prefix, which makes this whole function NON-IDEMPOTENT for a host like
+  // `www.www.example.com`: one pass yields `www.example.com`, a second yields
+  // `example.com`. That matters because the pipeline canonicalizes twice --
+  // `research.ts` merges per query and then merges those merges, and
+  // `seenUrlsFrom` canonicalizes items whose URLs are already canonical. The
+  // second application then produced a DIFFERENT key, so provider attribution
+  // was looked up under a URL that no longer existed, and the session stored a
+  // URL that could never match the next round's suppression check.
+  //
+  // Canonicalization must be idempotent to be composable at all; that property
+  // is pinned by a corpus test rather than left to this comment.
+  parsed.hostname = parsed.hostname.toLowerCase().replace(/^(?:www\.)+/, '');
   parsed.hash = '';
   // Userinfo is stripped, not carried. It is not part of the DOCUMENT's
   // identity -- `https://user:pw@example.com/a` and `https://example.com/a` are

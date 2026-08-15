@@ -376,6 +376,17 @@ answered inconsistently, and each is now enforced by code and a test:
   does not fire for `social`, `proxy`, `other` or `crawl`: an intent that says
   nothing about fetching is not an instruction against it, and `social` is the
   intent most likely to accompany a social-media URL.
+- **Canonicalization is idempotent, and that is a requirement, not a nicety.**
+  The pipeline applies `canonicalizeUrl` more than once to the same value:
+  `runResearch` merges per query and then merges those merges, and
+  `seenUrlsFrom` canonicalizes items that are already canonical. Stripping a
+  single `www.` prefix made the function non-idempotent for a
+  `www.www.example.com` host, so the second pass produced a different key — and
+  a session then stored a URL the next round could never match, silently
+  re-returning a document suppression was paid to withhold. Pinned by a corpus
+  property test and by a two-round executor test, because a single-round
+  assertion cannot see it: what the session stores and what the round emitted
+  agree with each other even when both are wrong.
 - **Session history is bounded** (2000 URLs, 500 queries, newest kept). The
   file is read and rewritten every round, and the oldest entries are the ones a
   follow-up is least likely to re-encounter.

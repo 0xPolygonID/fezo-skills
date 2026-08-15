@@ -1051,3 +1051,39 @@ describe('sniffUrlStrings: the allow-list entries each work', () => {
     },
   );
 });
+
+describe('canonicalizeUrl is idempotent', () => {
+  // A PROPERTY, not a handful of examples, because the pipeline applies this
+  // function more than once to the same value: `research.ts` merges per query
+  // and then merges those merges, and `seenUrlsFrom` canonicalizes items that
+  // are already canonical. A non-idempotent canonicalizer silently produces a
+  // second, different key — which loses provider attribution in the cross-query
+  // merge and writes a session entry that can never match again.
+  //
+  // `www.www.example.com` is the case that was live: `^www\.` stripped one
+  // prefix per pass.
+  const CORPUS = [
+    'https://example.com', 'https://example.com/', 'https://example.com//',
+    'https://www.example.com/a', 'https://www.www.example.com/a',
+    'https://www.WWW.example.com/a', 'https://www.www.www.example.com/a',
+    'https://wwwsomething.com/a', 'https://example.com/a/', 'https://example.com/a//',
+    'https://example.com/a/?b=1', 'https://example.com/a?b=1&a=2',
+    'https://example.com/a?utm_source=x&gclid=1', 'https://user:pw@example.com/a',
+    'https://example.com/a#frag', 'https://EXAMPLE.com/A/', 'https://example.com:443/a/',
+    'https://example.com/%7Euser/', 'https://example.com/a?q=a+b', 'https://example.com/a?q=a%20b',
+    'custom:opaque/path/', 'doc:1234', '/relative/path', 'not a url', '',
+  ];
+
+  it.each(CORPUS)('canonicalize(canonicalize(%s)) === canonicalize(it)', (input) => {
+    const once = canonicalizeUrl(input);
+    expect(canonicalizeUrl(once), `once="${once}"`).toBe(once);
+  });
+
+  it('strips every leading www. label, not just the first', () => {
+    expect(canonicalizeUrl('https://www.www.example.com/a')).toBe('https://example.com/a');
+  });
+
+  it('does not strip a host that merely starts with the letters www', () => {
+    expect(canonicalizeUrl('https://wwwsomething.com/a')).toBe('https://wwwsomething.com/a');
+  });
+});

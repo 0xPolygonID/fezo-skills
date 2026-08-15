@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ToolCandidate } from '../src/engine/catalog.js';
 import type { RoutingPlan } from '../src/engine/plan.js';
 import { MAX_RESEARCH_CALLS } from '../src/engine/plan.js';
-import { runResearch } from '../src/engine/research.js';
+import { runResearch, seenUrlsFrom } from '../src/engine/research.js';
 
 function candidate(backendId: string, method: string): ToolCandidate {
   return {
@@ -943,5 +943,59 @@ describe('runResearch: the target refusal is narrow', () => {
     });
     expect(outcome.documents).toHaveLength(0);
     expect(outcome.coverage.unfetchedTargets[0]?.reason).toMatch(/search-only/);
+  });
+});
+
+describe('runResearch: a doubly-canonicalizable URL survives the composed pipeline', () => {
+  // `www.www.` hosts made `canonicalizeUrl` non-idempotent, and this function
+  // canonicalizes twice — once per query, once across queries — then
+  // `seenUrlsFrom` canonicalizes a third time on the way to the session file.
+  // The symptom was not a crash: attribution was looked up under a URL the
+  // second pass had already changed, so providers silently vanished.
+  const body = (url: string) =>
+    new Response(JSON.stringify({ results: [{ url, title: 'A' }] }), { status: 200 });
+
+  it('keeps provider attribution', async () => {
+    const fetchFn = routedFetch({
+      you: [body('https://www.www.example.com/a')],
+      exa: [body('https://www.www.example.com/a')],
+      brave: [results([])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha'], fanout: 3 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.items).toHaveLength(1);
+    expect(outcome.items[0]?.url).toBe('https://example.com/a');
+    expect(outcome.items[0]?.providers.map((p) => p.backendId).sort()).toEqual(['exa', 'you']);
+  });
+
+  it('is actually suppressed on the next round', async () => {
+    // TWO ROUNDS, deliberately. A single-round assertion cannot see this: what
+    // the session stores and what the round emitted agree with each other even
+    // when both are wrong. The defect only appears when the NEXT round
+    // canonicalizes the provider's original URL once and compares it against a
+    // stored URL that had been canonicalized twice.
+    const round = async (seenUrls?: ReadonlySet<string>) =>
+      runResearch({
+        plan: plan({ queries: ['alpha'], fanout: 3 }),
+        candidates: CANDIDATES,
+        excluded: [],
+        gateway: {
+          ...gateway,
+          fetchFn: routedFetch({
+            you: [body('https://www.www.example.com/a')],
+            exa: [results([])],
+            brave: [results([])],
+          }),
+        },
+        ...(seenUrls !== undefined ? { seenUrls } : {}),
+      });
+
+    const first = await round();
+    expect(first.items).toHaveLength(1);
+    const second = await round(new Set(seenUrlsFrom(first)));
+    expect(second.items).toHaveLength(0);
+    expect(second.coverage.suppressed).toBe(1);
   });
 });
