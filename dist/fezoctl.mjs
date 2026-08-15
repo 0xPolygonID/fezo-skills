@@ -10397,8 +10397,8 @@ function canonicalizeUrl(url) {
   const params = [...parsed.searchParams.entries()].filter(([key]) => !key.toLowerCase().startsWith("utm_") && !TRACKING_PARAMS.includes(key.toLowerCase())).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
   parsed.search = "";
   for (const [key, value] of params) parsed.searchParams.append(key, value);
-  if (parsed.pathname.endsWith("/") && parsed.pathname !== "/") {
-    parsed.pathname = parsed.pathname.slice(0, -1);
+  if (parsed.pathname !== "/") {
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
   }
   let out = parsed.toString();
   if (out.endsWith("/")) out = out.slice(0, -1);

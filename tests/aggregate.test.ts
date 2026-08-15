@@ -1086,4 +1086,29 @@ describe('canonicalizeUrl is idempotent', () => {
   it('does not strip a host that merely starts with the letters www', () => {
     expect(canonicalizeUrl('https://wwwsomething.com/a')).toBe('https://wwwsomething.com/a');
   });
+
+  it('reaches a fixed point in one pass across a combinatorial corpus', () => {
+    // A FUZZ, because the hand-written list above missed a second instance of
+    // exactly the same defect: the trailing-slash rule also stripped only one
+    // separator, so `/p//?b=1` canonicalized to `/p/?b=1` and then to
+    // `/p?b=1`. Every repeated-token rule in this function is a candidate for
+    // that mistake, and enumerating hosts x paths x queries finds them without
+    // anyone having to think of the case.
+    const hosts = ['a.example', 'www.a.example', 'www.www.a.example', 'WWW.A.example'];
+    const paths = ['', '/', '/p', '/p/', '/p//', '/p///', '/p/q/'];
+    const queries = ['', '?b=1', '?utm_x=1', '?b=1&a=2', '?ref=1&b=2'];
+    for (const host of hosts) {
+      for (const path of paths) {
+        for (const query of queries) {
+          const url = `https://${host}${path}${query}`;
+          const once = canonicalizeUrl(url);
+          expect(canonicalizeUrl(once), `input=${url} once=${once}`).toBe(once);
+        }
+      }
+    }
+  });
+
+  it('collapses a doubled trailing slash even behind a query', () => {
+    expect(canonicalizeUrl('https://a.example/p//?b=1')).toBe('https://a.example/p?b=1');
+  });
 });

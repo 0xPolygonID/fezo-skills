@@ -164,8 +164,14 @@ export function canonicalizeUrl(url: string): string {
   // string-level test sees the query last and so would never fire for a URL
   // that carries one -- which is exactly how `/a/?b=1` and `/a?b=1` came to
   // canonicalize apart, defeating the dedup this function exists for.
-  if (parsed.pathname.endsWith('/') && parsed.pathname !== '/') {
-    parsed.pathname = parsed.pathname.slice(0, -1);
+  if (parsed.pathname !== '/') {
+    // EVERY trailing slash, not one -- the same idempotency requirement as the
+    // `www.` strip above, and it was broken the same way. `slice(0, -1)` turned
+    // `/p//?b=1` into `/p/?b=1` on the first pass and `/p?b=1` on the second,
+    // so a URL with a doubled trailing slash canonicalized to two different
+    // keys depending on how many times the pipeline had been through it. The
+    // `|| '/'` restores the root when a path was nothing but slashes.
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
   }
   let out = parsed.toString();
   // Two cases still arrive here with a trailing slash, and neither can be handled
