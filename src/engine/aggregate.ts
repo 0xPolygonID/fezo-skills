@@ -186,7 +186,21 @@ export function canonicalizeUrl(url: string): string {
   // slash (`custom:opaque/path/?b=1`), so the every-path invariant holds only
   // for schemes with a hierarchical path -- which is every URL a search or
   // scrape provider returns.
-  if (out.endsWith('/')) out = out.slice(0, -1);
+  //
+  // EVERY trailing slash, for the third time in this function -- and this is the
+  // instance that actually matters for an opaque URL, because the pathname
+  // setter above is a no-op there, so this line is the ONLY trailing-slash rule
+  // in force. `slice(0, -1)` left `doc:1234//` canonicalizing to `doc:1234/` on
+  // one pass and `doc:1234` on the next, which is precisely the non-idempotency
+  // the `www.` and pathname fixes were written to remove: a session then stores
+  // a key the next round never reproduces and silently re-delivers a document
+  // the caller has already read. `hostOf`'s docstring names `doc:1234` as what a
+  // corpus-backed provider returns when it has no web URL to give, so this is
+  // reachable, not theoretical.
+  //
+  // `|| out` keeps a degenerate all-slashes value from collapsing to the empty
+  // string, which would make every such value dedupe together.
+  out = out.replace(/\/+$/, '') || out;
   return out;
 }
 
@@ -866,6 +880,8 @@ export interface NarrowedQuery {
 export interface Coverage {
   queries: QueryCoverage[];
   served: string[];
+  /** See `CoverageInput.unreadable`. */
+  unreadable: string[];
   failed: Array<{ backendId: string; reason: string }>;
   skipped: string[];
   domainConcentration?: { host: string; share: number };
@@ -917,6 +933,11 @@ function groupByReason(dropped: readonly DroppedQuery[]): Array<[string, string[
 export interface CoverageInput {
   queries: Array<{ query: string; items: readonly ResearchItem[] }>;
   served: string[];
+  /** Providers that returned a billed 2xx whose body could not be parsed.
+   * Reported apart from `served` because "we paid and could not read it" and
+   * "the provider honestly found nothing" are different facts with different
+   * remedies, and `computeCoverage` exists to keep exactly that pair apart. */
+  unreadable: string[];
   failed: Array<{ backendId: string; reason: string }>;
   skipped: string[];
   droppedQueries: DroppedQuery[];
@@ -991,7 +1012,16 @@ export function computeCoverage(input: CoverageInput): Coverage {
     else if (q.uniqueUrls < THIN_QUERY_THRESHOLD) gaps.push(`"${q.query}" is thin (${String(q.uniqueUrls)} unique URLs)`);
     else if (q.agreementMedian <= 1) gaps.push(`"${q.query}" has no cross-provider agreement`);
   }
-  for (const failure of input.failed) gaps.push(`${failure.backendId} failed (${failure.reason})`);
+  // One line per DISTINCT failure. `failed` carries one entry per failed lane,
+  // so a provider that failed under three queries produced three identical gap
+  // lines -- and a list repeating one fact reads as three facts. `planSkipped`
+  // and `nextActions` both dedupe for exactly this reason; this did not.
+  for (const failure of [...new Set(input.failed.map((f) => `${f.backendId} failed (${f.reason})`))]) {
+    gaps.push(failure);
+  }
+  for (const backendId of [...new Set(input.unreadable)]) {
+    gaps.push(`${backendId} returned a billed response this round could not read`);
+  }
   // Split by cause, not joined into one line: a budget drop tells the caller
   // to run the query again, an abort tells them not to. See `DroppedQuery`.
   const budgetDropped = input.droppedQueries.filter((d) => d.reason === undefined).map((d) => d.query);
@@ -1025,6 +1055,7 @@ export function computeCoverage(input: CoverageInput): Coverage {
   return {
     queries,
     served: [...input.served],
+    unreadable: [...new Set(input.unreadable)],
     failed: input.failed.map((f) => ({ ...f })),
     skipped: [...input.skipped],
     ...(domainConcentration !== undefined ? { domainConcentration } : {}),

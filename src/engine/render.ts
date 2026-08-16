@@ -1053,6 +1053,7 @@ export function renderResearch(outcome: ResearchOutcome, sessionId: string | und
           agreement_median: q.agreementMedian,
         })),
         served: outcome.coverage.served,
+        unreadable: outcome.coverage.unreadable,
         failed: outcome.coverage.failed.map((f) => ({ backend_id: f.backendId, reason: f.reason })),
         skipped: outcome.coverage.skipped,
         ...(outcome.coverage.domainConcentration !== undefined

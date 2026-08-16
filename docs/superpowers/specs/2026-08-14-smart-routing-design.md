@@ -234,7 +234,7 @@ candidate and the Firecrawl-family backends put a whole page's markdown in it,
 so without a per-item cap one `research` round emits a multi-megabyte document.
 Recorded as a deviation under the plan's Task 4.
 
-**Canonicalization.** Lowercase scheme and host, strip a leading `www.`, drop
+**Canonicalization.** Lowercase scheme and host, strip every leading `www.` label, drop
 the fragment, remove tracking parameters (`utm_*`, `gclid`, `fbclid`,
 `mc_eid`, `ref`, `ref_src`, plus the vendor-namespaced click ids `msclkid`,
 `mc_cid`, `igshid`, `yclid`, `dclid`, `_hsenc`, `_hsmi` — none of which any
@@ -383,7 +383,10 @@ answered inconsistently, and each is now enforced by code and a test:
   single `www.` prefix made the function non-idempotent for a
   `www.www.example.com` host, so the second pass produced a different key — and
   a session then stored a URL the next round could never match, silently
-  re-returning a document suppression was paid to withhold. Pinned by a corpus
+  re-returning a document suppression was paid to withhold. The same
+  single-strip mistake was made three times in one function — the `www.`
+  prefix, the pathname's trailing separators, and the string-level fallback
+  that is the only rule in force for an opaque-path URL such as `doc:1234//`. Pinned by a corpus
   property test and by a two-round executor test, because a single-round
   assertion cannot see it: what the session stores and what the round emitted
   agree with each other even when both are wrong.

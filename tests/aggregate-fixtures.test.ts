@@ -74,6 +74,14 @@ describe('extractItems against captured provider responses', () => {
         // page it could not date. Zero means the field name is missing from
         // FIELD_CANDIDATES, which is the defect this pins.
         expect(dated, `${tool} dropped every date — check FIELD_CANDIDATES.publishedAt`).toBeGreaterThan(0);
+      } else {
+        // The negative side matters as much, and its absence made the whole
+        // assertion one-sided: flipping an entry to `dated: false` silenced the
+        // check rather than failing it, so a date regression could be "fixed"
+        // by editing a boolean. It also pins that no newly-added candidate
+        // field name has started reading the wrong key on a provider that
+        // genuinely sends none.
+        expect(dated, `${tool} newly reads dates — update EXPECTED rather than the code`).toBe(0);
       }
     });
 

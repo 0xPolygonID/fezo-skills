@@ -211,6 +211,10 @@ interface LaneReport {
   attempts: AttemptLog[];
   /** Set when the lane was billed and answered: the backend that served. */
   served?: string;
+  /** Set when the lane was billed and answered but its body could not be
+   * parsed. Distinct from `served` alone, which cannot tell "we paid and could
+   * not read it" from "the provider found nothing". */
+  unreadable?: string;
   failed?: { backendId: string; reason: string };
   skipped?: string;
   /** The account-scoped code this lane saw, if any. */
@@ -357,7 +361,28 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     ? plan.targets.map((url) => ({ url, reason: `intents are search-only (${plan.intents.join(', ')})` }))
     : [];
   const fetchableTargets = noScrapeIntent ? [] : plan.targets;
-  const targetReserve = Math.min(fetchableTargets.length, Math.max(0, maxCalls));
+  // Deduped by CANONICAL URL before anything is reserved. The same URL listed
+  // twice is one document, and fetching it twice billed twice while producing a
+  // self-contradicting report: the URL appeared in `documents` (the first fetch
+  // succeeded) AND in `unfetched_targets` (the second was rate limited), with a
+  // `next_actions` entry telling the agent to re-fetch a page it already had.
+  //
+  // NOT the old value-filter bug: that one decided MEMBERSHIP by value AFTER
+  // the split, and so dropped both copies of a target the budget had already
+  // reserved a call for. This collapses duplicates up front, before any budget
+  // is allocated, so every surviving entry still owns exactly one slot and the
+  // positional split below is unchanged. `clampPlan` already dedupes, but this
+  // module states twice that it must not depend on another module's invariant,
+  // and this is the case where the dependence was real.
+  const dedupedTargets: string[] = [];
+  const seenTargets = new Set<string>();
+  for (const target of fetchableTargets) {
+    const key = canonicalizeUrl(target);
+    if (seenTargets.has(key)) continue;
+    seenTargets.add(key);
+    dedupedTargets.push(target);
+  }
+  const targetReserve = Math.min(dedupedTargets.length, Math.max(0, maxCalls));
   let budget = maxCalls - targetReserve;
   // A caller who declared intents, none of which a query can be served by
   // (`--intents scrape` with a query and no target), gets NO search fan-out.
@@ -406,8 +431,8 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   // `targetReserve`, not whatever the query loop left over: the reservation
   // above is what the queries were already budgeted around, so reading the
   // leftover here would spend the same calls twice.
-  const fetchTargets = fetchableTargets.slice(0, targetReserve);
-  const unfetchedTargets = fetchableTargets.slice(targetReserve);
+  const fetchTargets = dedupedTargets.slice(0, targetReserve);
+  const unfetchedTargets = dedupedTargets.slice(targetReserve);
 
   // The flat, plan-ordered list of lanes this round will run: query order
   // first, then diversity position within the query. Every slot array below is
@@ -467,8 +492,12 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
       body = JSON.parse(report.outcome.result.bodyText);
     } catch {
       // A billed 2xx that is not JSON yields no items but is still a served
-      // lane -- reported, never silently counted as a failure.
+      // lane -- reported, never silently counted as a failure. It is ALSO
+      // recorded as unreadable: `served` alone made it indistinguishable from a
+      // provider that honestly found nothing, which is the pair coverage exists
+      // to separate.
       body = undefined;
+      laneReport.unreadable = lane.backendId;
     }
     const items = extractItems(lane.candidate.tool, body);
     // Written into the lane's OWN slot, never appended: the pool completes
@@ -539,6 +568,7 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   ]);
   const failed = ran.flatMap((r) => (r.failed !== undefined ? [r.failed] : []));
   const skipped = [...new Set([...planSkipped, ...ran.flatMap((r) => (r.skipped !== undefined ? [r.skipped] : []))])];
+  const unreadable = ran.flatMap((r) => (r.unreadable !== undefined ? [r.unreadable] : []));
   const aborted = ran.find((r) => r.aborted !== undefined)?.aborted ?? targetsRan.find((r) => r.aborted !== undefined)?.aborted;
 
   // Work the pool never started, recovered by diffing the plan against the
@@ -704,6 +734,7 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
   const coverage = computeCoverage({
     queries: perQuery,
     served: [...served],
+    unreadable,
     failed,
     skipped,
     droppedQueries,
@@ -721,9 +752,21 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
     // A query the abort stopped before any lane started is reported as not run,
     // and describing the width of a round that never happened alongside it is
     // two answers to one question. The narrowing is real but moot.
-    narrowedQueries: narrowedQueries.filter(
-      (n) => !unstartedQueries.has(n.query),
-    ),
+    // `actual` recomputed from lanes that actually REPORTED, not from what was
+    // planned: an abort stops the pool mid-round, so a query planned at 4 lanes
+    // may have run 2 -- and stating "narrowed to 4 of 5 providers" then names a
+    // width the round never reached. A narrowing that has become moot (the query
+    // ran nothing, or reached its full requested width) is dropped rather than
+    // restated.
+    narrowedQueries: narrowedQueries.flatMap((n) => {
+      if (unstartedQueries.has(n.query)) return [];
+      const queryIndex = planned.findIndex((entry) => entry.query === n.query);
+      const ran = plannedLanes.filter(
+        (entry, laneIndex) => entry.queryIndex === queryIndex && laneReports[laneIndex] !== undefined,
+      ).length;
+      if (ran === 0 || ran >= n.requested) return [];
+      return [{ ...n, actual: ran }];
+    }),
     suppressed: suppressedUrls.size,
   });
 
@@ -748,5 +791,24 @@ export async function runResearch(options: ResearchOptions): Promise<ResearchOut
 
 /** Canonical URLs this outcome returned, for a session to remember. */
 export function seenUrlsFrom(outcome: ResearchOutcome): string[] {
-  return outcome.items.map((item) => canonicalizeUrl(item.url));
+  // `duplicates` as well as `url`, because a cross-host twin that pass 2
+  // collapsed is a document the caller HAS been shown -- under the
+  // representative's URL -- and storing only the representative let the twin
+  // come back next round as a brand-new item. That is the opposite of what a
+  // session is for.
+  //
+  // Canonicalizing each duplicate is what makes this safe to do bluntly:
+  // pass-2 entries are already canonical (so it is a no-op on them), while
+  // pass-1 entries are the provider's ORIGINAL decorated URL, which
+  // canonicalizes to the representative's own URL and therefore adds nothing
+  // new. Both land on a key the next round will actually compute. This only
+  // holds because `canonicalizeUrl` is idempotent -- see its docstring.
+  return [
+    ...new Set(
+      outcome.items.flatMap((item) => [
+        canonicalizeUrl(item.url),
+        ...item.duplicates.map((url) => canonicalizeUrl(url)),
+      ]),
+    ),
+  ];
 }

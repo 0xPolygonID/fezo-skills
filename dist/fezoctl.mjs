@@ -10401,7 +10401,7 @@ function canonicalizeUrl(url) {
     parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
   }
   let out = parsed.toString();
-  if (out.endsWith("/")) out = out.slice(0, -1);
+  out = out.replace(/\/+$/, "") || out;
   return out;
 }
 function collectArrays(value, depth = 0, found = []) {
@@ -10666,7 +10666,12 @@ function computeCoverage(input) {
     else if (q.uniqueUrls < THIN_QUERY_THRESHOLD) gaps.push(`"${q.query}" is thin (${String(q.uniqueUrls)} unique URLs)`);
     else if (q.agreementMedian <= 1) gaps.push(`"${q.query}" has no cross-provider agreement`);
   }
-  for (const failure of input.failed) gaps.push(`${failure.backendId} failed (${failure.reason})`);
+  for (const failure of [...new Set(input.failed.map((f) => `${f.backendId} failed (${f.reason})`))]) {
+    gaps.push(failure);
+  }
+  for (const backendId of [...new Set(input.unreadable)]) {
+    gaps.push(`${backendId} returned a billed response this round could not read`);
+  }
   const budgetDropped = input.droppedQueries.filter((d) => d.reason === void 0).map((d) => d.query);
   if (budgetDropped.length > 0) gaps.push(`not run (call budget): ${budgetDropped.join(", ")}`);
   for (const [reason, queries_] of groupByReason(input.droppedQueries)) {
@@ -10687,6 +10692,7 @@ function computeCoverage(input) {
   return {
     queries,
     served: [...input.served],
+    unreadable: [...new Set(input.unreadable)],
     failed: input.failed.map((f) => ({ ...f })),
     skipped: [...input.skipped],
     ...domainConcentration !== void 0 ? { domainConcentration } : {},
@@ -10839,7 +10845,15 @@ async function runResearch(options) {
   const noScrapeIntent = plan.intents.length > 0 && plan.intents.every((intent) => FIND_INTENTS.has(intent));
   const refusedTargets = noScrapeIntent ? plan.targets.map((url) => ({ url, reason: `intents are search-only (${plan.intents.join(", ")})` })) : [];
   const fetchableTargets = noScrapeIntent ? [] : plan.targets;
-  const targetReserve = Math.min(fetchableTargets.length, Math.max(0, maxCalls));
+  const dedupedTargets = [];
+  const seenTargets = /* @__PURE__ */ new Set();
+  for (const target of fetchableTargets) {
+    const key = canonicalizeUrl(target);
+    if (seenTargets.has(key)) continue;
+    seenTargets.add(key);
+    dedupedTargets.push(target);
+  }
+  const targetReserve = Math.min(dedupedTargets.length, Math.max(0, maxCalls));
   let budget = maxCalls - targetReserve;
   const searchShaped = plan.intents.filter((intent) => intent !== "scrape" && intent !== "crawl");
   const noSearchIntent = plan.intents.length > 0 && searchShaped.length === 0;
@@ -10864,8 +10878,8 @@ async function runResearch(options) {
     budget -= kept.length;
     planned.push({ query, lanes: kept });
   }
-  const fetchTargets = fetchableTargets.slice(0, targetReserve);
-  const unfetchedTargets = fetchableTargets.slice(targetReserve);
+  const fetchTargets = dedupedTargets.slice(0, targetReserve);
+  const unfetchedTargets = dedupedTargets.slice(targetReserve);
   const plannedLanes = planned.flatMap(
     ({ lanes }, queryIndex) => lanes.map((lane2) => ({ queryIndex, lane: lane2 }))
   );
@@ -10902,6 +10916,7 @@ async function runResearch(options) {
       body = JSON.parse(report.outcome.result.bodyText);
     } catch {
       body = void 0;
+      laneReport.unreadable = lane2.backendId;
     }
     const items2 = extractItems(lane2.candidate.tool, body);
     const list = laneItemsByQuery[queryIndex];
@@ -10948,6 +10963,7 @@ async function runResearch(options) {
   ]);
   const failed = ran.flatMap((r) => r.failed !== void 0 ? [r.failed] : []);
   const skipped = [.../* @__PURE__ */ new Set([...planSkipped, ...ran.flatMap((r) => r.skipped !== void 0 ? [r.skipped] : [])])];
+  const unreadable = ran.flatMap((r) => r.unreadable !== void 0 ? [r.unreadable] : []);
   const aborted = ran.find((r) => r.aborted !== void 0)?.aborted ?? targetsRan.find((r) => r.aborted !== void 0)?.aborted;
   const unstartedQueryIndexes = /* @__PURE__ */ new Set();
   const unstartedQueries = /* @__PURE__ */ new Set();
@@ -11035,6 +11051,7 @@ async function runResearch(options) {
   const coverage = computeCoverage({
     queries: perQuery,
     served: [...served],
+    unreadable,
     failed,
     skipped,
     droppedQueries,
@@ -11052,9 +11069,21 @@ async function runResearch(options) {
     // A query the abort stopped before any lane started is reported as not run,
     // and describing the width of a round that never happened alongside it is
     // two answers to one question. The narrowing is real but moot.
-    narrowedQueries: narrowedQueries.filter(
-      (n) => !unstartedQueries.has(n.query)
-    ),
+    // `actual` recomputed from lanes that actually REPORTED, not from what was
+    // planned: an abort stops the pool mid-round, so a query planned at 4 lanes
+    // may have run 2 -- and stating "narrowed to 4 of 5 providers" then names a
+    // width the round never reached. A narrowing that has become moot (the query
+    // ran nothing, or reached its full requested width) is dropped rather than
+    // restated.
+    narrowedQueries: narrowedQueries.flatMap((n) => {
+      if (unstartedQueries.has(n.query)) return [];
+      const queryIndex = planned.findIndex((entry) => entry.query === n.query);
+      const ran2 = plannedLanes.filter(
+        (entry, laneIndex) => entry.queryIndex === queryIndex && laneReports[laneIndex] !== void 0
+      ).length;
+      if (ran2 === 0 || ran2 >= n.requested) return [];
+      return [{ ...n, actual: ran2 }];
+    }),
     suppressed: suppressedUrls.size
   });
   const callsBilled = attempts.filter((a) => a.billed).length;
@@ -11076,7 +11105,14 @@ async function runResearch(options) {
   };
 }
 function seenUrlsFrom(outcome) {
-  return outcome.items.map((item) => canonicalizeUrl(item.url));
+  return [
+    ...new Set(
+      outcome.items.flatMap((item) => [
+        canonicalizeUrl(item.url),
+        ...item.duplicates.map((url) => canonicalizeUrl(url))
+      ])
+    )
+  ];
 }
 
 // src/engine/one-step-descriptions.json
@@ -11700,6 +11736,7 @@ function renderResearch(outcome, sessionId, json) {
           agreement_median: q.agreementMedian
         })),
         served: outcome.coverage.served,
+        unreadable: outcome.coverage.unreadable,
         failed: outcome.coverage.failed.map((f) => ({ backend_id: f.backendId, reason: f.reason })),
         skipped: outcome.coverage.skipped,
         ...outcome.coverage.domainConcentration !== void 0 ? { domain_concentration: outcome.coverage.domainConcentration } : {},

@@ -421,7 +421,7 @@ describe('runResearch: targets', () => {
 
   // Two identical targets are two entries, and a value-membership split of the
   // budget drops the in-budget occurrence along with the out-of-budget one.
-  it('spends the budget on a duplicated target by position, not by value', async () => {
+  it('collapses a duplicated target instead of billing it twice', async () => {
     const fetchFn = routedFetch({
       you: [results(['https://a.example'])],
       exa: [results([])],
@@ -429,12 +429,10 @@ describe('runResearch: targets', () => {
       scrapingdog: [new Response('{"content":"one"}', { status: 200 }), new Response('{"content":"two"}', { status: 200 })],
     });
     const outcome = await runResearch({
-      // Targets are reserved before queries take what is left (`clampPlan`'s
-      // stated order, which the executor now matches), so a 2-call budget buys
-      // the first two of the three targets -- including the duplicate at index
-      // 0 -- and leaves nothing for the query. The third target is the one
-      // dropped, BY POSITION: dropping by value would lose both copies of t1,
-      // one of which the round had already reserved a call for.
+      // t1 appears twice. It is ONE document, so it takes one slot and one
+      // call -- listing it in both `documents` and `unfetchedTargets` (which is
+      // what fetching it twice produced when the second attempt failed) is a
+      // report that contradicts itself.
       plan: plan({
         intents: ['search', 'scrape'], queries: ['coffee'],
         targets: ['https://t1.example', 'https://t2.example', 'https://t1.example'],
@@ -442,7 +440,26 @@ describe('runResearch: targets', () => {
       candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, maxCalls: 2,
     });
     expect(outcome.documents.map((d) => d.url)).toEqual(['https://t1.example', 'https://t2.example']);
-    expect(outcome.coverage.unfetchedTargets).toEqual([{ url: 'https://t1.example' }]);
+    expect(outcome.coverage.unfetchedTargets).toEqual([]);
+    expect(outcome.billing.callsBilled).toBe(2);
+  });
+
+  it('drops targets past the budget by POSITION, never by value', async () => {
+    // The original hazard this replaced a value-filter to avoid: deciding
+    // membership by value AFTER the split loses a target the budget had
+    // already reserved. Three distinct targets, room for two.
+    const fetchFn = routedFetch({
+      scrapingdog: [new Response('{"content":"one"}', { status: 200 }), new Response('{"content":"two"}', { status: 200 })],
+    });
+    const outcome = await runResearch({
+      plan: plan({
+        intents: ['scrape'], queries: [],
+        targets: ['https://t1.example', 'https://t2.example', 'https://t3.example'],
+      }),
+      candidates: SCRAPE_CANDIDATES, excluded: [], gateway: { ...gateway, fetchFn }, maxCalls: 2,
+    });
+    expect(outcome.documents.map((d) => d.url)).toEqual(['https://t1.example', 'https://t2.example']);
+    expect(outcome.coverage.unfetchedTargets).toEqual([{ url: 'https://t3.example' }]);
   });
 
   it('runs searches and target fetches in the same round', async () => {
@@ -997,5 +1014,94 @@ describe('runResearch: a doubly-canonicalizable URL survives the composed pipeli
     const second = await round(new Set(seenUrlsFrom(first)));
     expect(second.items).toHaveLength(0);
     expect(second.coverage.suppressed).toBe(1);
+  });
+});
+
+describe('seenUrlsFrom: a collapsed twin is remembered too', () => {
+  it('stores the cross-host duplicate, so it is not returned again next round', async () => {
+    const same = 'Chip maker acquires rival in landmark deal';
+    const body = (url: string) =>
+      new Response(JSON.stringify({ results: [{ url, title: same }] }), { status: 200 });
+    const round = async (seenUrls?: ReadonlySet<string>) =>
+      runResearch({
+        plan: plan({ queries: ['alpha'], fanout: 3 }), candidates: CANDIDATES, excluded: [],
+        gateway: {
+          ...gateway,
+          fetchFn: routedFetch({
+            you: [body('https://outlet-a.example/s')],
+            exa: [body('https://outlet-b.example/s')],
+            brave: [results([])],
+          }),
+        },
+        ...(seenUrls !== undefined ? { seenUrls } : {}),
+      });
+
+    const first = await round();
+    expect(first.items).toHaveLength(1);
+    expect(first.items[0]?.duplicates).toContain('https://outlet-b.example/s');
+    // Round 1 showed the caller BOTH stories, folded into one item. Round 2
+    // must not present outlet-b as new.
+    const second = await round(new Set(seenUrlsFrom(first)));
+    expect(second.items).toHaveLength(0);
+  });
+
+  it('still stores the representative for a plain single-source item', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example/x'])],
+      exa: [results([])],
+      brave: [results([])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha'], fanout: 3 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn },
+    });
+    expect(seenUrlsFrom(outcome)).toEqual(['https://a.example/x']);
+  });
+});
+
+describe('runResearch: a billed 2xx that cannot be parsed is its own state', () => {
+  it('is reported as unreadable, not merely as served', async () => {
+    const fetchFn = routedFetch({
+      you: [new Response('<html>nope</html>', { status: 200 })],
+      exa: [results([])],
+      brave: [results([])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha'], fanout: 3 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.coverage.served).toContain('you');
+    expect(outcome.coverage.unreadable).toEqual(['you']);
+    expect(outcome.coverage.gaps.join(' ')).toMatch(/could not read/);
+  });
+
+  it('leaves unreadable empty when every body parsed', async () => {
+    const fetchFn = routedFetch({
+      you: [results(['https://a.example'])],
+      exa: [results([])],
+      brave: [results([])],
+    });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha'], fanout: 3 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn },
+    });
+    expect(outcome.coverage.unreadable).toEqual([]);
+  });
+});
+
+describe('runResearch: narrowing counts lanes that ran', () => {
+  it('does not claim a width an abort prevented the round from reaching', async () => {
+    const limit = () =>
+      new Response(JSON.stringify({ error: { code: 'limit_exceeded', message: 'cap' } }), { status: 402 });
+    const fetchFn = routedFetch({ you: [results(['https://a.example'])], exa: [limit()] });
+    const outcome = await runResearch({
+      plan: plan({ queries: ['alpha'], fanout: 5 }), candidates: CANDIDATES, excluded: [],
+      gateway: { ...gateway, fetchFn }, maxCalls: 4, concurrency: 1,
+    });
+    // Planned 4 of 5; the abort stopped the pool after 2. Saying "narrowed to
+    // 4" names a width two lanes short of anything that happened.
+    for (const narrowed of outcome.coverage.narrowedQueries) {
+      expect(narrowed.actual).toBeLessThanOrEqual(outcome.billing.attempts.length);
+    }
   });
 });
