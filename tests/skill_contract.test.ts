@@ -1,3 +1,11 @@
+// WARNING TO ANYONE RUNNING A MUTATION SWEEP: exclude this file. Two tests
+// below rebuild the bundle and byte-compare it against the committed
+// `dist/fezoctl.mjs`, so they fail on ANY edit to `src/` — which makes every
+// mutant look "killed" and a coverage sweep look total. A reviewer was misled
+// by exactly this and had to re-run the sweep per-file; five live guards turned
+// out to be unguarded underneath. Run `vitest run tests/<the-file>.test.ts` for
+// the module you are mutating instead.
+//
 // Contract tests for the generated `skills/fezo/SKILL.md` and the two
 // artifacts its packaging story depends on: `dist/fezoctl.mjs` (the
 // committed, deterministic bundle) and `skills/fezo/scripts/fezoctl.mjs`
@@ -29,7 +37,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { runCli } from '../src/cli.js';
-import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS } from '../src/engine/steering.js';
+import { ONE_STEP_COMMANDS, ONE_STEP_DESCRIPTIONS, RESEARCH_DESCRIPTIONS } from '../src/engine/steering.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..');
@@ -484,6 +492,37 @@ describe('skills/fezo/SKILL.md generated content', () => {
     // The capabilities no one-step command covers (news/social/proxy) are only
     // reachable this way, so the step that routes there must name the command.
     expect(procedure).toContain('`providers --intent <intent>`');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 13: the `research` contract. Same "these agree" principle as the
+// ONE_STEP_DESCRIPTIONS block above, but the descriptions are asserted
+// against the RAW file (`skillMd`), not `skillMdFlat`: `plan`/`research`'s
+// sentences are deliberately embedded unwrapped (see gen-skill.mjs's
+// renderResearchSection), so a wrapped copy sneaking back in would mean the
+// exact sentence no longer appears anywhere in the file and this test would
+// catch it. The regex assertions below check the harder-to-verify-by-eye
+// property: that the section actually tells the agent to decompose a
+// research-depth prompt itself and to act on reported coverage gaps, not just
+// that the section exists.
+// ---------------------------------------------------------------------------
+
+describe('SKILL.md research contract', () => {
+  it('documents every research command description verbatim', () => {
+    for (const description of Object.values(RESEARCH_DESCRIPTIONS)) {
+      expect(skillMd).toContain(description);
+    }
+  });
+
+  it('tells the agent to plan explicitly for research-depth prompts', () => {
+    expect(skillMd).toMatch(/--queries/);
+    expect(skillMd).toMatch(/decompos/i);
+  });
+
+  it('tells the agent to act on coverage gaps', () => {
+    expect(skillMd).toMatch(/gaps/);
+    expect(skillMd).toMatch(/--session/);
   });
 });
 

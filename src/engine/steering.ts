@@ -32,6 +32,11 @@ import type { Intent } from './intent.js';
 // The shared bytes `build/gen-skill.mjs` also reads; see the module comment
 // above for why this one table lives in JSON rather than in this file.
 import oneStepDescriptions from './one-step-descriptions.json' with { type: 'json' };
+// Same reason, same shape, for the two routing commands (Task 13): the
+// sentences are read by HELP_TEXT here and, straight from this JSON, by
+// `build/gen-skill.mjs`'s research section -- one file `gen-skill.mjs` (a
+// plain Node script, no TypeScript) can actually import.
+import researchDescriptions from './research-descriptions.json' with { type: 'json' };
 
 /**
  * Routing note for a *successful* one-step result: which provider answered,
@@ -98,3 +103,25 @@ export const ONE_STEP_DESCRIPTIONS: Record<OneStepCommand, string> = oneStepDesc
  * read identically wherever it is read from. */
 Object.freeze(ONE_STEP_DESCRIPTIONS);
 Object.freeze(ONE_STEP_COMMANDS);
+
+/** The two routing commands (Task 10-12), in the order SKILL.md's research
+ * section documents them: `plan` (no calls, see what routing would do) before
+ * `research` (the wide fan-out it describes). */
+export const RESEARCH_COMMANDS = ['plan', 'research'] as const;
+export type ResearchCommand = (typeof RESEARCH_COMMANDS)[number];
+
+/**
+ * One line per routing command, read by HELP_TEXT (`src/cli.ts`) and by the
+ * SKILL.md generator's research section (`build/gen-skill.mjs`, straight from
+ * `./research-descriptions.json`) -- same single-source rule as
+ * `ONE_STEP_DESCRIPTIONS` above, so `--help` and the shipped skill cannot
+ * describe `plan`/`research` differently from each other.
+ */
+export const RESEARCH_DESCRIPTIONS: Record<ResearchCommand, string> = researchDescriptions;
+
+/** Frozen for the same reason as `ONE_STEP_DESCRIPTIONS`/`ONE_STEP_COMMANDS`
+ * above -- including the enum-shaped tuple, per this codebase's rule that a
+ * nested "these are the only valid values" array is part of the declared
+ * table and must be frozen with it, not just the record it indexes. */
+Object.freeze(RESEARCH_DESCRIPTIONS);
+Object.freeze(RESEARCH_COMMANDS);

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -193,6 +193,57 @@ const ALL_SEARCH_PROVIDERS_CATALOG: WireBackend[] = [
   { backend_id: 'firecrawl', billing: { model: 'per_call' }, methods: [{ name: 'search', path: '/search', description: 'LLM-ready markdown search.', input_schema: {} }] },
   { backend_id: 'geonode', billing: { model: 'per_call' }, methods: [{ name: 'search', path: '/search', description: 'Proxy-backed search.', input_schema: {} }] },
 ];
+
+// The two top-ranked declared `search` providers, each publishing its entry
+// method with a BINDABLE query parameter -- the catalogs above declare
+// `input_schema: {}`, which `resolveArgName` cannot resolve an argument name
+// out of, so a fan-out over them plans zero lanes and bills nothing. This is
+// the minimum catalog a `research` round can actually spend a call against;
+// `RECOMMENDATIONS.search` ranks `you` first and `exa` second, so `--fanout 2`
+// reaches exactly these two.
+const RESEARCH_CATALOG: WireBackend[] = [
+  {
+    backend_id: 'you',
+    billing: { model: 'per_call' },
+    methods: [
+      {
+        name: 'search',
+        path: '/search',
+        description: 'Search the web.',
+        input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+        http: { method: 'GET', query: ['query'] },
+      },
+    ],
+  },
+  {
+    backend_id: 'exa',
+    billing: { model: 'per_call' },
+    methods: [
+      {
+        name: 'search',
+        path: '/search',
+        description: 'Neural/semantic search over the web.',
+        input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+        http: { method: 'GET', query: ['query'] },
+      },
+    ],
+  },
+];
+
+/** A search provider's body, in the shape `sniffItems` recognizes. Title is the
+ * URL: these tests assert on merging and suppression, not on titles. */
+function searchResults(urls: string[]): Response {
+  return okResponse(JSON.stringify({ results: urls.map((url) => ({ url, title: url })) }));
+}
+
+/** The two lanes a `--fanout 2` round runs, with `b.example` deliberately
+ * returned by both providers so a round's result set proves the fusion. */
+function researchFetch(): typeof fetch {
+  return multiRouteFetch(RESEARCH_CATALOG, {
+    you: [searchResults(['https://a.example/one', 'https://b.example/two'])],
+    exa: [searchResults(['https://b.example/two', 'https://c.example/three'])],
+  });
+}
 
 // ---------------------------------------------------------------------------
 // --version
@@ -2369,7 +2420,7 @@ describe('no secret leakage across every command', () => {
   // stdout trivially "does not contain the secret". Text mode is covered
   // alongside `--json` for every command, since the two render through
   // different code paths.
-  it('search, schema, call, run, catalog, and doctor never print the raw API key, in text or JSON mode', async () => {
+  it('search, schema, call, run, plan, research, catalog, and doctor never print the raw API key, in text or JSON mode', async () => {
     const catalog = SCRAPE_CATALOG;
     const commands: { argv: string[]; fetchFn: typeof fetch; exitCode: number }[] = [
       { argv: ['search', 'scrape this page', '--json'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
@@ -2408,6 +2459,14 @@ describe('no secret leakage across every command', () => {
         fetchFn: multiRouteFetch(catalog, { scrapingbee: [gatewayErrorResponse(503, 'backend_unavailable')] }),
         exitCode: 2,
       },
+      // `plan` never reaches the network, but it renders the round the
+      // credentials would have paid for; `research` renders a full attempt log,
+      // which is exactly where a request's own headers would be tempting to
+      // echo.
+      { argv: ['plan', 'merkle tree proofs', '--json'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
+      { argv: ['plan', 'merkle tree proofs'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
+      { argv: ['research', 'merkle tree proofs', '--fanout', '2', '--json'], fetchFn: researchFetch(), exitCode: 0 },
+      { argv: ['research', 'merkle tree proofs', '--fanout', '2'], fetchFn: researchFetch(), exitCode: 0 },
       { argv: ['catalog', '--json'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
       { argv: ['catalog'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
       { argv: ['doctor', '--json'], fetchFn: multiRouteFetch(catalog), exitCode: 0 },
@@ -2441,5 +2500,185 @@ describe('no secret leakage across every command', () => {
       expect(result.stdout, argv.join(' ')).not.toContain(SECRET);
       expect(result.stderr, argv.join(' ')).not.toContain(SECRET);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// plan / research (Task 12: smart-routing CLI wiring)
+// ---------------------------------------------------------------------------
+
+describe('fezoctl plan', () => {
+  it('prints a plan without touching the network', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(['plan', 'what is a merkle tree', '--json'], baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }));
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).intents).toContain('search');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('requires a prompt', async () => {
+    expect((await runCli(['plan'], baseDeps())).exitCode).toBe(1);
+  });
+});
+
+describe('fezoctl research', () => {
+  it('rejects a malformed --plan-json with a usage error before any call', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(
+      ['research', 'x', '--plan-json', '{not json'],
+      baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }),
+    );
+    expect(result.exitCode).toBe(1);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown key in --plan-json', async () => {
+    const result = await runCli(['research', 'x', '--plan-json', '{"nonsense":1}'], baseDeps());
+    expect(result.exitCode).toBe(1);
+  });
+
+  it('rejects an invalid --session id before any call', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(
+      ['research', 'x', '--session', '../escape'],
+      baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }),
+    );
+    expect(result.exitCode).toBe(1);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-numeric --fanout', async () => {
+    expect((await runCli(['research', 'x', '--fanout', 'wide'], baseDeps())).exitCode).toBe(1);
+  });
+
+  it('emits a JSON error envelope on failure with --json', async () => {
+    const result = await runCli(['research', 'x', '--fanout', 'wide', '--json'], baseDeps());
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stdout).error.kind).toBeTruthy();
+  });
+
+  // `--intent` is `providers`' flag and `--intents` is routing's. The parser
+  // accepts any known flag for any command, so the singular would otherwise
+  // parse, be dropped, and bill a round routed by the heuristic's intents
+  // rather than the caller's.
+  it('rejects the singular --intent, before any call, pointing at the plural', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(['research', 'latest news', '--intent', 'news'], baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }));
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('--intents news');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The billed `research` path: everything past the usage gate -- openGateway,
+// the fan-out, session load/save, and the render.
+// ---------------------------------------------------------------------------
+
+describe('fezoctl research (the billed path)', () => {
+  it('fuses two providers into one result set, persists the session, and suppresses it next round', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'fezoctl-cli-research-home-'));
+    try {
+      const argv = ['research', 'merkle tree proofs', '--fanout', '2', '--session', 'round-1', '--json'];
+      const first = await runCli(argv, baseDeps({ homeDir: home, fetchFn: researchFetch() }));
+      expect(first.exitCode).toBe(0);
+
+      const firstDoc = JSON.parse(first.stdout) as {
+        items: { url: string; providers: { backend_id: string }[] }[];
+        coverage: { served: string[]; suppressed: number };
+        billing: { calls_billed: number };
+        session: { id: string } | null;
+        next_actions: { cmd: string }[];
+      };
+      expect(firstDoc.items.map((item) => item.url).sort()).toEqual([
+        'https://a.example/one',
+        'https://b.example/two',
+        'https://c.example/three',
+      ]);
+      // The one URL both providers returned is ONE item carrying both of them,
+      // which is what the fan-out exists to produce.
+      const shared = firstDoc.items.find((item) => item.url === 'https://b.example/two');
+      expect(shared?.providers.map((p) => p.backend_id).sort()).toEqual(['exa', 'you']);
+      expect(firstDoc.coverage.served.sort()).toEqual(['exa', 'you']);
+      expect(firstDoc.billing.calls_billed).toBe(2);
+      expect(firstDoc.session).toEqual({ id: 'round-1' });
+
+      const sessionFile = join(home, '.cache', 'fezo', 'sessions', 'round-1.json');
+      const saved = JSON.parse(readFileSync(sessionFile, 'utf8')) as { id: string; seenUrls: string[]; queries: string[]; callsBilled: number };
+      expect(saved.id).toBe('round-1');
+      expect(saved.seenUrls.sort()).toEqual([
+        'https://a.example/one',
+        'https://b.example/two',
+        'https://c.example/three',
+      ]);
+      expect(saved.queries).toContain('merkle tree proofs');
+      expect(saved.callsBilled).toBe(2);
+
+      // Round two, same id, same provider bodies: nothing new to read, and the
+      // billing counter accumulates ACROSS rounds rather than restarting.
+      const second = await runCli(argv, baseDeps({ homeDir: home, fetchFn: researchFetch() }));
+      expect(second.exitCode).toBe(0);
+      const secondDoc = JSON.parse(second.stdout) as { items: unknown[]; coverage: { suppressed: number }; billing: { calls_billed: number } };
+      expect(secondDoc.coverage.suppressed).toBe(firstDoc.items.length);
+      expect(secondDoc.items).toEqual([]);
+      expect(secondDoc.billing.calls_billed).toBe(2);
+      const after = JSON.parse(readFileSync(sessionFile, 'utf8')) as { callsBilled: number };
+      expect(after.callsBilled).toBe(4);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // The round is already paid for by the time the cache is written, so a cache
+  // this round cannot persist must cost the caller the NEXT round's
+  // suppression -- never this round's results. Before the fix `saveSession`
+  // ran unguarded AND before the render, so an unwritable cache location
+  // rejected `runCli` outright: two billed calls thrown away, stdout empty
+  // despite `--json`, and an unhandled rejection instead of an exit code.
+  it('still prints an already-billed round when the session cache cannot be written', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fezoctl-cli-research-cache-'));
+    try {
+      // A regular file where the cache root should be: every mkdir under it
+      // fails with ENOTDIR, the same shape as a read-only or sandboxed home.
+      const blocked = join(dir, 'not-a-directory');
+      writeFileSync(blocked, 'x');
+      const result = await runCli(
+        ['research', 'merkle tree proofs', '--fanout', '2', '--session', 'round-1', '--json'],
+        baseDeps({
+          env: { FEZO_URL: 'https://gw.example.com', FEZO_API_KEY: SECRET, XDG_CACHE_HOME: blocked },
+          homeDir: dir,
+          fetchFn: researchFetch(),
+        }),
+      );
+      expect(result.exitCode).toBe(0);
+      const doc = JSON.parse(result.stdout) as { items: unknown[]; billing: { calls_billed: number } };
+      expect(doc.items).toHaveLength(3);
+      expect(doc.billing.calls_billed).toBe(2);
+      // Reported, not silent -- and on stderr only, because `--json` promises
+      // exactly one document on stdout.
+      expect(result.stderr).toContain('could not write the session cache');
+      expect(result.stderr).not.toContain(SECRET);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('fezoctl research: a plan with nothing to do is a usage error', () => {
+  it('rejects a whitespace-only --queries before any call', async () => {
+    const fetchFn = vi.fn();
+    const result = await runCli(
+      ['research', 'hello', '--queries', '   '],
+      baseDeps({ fetchFn: fetchFn as unknown as typeof fetch }),
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toMatch(/no queries and no targets/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('says so on stdout under --json, like every other usage error', async () => {
+    const result = await runCli(['research', 'hello', '--queries', '   ', '--json'], baseDeps());
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stdout).error.kind).toBe('usage');
   });
 });

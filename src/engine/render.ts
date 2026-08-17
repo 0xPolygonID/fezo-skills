@@ -14,11 +14,14 @@ import type { BoundRequest } from './bindings.js';
 import type { CredentialDisplay, StoreCredentialsResult } from './credentials.js';
 import type { Intent } from './intent.js';
 import type { OneStepResult } from './one-step.js';
+import { capTitle } from './aggregate.js';
+import type { RoutingPlan } from './plan.js';
 import type { AnnotatedProviderRow, CapabilityGroup, ListedProviderRow, ProviderRow } from './provider-view.js';
 import { NOT_SUBSTITUTES_NOTE, annotate, annotateListed } from './provider-view.js';
 import { RECOMMENDATION_SOURCE } from './providers.js';
 import type { Tier } from './providers.js';
 import type { RankExplanation, RankedCandidate, RunSelection } from './rank.js';
+import type { ResearchOutcome } from './research.js';
 import type { AttemptLog, RunOutcome, RunReport } from './retry.js';
 import { failureFooter, successFooter } from './steering.js';
 
@@ -980,6 +983,141 @@ export function renderSetup(input: SetupRenderInput, json: boolean): string {
   else lines.push('  configured api key: (not configured)');
   if (!usable) {
     lines.push('  this configuration is NOT usable yet: fezoctl needs an API key.');
+  }
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// plan / research (Task 10-11's fan-out executor)
+// ---------------------------------------------------------------------------
+
+/** The plan on its own (`fezoctl plan`) -- no network, no billing, so this is
+ * the cheapest way for a caller to see what routing a prompt would get. */
+export function renderPlan(plan: RoutingPlan, json: boolean): string {
+  if (json) return toJson(plan);
+  const lines = [
+    `intents:  ${plan.intents.join(', ')}`,
+    `queries:  ${plan.queries.length > 0 ? plan.queries.map((q) => `"${q}"`).join(', ') : '(none)'}`,
+    `targets:  ${plan.targets.length > 0 ? plan.targets.join(', ') : '(none)'}`,
+    `depth:    ${plan.depth} (fan-out ${String(plan.fanout)} providers per query)`,
+    `source:   ${plan.source}`,
+    `signals:  ${plan.signals.length > 0 ? plan.signals.join('; ') : '(none)'}`,
+    '',
+    'Override any field: --intents, --queries, --targets, --depth, --fanout, or --plan-json.',
+  ];
+  return lines.join('\n');
+}
+
+/**
+ * One research round.
+ *
+ * Gaps and billing are rendered even on a fully successful round, for the
+ * reason `renderOneStep` above states about caps: "it worked" and "it worked
+ * but half the providers never answered" must not look identical.
+ */
+export function renderResearch(outcome: ResearchOutcome, sessionId: string | undefined, json: boolean): string {
+  if (json) {
+    return toJson({
+      ok: outcome.ok,
+      plan: outcome.plan,
+      items: outcome.items.map((item) => ({
+        url: item.url,
+        // Capped HERE, at the emit boundary, because this is the last place the
+        // title is text rather than identity -- see aggregate.ts's
+        // TITLE_MAX_CHARS for the two earlier placements that both poisoned a
+        // dedup key.
+        title: capTitle(item.title),
+        ...(item.snippet !== undefined ? { snippet: item.snippet } : {}),
+        ...(item.publishedAt !== undefined ? { published_at: item.publishedAt } : {}),
+        providers: item.providers.map((p) => ({ backend_id: p.backendId, rank: p.rank, result_rank: p.resultRank })),
+        score: item.score,
+        duplicates: item.duplicates,
+      })),
+      documents: outcome.documents.map((doc) => ({ url: doc.url, backend_id: doc.backendId, content: doc.content })),
+      // Mapped, not emitted raw: `coverage` is a shape this feature invented,
+      // so its wire spelling was ours to choose, and snake_case matches the
+      // sections around it (`calls_billed`, `backend_id`, `result_rank`).
+      // SKILL.md teaches agents to read `gaps`, so this is a public contract
+      // from the moment anything depends on it -- cheaper to settle now than to
+      // carry both spellings forever.
+      //
+      // NOT a claim that the whole document is snake_case: `billing.attempts`
+      // below is `AttemptLog` verbatim (`backendId`, `httpStatus`,
+      // `gatewayCode`), which `call` and `run` have emitted in that shape since
+      // long before this feature. Renaming it is a wider contract decision
+      // about those commands, not a tidy-up belonging to this one.
+      coverage: {
+        queries: outcome.coverage.queries.map((q) => ({
+          query: q.query,
+          unique_urls: q.uniqueUrls,
+          agreement_median: q.agreementMedian,
+        })),
+        served: outcome.coverage.served,
+        unreadable: outcome.coverage.unreadable,
+        failed: outcome.coverage.failed.map((f) => ({ backend_id: f.backendId, reason: f.reason })),
+        skipped: outcome.coverage.skipped,
+        ...(outcome.coverage.domainConcentration !== undefined
+          ? { domain_concentration: outcome.coverage.domainConcentration }
+          : {}),
+        dropped_queries: outcome.coverage.droppedQueries,
+        unfetched_targets: outcome.coverage.unfetchedTargets,
+        narrowed_queries: outcome.coverage.narrowedQueries,
+        suppressed: outcome.coverage.suppressed,
+        gaps: outcome.coverage.gaps,
+      },
+      next_actions: outcome.nextActions.map((a) => ({
+        why: a.why,
+        // Omitted rather than emitted as null when an action carries no
+        // command: a consumer testing `if (action.cmd)` and one testing
+        // `'cmd' in action` must agree, and `null` in a field documented as a
+        // runnable command invites being coerced to the string "null".
+        ...(a.cmd !== undefined ? { cmd: a.cmd } : {}),
+      })),
+      billing: { calls_billed: outcome.billing.callsBilled, attempts: outcome.billing.attempts },
+      session: sessionId !== undefined ? { id: sessionId } : null,
+    });
+  }
+
+  const lines: string[] = [];
+  outcome.items.forEach((item, index) => {
+    const providers = item.providers.map((p) => p.backendId).join(', ');
+    lines.push(`${String(index + 1)}. ${capTitle(item.title)}`);
+    lines.push(`   ${item.url}`);
+    if (item.snippet !== undefined) lines.push(`   ${item.snippet}`);
+    lines.push(`   sources: ${providers}${item.duplicates.length > 0 ? ` (+${String(item.duplicates.length)} duplicate link(s))` : ''}`);
+    lines.push('');
+  });
+  if (outcome.items.length === 0) lines.push('No results.', '');
+
+  for (const doc of outcome.documents) {
+    // Byte count, not the body: a scraped page is routinely tens of kilobytes,
+    // and printing it would bury the merged results this command exists to
+    // produce. `--json` carries the full content for anything that needs it.
+    lines.push(`fetched ${doc.url} via ${doc.backendId} (${String(doc.content.length)} bytes)`);
+  }
+  if (outcome.documents.length > 0) lines.push('');
+
+  lines.push(`Providers served: ${outcome.coverage.served.join(', ') || '(none)'}`);
+  if (outcome.coverage.failed.length > 0) {
+    lines.push(`Failed: ${outcome.coverage.failed.map((f) => `${f.backendId} (${f.reason})`).join(', ')}`);
+  }
+  if (outcome.coverage.suppressed > 0) {
+    lines.push(`Suppressed ${String(outcome.coverage.suppressed)} result(s) already seen in this session.`);
+  }
+  lines.push(`Billed ${String(outcome.billing.callsBilled)} call(s).`);
+  if (outcome.aborted !== undefined) lines.push(`Stopped: ${outcome.aborted}`);
+  if (outcome.coverage.gaps.length > 0) {
+    lines.push('', 'Gaps:');
+    for (const gap of outcome.coverage.gaps) lines.push(`  - ${gap}`);
+  }
+  if (outcome.nextActions.length > 0) {
+    lines.push('', 'Next:');
+    // An action with no `cmd` is advice, not a command, and is printed as prose
+    // — never in command position with the sentence standing in for a command,
+    // which is an instruction to run its first word.
+    for (const action of outcome.nextActions) {
+      lines.push(action.cmd !== undefined ? `  ${action.cmd}   # ${action.why}` : `  ${action.why}`);
+    }
   }
   return lines.join('\n');
 }
