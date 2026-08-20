@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { MechanicalFailure } from '../src/engine/retry.js';
-import { ABORT_CODES, RETRY_CODES, classifyFailure } from '../src/engine/retry.js';
+import { ABORT_CODES, RETRY_CODES, UNBILLED_GATEWAY_CODES, classifyFailure } from '../src/engine/retry.js';
 
 // ---------------------------------------------------------------------------
 // classifyFailure -- code-first, status-fallback retry classification.
@@ -240,6 +240,37 @@ describe('classifyFailure — ABORT_CODES / RETRY_CODES set membership', () => {
     expect(overlap).toEqual([]);
     const reverseOverlap = expectedRetryCodes.filter((code) => ABORT_CODES.has(code));
     expect(reverseOverlap).toEqual([]);
+  });
+
+  // UNBILLED_GATEWAY_CODES pinned in the same place, and for the same reason:
+  // it decides whether an attempt spends the user's `maxAttempts` budget, so a
+  // code sliding into (or out of) it silently changes how far a walk gets
+  // before giving up. Membership is a claim about WHERE the gateway writes
+  // each code -- before the forward, or after -- which no per-code behavior
+  // test can check on its own.
+  const expectedUnbilledCodes = ['backend_not_found', 'backend_unavailable', 'provider_disabled', 'backend_not_configured'];
+
+  it('UNBILLED_GATEWAY_CODES is exactly this list, no more and no fewer', () => {
+    expect(new Set(UNBILLED_GATEWAY_CODES)).toEqual(new Set(expectedUnbilledCodes));
+    expect(UNBILLED_GATEWAY_CODES.size).toBe(expectedUnbilledCodes.length);
+  });
+
+  it('UNBILLED_GATEWAY_CODES is a subset of RETRY_CODES: a code that stops the run has no budget to spare', () => {
+    for (const code of UNBILLED_GATEWAY_CODES) {
+      expect(RETRY_CODES.has(code), code).toBe(true);
+      expect(ABORT_CODES.has(code), code).toBe(false);
+    }
+  });
+
+  it('excludes every code that can follow a forwarded request', () => {
+    // backend_error can be written AFTER a forward fails mid-flight (502);
+    // quota_exceeded/rate_limited are written by the backend itself, which
+    // only sees a request that was already forwarded. None may promise
+    // "nothing was billed". tool_not_in_catalog issues no request at all but
+    // never reaches `run`'s loop, so it has no budget to exempt either.
+    for (const code of ['backend_error', 'quota_exceeded', 'rate_limited', 'tool_not_in_catalog']) {
+      expect(UNBILLED_GATEWAY_CODES.has(code), code).toBe(false);
+    }
   });
 
   it('every code in ABORT_CODES classifies as abort, and every code in RETRY_CODES classifies as retry', () => {

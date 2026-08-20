@@ -1466,6 +1466,49 @@ describe('web-search / scrape / crawl (one-step commands)', () => {
     expect(textResult.stdout).toContain('Stopped after 3 provider(s)');
   });
 
+  // The reported bug, through the CLI: an account with every provider disabled
+  // except the two lowest-ranked ones. /v1/catalog does not filter by the
+  // caller's per-backend disable list, so the walk must discover the disabled
+  // providers by calling them -- for free, at 403 -- and keep going.
+  it('walks past providers disabled for the account, names them, and bills only the one that served it', async () => {
+    const catalog = ALL_SEARCH_PROVIDERS_CATALOG.map((backend) => ({
+      ...backend,
+      methods: backend.methods.map((m) => ({
+        ...m,
+        input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+      })),
+    }));
+    const disabled = (): Response => gatewayErrorResponse(403, 'provider_disabled', 'provider disabled for this account');
+    const routes = (): Record<string, Response[]> => ({
+      you: [disabled()],
+      exa: [disabled()],
+      brave: [disabled()],
+      firecrawl: [disabled()],
+      geonode: [okResponse('{"results":[]}')],
+    });
+
+    const result = await runCli(['web-search', 'weather today', '--json'], baseDeps({ fetchFn: multiRouteFetch(catalog, routes()) }));
+
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as {
+      served: { backend_id: string; rank: number; success: boolean };
+      stopped_by?: string;
+      unbilled_rejections?: number;
+      attempts: { backend_id?: string; backendId: string; billed: boolean }[];
+    };
+    // Rank 5 -- four ranks past the 3-attempt cap that used to end the walk.
+    expect(parsed.served).toEqual({ backend_id: 'geonode', provider: 'Geonode', rank: 5, success: true });
+    expect(parsed.stopped_by).toBeUndefined();
+    expect(parsed.unbilled_rejections).toBe(4);
+    expect(parsed.attempts.filter((a) => a.billed).map((a) => a.backendId)).toEqual(['geonode']);
+
+    const textResult = await runCli(['web-search', 'weather today'], baseDeps({ fetchFn: multiRouteFetch(catalog, routes()) }));
+    expect(textResult.stdout).toContain('Rejected by the gateway before any provider was called');
+    expect(textResult.stdout).toContain('you (provider_disabled)');
+    expect(textResult.stdout).toContain('re-enable the provider for your account');
+    expect(textResult.stdout).not.toContain('Stopped after');
+  });
+
   it('crawl walks the declared `crawl` roster with a url-kind argument', async () => {
     const catalog: WireBackend[] = [
       {

@@ -23,6 +23,7 @@ import type { Tier } from './providers.js';
 import type { RankExplanation, RankedCandidate, RunSelection } from './rank.js';
 import type { ResearchOutcome } from './research.js';
 import type { AttemptLog, RunOutcome, RunReport } from './retry.js';
+import { isUnbilledGatewayRejection } from './retry.js';
 import { failureFooter, successFooter } from './steering.js';
 
 // ---------------------------------------------------------------------------
@@ -484,6 +485,10 @@ interface OneStepJson {
   manifest_rejected: string[];
   skipped: string[];
   stopped_by?: 'max-attempts' | 'deadline';
+  /** How many attempts the GATEWAY rejected before any provider was called
+   * (disabled for this account, unavailable, or missing required settings).
+   * See retry.ts's `RunReport.unbilledRejections`. */
+  unbilled_rejections?: number;
   attempts: readonly AttemptLog[];
   result: object;
   billed_any_attempt: boolean;
@@ -507,6 +512,7 @@ export function renderOneStep(result: OneStepResult, json: boolean): string {
       manifest_rejected: manifestRejected,
       skipped,
       ...(report.stoppedBy !== undefined ? { stopped_by: report.stoppedBy } : {}),
+      ...(report.unbilledRejections !== undefined ? { unbilled_rejections: report.unbilledRejections } : {}),
       attempts: report.attempts,
       result: outcomeToJson(report.outcome),
       billed_any_attempt: billedAnyAttempt,
@@ -555,6 +561,21 @@ export function renderOneStep(result: OneStepResult, json: boolean): string {
       `Skipped ${manifestRejected.join(', ')}: that provider's manifest requires an argument ` +
         `\`${spec.command}\` does not supply -- run \`fezoctl schema <tool>\` to see its bindings, then ` +
         '`fezoctl call <tool>` to supply them yourself.',
+    );
+  }
+  // Printed even on a successful run, and for the same reason `argRejected`
+  // above is: the walk silently passing over the providers the caller thinks
+  // it is using is exactly what they cannot otherwise see. This is the only
+  // signal that a provider is switched off at the GATEWAY -- the catalog still
+  // advertises it, so `providers`/`search` show it as callable and `skipped`
+  // never names it.
+  const unbilled = report.attempts.filter(isUnbilledGatewayRejection);
+  if (unbilled.length > 0) {
+    const named = unbilled.map((attempt) => `${attempt.backendId} (${attempt.gatewayCode ?? 'rejected'})`).join(', ');
+    lines.push(
+      `Rejected by the gateway before any provider was called: ${named}. ` +
+        'Nothing was billed for these and they did not consume the attempt budget; ' +
+        're-enable the provider for your account (or fix its required settings) to use it.',
     );
   }
   if (report.stoppedBy === 'max-attempts') {
