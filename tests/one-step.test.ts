@@ -386,6 +386,72 @@ describe('runOneStep', () => {
     expect(timedFetch).toHaveBeenCalledTimes(1);
   });
 
+  // -------------------------------------------------------------------------
+  // The reported bug, end to end: an account with every provider disabled
+  // except ScraperAPI and ScrapingBee could not scrape a URL at all. The
+  // gateway's /v1/catalog does not filter by the caller's own per-backend
+  // disable list, so `buildWalk` cannot pass those providers over -- they are
+  // in the catalog, they are ranked, and they publish a `url` argument. The
+  // walk therefore spent its whole 3-attempt budget on three free 403s
+  // (`provider_disabled`) and gave up at rank 3, with ScraperAPI unasked at
+  // rank 6 and nothing billed and nothing scraped.
+  // -------------------------------------------------------------------------
+  it('reaches the one enabled provider when every higher-ranked one is disabled for the account', async () => {
+    const scrapeSpec = specFor('scrape');
+    const urlSchema = { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] };
+    // The real `scrape` ranking, in declared order, each with its declared
+    // entry method -- the catalog the gateway serves a user who has disabled
+    // the first five.
+    const candidates = [
+      candidate({ backendId: 'scrapingdog', method: 'scrape', inputSchema: urlSchema }),
+      candidate({ backendId: 'brightdata', method: 'unlock', inputSchema: urlSchema }),
+      candidate({ backendId: 'firecrawl', method: 'scrape', inputSchema: urlSchema }),
+      candidate({ backendId: 'geonode', method: 'scrape', inputSchema: urlSchema }),
+      candidate({ backendId: 'apify', method: 'runs_submit', inputSchema: urlSchema }),
+      candidate({ backendId: 'scraperapi', method: 'scrape', inputSchema: urlSchema }),
+      candidate({ backendId: 'scrapingbee', method: 'scrape', inputSchema: urlSchema }),
+    ];
+    // A fresh Response per backend: a body can only be read once, so a shared
+    // one would surface as a "Body has already been read" transport failure
+    // from the second candidate on -- a fixture artifact that would quietly
+    // test something else entirely.
+    const disabled = (): Response => gatewayErrorResponse(403, 'provider_disabled', 'provider disabled for this account');
+    const fetchFn = routedFetch({
+      scrapingdog: [disabled()],
+      brightdata: [disabled()],
+      firecrawl: [disabled()],
+      geonode: [disabled()],
+      apify: [disabled()],
+      scraperapi: [okResponse('<html>the page</html>')],
+    });
+
+    const result = await runOneStep(
+      scrapeSpec,
+      'https://sherpa.ai/blog/training-together-diagnosing-better-federated-learning',
+      {},
+      candidates,
+      NO_EXCLUSIONS,
+      { ...GATEWAY, fetchFn },
+    );
+
+    expect(result.report.outcome.kind).toBe('success');
+    expect(result.served).toEqual({ backendId: 'scraperapi', displayName: 'ScraperAPI', rank: 6, success: true });
+    expect(result.report.stoppedBy).toBeUndefined();
+    expect(result.report.unbilledRejections).toBe(5);
+    // Exactly one paid call: the one that actually returned the page.
+    expect(result.report.attempts.filter((a) => a.billed).map((a) => a.backendId)).toEqual(['scraperapi']);
+    // ScrapingBee is never reached, and that is correct -- the walk stops at
+    // the first provider that answers, it does not sweep the rest.
+    expect(result.report.attempts.map((a) => a.backendId)).toEqual([
+      'scrapingdog',
+      'brightdata',
+      'firecrawl',
+      'geonode',
+      'apify',
+      'scraperapi',
+    ]);
+  });
+
   it('a direct success on the first try still carries the full billing report', async () => {
     const candidates = [candidate({ backendId: 'you', method: 'search' })];
     const fetchFn = routedFetch({ you: [okResponse('{"ok":true}')] });

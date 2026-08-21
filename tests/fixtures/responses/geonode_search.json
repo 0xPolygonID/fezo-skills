@@ -1,0 +1,190 @@
+{
+  "job_id": "90b17046-652f-4754-ba59-e07e30c19df4",
+  "query": "renewable energy storage",
+  "page": 1,
+  "attempts": 1,
+  "results": [
+    {
+      "position": 1,
+      "title": "Solving renewable energy’s sticky storage problem - The Institute for Climate and Sustainable Growth",
+      "url": "https://climate.uchicago.edu/news/solving-renewable-energys-sticky-storage-problem/",
+      "snippet": "The solution lies, of course, in storing energy when it’s abundant so it’s available for use during lean times. But the increasingly popular electricity-storage devices today — lithium-ion batteries — are only cost-effective in bridging daily fluctuations in sun and wind, not multiday doldrums.",
+      "thumbnail": null,
+      "displayed_url": "climate.uchicago.edu",
+      "source_host": "climate.uchicago.edu"
+    },
+    {
+      "position": 2,
+      "title": "What is renewable energy storage (and why is it important for reaching net zero)? | National Grid",
+      "url": "https://www.nationalgrid.com/stories/energy-explained/what-is-renewable-energy-storage",
+      "snippet": "When this happens, some renewable generators may need to curtail their outputs in order to help the system remain ‘balanced’ – i.e. when electricity supply meets demand – meaning that an opportunity to generate clean electricity has essentially gone to waste. Energy storage allows these renewable energy resources to continue to generate electricity even if it’s not needed at that particular time, as it can be stored until a later time when it’s needed.",
+      "thumbnail": null,
+      "displayed_url": "www.nationalgrid.com",
+      "source_host": "www.nationalgrid.com"
+    },
+    {
+      "position": 3,
+      "title": "Energy Storage",
+      "url": "https://www.irena.org/Energy-Transition/Technology/Energy-Storage",
+      "snippet": "Thermal energy storage systems can be as simple as hot-water tanks, but more advanced technologies can store energy more densely (e.g., molten salts, as used in concentrating solar power). With the rapidly falling costs of solar and wind power technologies, increasing shares of variable renewable energy will become the norm, while efforts to decarbonise the transport sector are being accelerated by the use of electric vehicles.",
+      "thumbnail": null,
+      "displayed_url": "www.irena.org",
+      "source_host": "www.irena.org"
+    },
+    {
+      "position": 4,
+      "title": "Renewable Energy Storage - an overview | ScienceDirect Topics",
+      "url": "https://www.sciencedirect.com/topics/engineering/renewable-energy-storage",
+      "snippet": "Energy storage, as a significant and regulated component of power grids, can supply a short-term energy supply that enables seamless off-grid switching [119–121]. Energy storage technologies have been considered as an essential factor to facilitate renewable energy absorption, enhance grid control, and ensure the security and cost effectiveness of power grid services [43, 122]. Applications of AI techniques cover many aspects including parameter estimation, optimization design, and operational control of energy storage and RES integration [24]. Zhou et al.",
+      "thumbnail": null,
+      "displayed_url": "www.sciencedirect.com",
+      "source_host": "www.sciencedirect.com"
+    },
+    {
+      "position": 5,
+      "title": "Renewable and Clean Energy Storage | NYSERDA",
+      "url": "https://www.nyserda.ny.gov/PutEnergyToWork/Energy-Technology-and-Solutions/Renewables-and-Clean-Technologies/Energy-Storage",
+      "snippet": "Storage systems can be installed on their own to store energy from the grid and release it during peak load times, lowering your energy bills. They can also integrate with renewable energy technologies (e.g., solar) to provide consistent power during peak load times or when energy may not be available (e.g., when the sun is not shining).",
+      "thumbnail": null,
+      "displayed_url": "www.nyserda.ny.gov",
+      "source_host": "www.nyserda.ny.gov"
+    },
+    {
+      "position": 6,
+      "title": "Energy Storage Technologies | Energy Storage Europe",
+      "url": "https://energystorageeurope.eu/facts-and-figures/technologies/",
+      "snippet": "Energy storage can store surplus energy from intermittent renewable sources, such as solar PV and wind power, until it is required – allowing therefore for the integration of additional renewable energy into the system.",
+      "thumbnail": null,
+      "displayed_url": "energystorageeurope.eu",
+      "source_host": "energystorageeurope.eu"
+    },
+    {
+      "position": 7,
+      "title": "Energy Storage | U.S. Energy Storage Coalition",
+      "url": "https://www.energystorage.org/",
+      "snippet": "Energy storage reduces energy waste, improves grid efficiency, limits costly energy imports, prevents and minimizes power outages, and allows the grid to use more affordable clean energy resources—all of which reduce energy costs for consumers.",
+      "thumbnail": null,
+      "displayed_url": "www.energystorage.org",
+      "source_host": "www.energystorage.org"
+    },
+    {
+      "position": 8,
+      "title": "Renewable energy battery storage in the US - Clearway",
+      "url": "https://www.clearwayenergygroup.com/projects/battery-storage/",
+      "snippet": "Battery storage allows for the storing of energy when there is excess supply and later discharges that energy when demand is high. This makes the most efficient use of our grid, helping utilities and households save money on electricity. By providing back up power, battery storage also helps ...",
+      "thumbnail": null,
+      "displayed_url": "www.clearwayenergygroup.com",
+      "source_host": "www.clearwayenergygroup.com"
+    },
+    {
+      "position": 9,
+      "title": "Energy Storage Facts and Information | ACP | ACP",
+      "url": "https://cleanpower.org/facts/clean-energy-storage/",
+      "snippet": "Energy storage supports high-fidelity facilities by ensuring steady, reliable power quality, helping critical infrastructure like data centers and advanced manufacturing to operate without interruption. By smoothing variable energy output from renewables like solar and wind, storage strengthens grid stability and ensures reliable integration of new energy projects.",
+      "thumbnail": "https://imgs.search.brave.com/g-qvxcblWPFkZjGHELYc-_W9wtFLBqTS-OtYPfp0j6U/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly9jbGVh/bnBvd2VyLm9yZy93/cC1jb250ZW50L3Vw/bG9hZHMvMjAyMS8w/MS9hbWVyaWNhbi1z/b2xhci1mYXJtLWFl/cmlhbC12aWV3LXNj/YWxlZC5qcGc",
+      "displayed_url": "cleanpower.org",
+      "source_host": "cleanpower.org"
+    },
+    {
+      "position": 10,
+      "title": "Storage solutions for renewable energy: A review - ScienceDirect",
+      "url": "https://www.sciencedirect.com/science/article/pii/S2772427125000324",
+      "snippet": "Electrical storage methods, such as supercapacitors, provide rapid response capabilities but are limited by low energy density. Mechanical systems, including pumped hydro and compressed air storage, excel in large-scale scenarios but face geographical constraints. Emerging chemical storage technologies, including hydrogen and synthetic natural gas, offer long-term solutions but require advancements in efficiency. Thermal storage systems, such as molten salt and latent heat storage, show significant potential for renewable integration in heating and cooling, although material costs remain a barrier.",
+      "thumbnail": "https://imgs.search.brave.com/KQCYwyf4ulaee5jqWeQMLzji_QZKfpfJRfBxOd4TE98/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly9hcnMu/ZWxzLWNkbi5jb20v/Y29udGVudC9pbWFn/ZS8xLXMyLjAtUzI3/NzI0MjcxMjRYMDAw/NTQtY292MTUwaC5n/aWY.jpeg",
+      "displayed_url": "www.sciencedirect.com",
+      "source_host": "www.sciencedirect.com"
+    },
+    {
+      "position": 11,
+      "title": "Energy storage: what it is and how it works | Enel Group",
+      "url": "https://www.enel.com/learning-hub/storage",
+      "snippet": "Energy storage systems be applied both on a large and a small scale. They can either feed the grid or they can be used in small-scale, residential, so-called \"behind the meter\" solutions. By 2050, nearly 50% of the electricity fed into the grid will be generated from renewable sources.",
+      "thumbnail": "https://imgs.search.brave.com/4shunf4rRnSvgazcRnRVv-3vrCbAsf7aq72zCOQpmDY/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly93d3cu/ZW5lbC5jb20vY29u/dGVudC9kYW0vZW5l/bC1jb20vaW1tYWdp/bmkvbGVhcm5pbmct/aHViL2VuZXJnaWUt/cmlubm92YWJpbGkv/c3RvcmFnZS9zb2Np/YWwtdGh1bWJuYWls/LXN0b3JhZ2UuanBn",
+      "displayed_url": "www.enel.com",
+      "source_host": "www.enel.com"
+    },
+    {
+      "position": 12,
+      "title": "Why Energy Storage is Essential for a Green Transition | CFR Education",
+      "url": "https://www.cfr.org/education/learn/reading/energy-storage-climate-change",
+      "snippet": "Energy storage plays a crucial role in adding high levels of renewable energy to the grid and reducing the demand for electricity from inefficient, polluting power plants. The good news is that energy storage strategies are being adopted rapidly.",
+      "thumbnail": "https://imgs.search.brave.com/vosKkXbLjhq30FUlF_gXsBztkz2FJ4lZBOM8ybfmIb4/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly9hc3Nl/dHMuY2ZyLm9yZy9p/bWFnZXMvd18xMjAw/L3RfY2ZyXzE2Xzkv/Zl9hdXRvL3YxNzc2/NzE2MTg1L2VkdS9S/QzJGTzZBSU1GNVYt/aGVyb18zNTcwNDcz/ZmQvUkMyRk82QUlN/RjVWLWhlcm9fMzU3/MDQ3M2ZkLndlYnA",
+      "displayed_url": "www.cfr.org",
+      "source_host": "www.cfr.org"
+    },
+    {
+      "position": 13,
+      "title": "Electricity Storage | US EPA",
+      "url": "https://www.epa.gov/energy/electricity-storage",
+      "snippet": "Details technologies that can be used to store electricity so it can be used at times when demand exceeds generation, which helps utilities operate more effectively, reduce brownouts, and allow for more renewable energy resources to be built ...",
+      "thumbnail": "https://imgs.search.brave.com/Z2zQtER9-TeG0PZI4FBkuToSOuiWUH9ioLgM6rEqABU/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly93d3cu/ZXBhLmdvdi9zeXN0/ZW0vZmlsZXMvaW1h/Z2VzLzIwMjItMDMv/ZXBhLXN0YW5kYXJk/LXR3aXR0ZXIuanBn",
+      "displayed_url": "www.epa.gov",
+      "source_host": "www.epa.gov"
+    },
+    {
+      "position": 14,
+      "title": "6 Key Storage Technologies for Renewable Energy",
+      "url": "https://blog.rgbsi.com/6-storage-technologies-renewable-energy",
+      "snippet": "Here are 6 key storage technologies for renewable energy: batteries. pumped hydrogen, hydrogen, flywheels, CAES, PHES important to balance energy demand.",
+      "thumbnail": "https://imgs.search.brave.com/YaoHnUPOnOsLSHkGba7SV9VWSEWyzM0rDpzf4oJpcss/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly9ibG9n/LnJnYnNpLmNvbS9o/dWJmcy9lbmVyZ3kt/c3RvcmFnZS10ZWNo/bm9sb2dpZXMtYmxv/Zy0xMzAweDYyOC5q/cGc",
+      "displayed_url": "blog.rgbsi.com",
+      "source_host": "blog.rgbsi.com"
+    },
+    {
+      "position": 15,
+      "title": "ISO - Energy storage: Powering the future of renewable energy",
+      "url": "https://www.iso.org/renewable-energy/storage",
+      "snippet": "Energy storage is revolutionizing our power landscape, turning intermittent renewables into reliable powerhouses. The benefits of energy storage systems are striking: drastically reduced reliance on fossil fuels, significant savings on energy bills, and a more resilient power grid.",
+      "thumbnail": "https://imgs.search.brave.com/7r5gKHtD-8kTQ22VjuR1idx2raH7OTppyDXABr0k3MM/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly93d3cu/aXNvLm9yZy9maWxl/cy9saXZlL3NpdGVz/L2lzb29yZy9maWxl/cy9uZXdzL2luc2ln/aHRzL2VuZXJneS9F/bmVyZ3klMjAtJTIw/RW5lcmd5JTIwU3Rv/cmFnZS5wbmcvdGh1/bWJuYWlscy8xMjAw/eDYwMA",
+      "displayed_url": "www.iso.org",
+      "source_host": "www.iso.org"
+    },
+    {
+      "position": 16,
+      "title": "Battery Energy Storage Systems: Key to Renewable Power Supply-Demand Gaps",
+      "url": "https://www.irena.org/News/articles/2025/Aug/Battery-energy-storage-systems-key-to-renewable-power-supply-demand-gaps",
+      "snippet": "Battery energy storage systems offer power grids key opportunities for better flexibility, renewable energy integration, and reliable power supply by storing excess renewable energy during low demand times to release during peak demand enabling higher renewable energy penetration and supporting global decarbonisation.",
+      "thumbnail": "https://imgs.search.brave.com/CN3Ud2zqLE6zIelASaeDqh8Nd92E-Cqe-F0NI4PVo-Y/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly93d3cu/aXJlbmEub3JnLy0v/bWVkaWEvSW1hZ2Vz/L0lSRU5BL0FnZW5j/eS9BcnRpY2xlLzIw/MjUvQXVnL0JhdHRl/cnktZW5lcmd5LXN0/b3JhZ2Utc3lzdGVt/cy1CYW5uZXItSW1h/Z2UuanBn",
+      "displayed_url": "www.irena.org",
+      "source_host": "www.irena.org"
+    },
+    {
+      "position": 17,
+      "title": "Renewable energy storage systems to power the future - Atlas Copco USA",
+      "url": "https://www.atlascopco.com/en-us/construction-equipment/resources/generators-guide/renewable-energy-storage-to-power-the-future",
+      "snippet": "The most efficient way to store – and deliver – energy coming from renewable sources is through battery-based renewable energy storage systems. The more battery storage for renewable energy that is available the less there will be a need ...",
+      "thumbnail": "https://imgs.search.brave.com/6aY40ZF8Jts8AYQ8iAXBwfObjAtbMC0HtbBbPDGaflY/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly93d3cu/YXRsYXNjb3Bjby5j/b20vY29udGVudC9k/YW0vYXRsYXMtY29w/Y28vY29uc3RydWN0/aW9uLXRlY2huaXF1/ZS9wb3J0YWJsZS1l/bmVyZ3kvcGljdHVy/ZXMvZm9yLXdlYi1v/bmx5LXBmbC9pbmZv/Z3JhcGhpY3MvcmVu/ZXdhYmxlLWVuZXJn/eS1zdG9yYWdlLXN5/c3RlbXMucG5nL2pj/cjpjb250ZW50L3Jl/bmRpdGlvbnMvY3E1/ZGFtLndlYi4xMjAw/LjYyOC5wbmc",
+      "displayed_url": "www.atlascopco.com",
+      "source_host": "www.atlascopco.com"
+    },
+    {
+      "position": 18,
+      "title": "What Is Energy Storage & How Does It Work? | Constellation",
+      "url": "https://www.constellation.com/energy-101/energy-innovation/energy-storage.html",
+      "snippet": "We can store energy in batteries because this chemical reaction is reversible. When you charge the electrolyte with wind, solar, or another source of power, it holds the charge until a circuit is created and the power is then discharged.",
+      "thumbnail": "https://imgs.search.brave.com/0EyfmukSdwxX3A1xqtrKqsj4NIuP0vv2lnqbd-xMDbM/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly93d3cu/Y29uc3RlbGxhdGlv/bi5jb20vY29udGVu/dC9jb25zdGVsbGF0/aW9uL2VuL2VuZXJn/eS0xMDEvZW5lcmd5/LWlubm92YXRpb24v/ZW5lcmd5LXN0b3Jh/Z2UvamNyJTNBY29u/dGVudC9vZ2ltYWdl/LmltZy5wbmcvd2hh/dC1pcy1lbmVyZ3kt/c3RvcmFnZS5wbmc",
+      "displayed_url": "www.constellation.com",
+      "source_host": "www.constellation.com"
+    },
+    {
+      "position": 19,
+      "title": "Energy Storage Systems | Southwest Research Institute",
+      "url": "https://www.swri.org/markets/energy-environment/power-generation-utilities/conventional-power-generation/energy-storage-systems",
+      "snippet": "Energy storage systems may include lithium-ion battery banks used with photovoltaic solar arrays, tanks of molten salt that store heat form concentrating solar (CSP), or pumped hydro systems used in conjunction with wind farms.",
+      "thumbnail": "https://imgs.search.brave.com/j_SV-d4zWzTTgIgzSZ1R-73E-u2hxjAcvjKmvZl-Rjs/rs:fit:200:200:1:0/g:ce/aHR0cHM6Ly93d3cu/c3dyaS5vcmcvc2l0/ZXMvZGVmYXVsdC9m/aWxlcy9zdHlsZXMv/Y2xpZW50X3NlcnZp/Y2VzX2Jhbm5lci9w/dWJsaWMvY2xpZW50/LXNlcnZpY2VzLWlt/YWdlcy9BZG9iZVN0/b2NrXzE4MjU0ODg2/MC5qcGVn",
+      "displayed_url": "www.swri.org",
+      "source_host": "www.swri.org"
+    }
+  ],
+  "suggestions": [
+    "solar storage renewable energy",
+    "renewable energy storage pdf",
+    "renewable energy storage companies",
+    "energy storage systems",
+    "renewable energy storage problems",
+    "renewable energy storage batteries",
+    "storage renewable energy cost",
+    "energy storage examples"
+  ],
+  "spelling_correction": null
+}

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 jobs:
   test:
@@ -71,14 +71,28 @@ jobs:
       # which this grep would misattribute as "a test is writing to a real
       # stream". Guarding on the previous step's success removes that
       # misdiagnosis.
+      # Vitest's OWN reporter lines are excluded before the grep. Several test
+      # names contain the word "fezoctl" -- they describe what `fezoctl
+      # --version` prints -- and the default reporter names an individual test
+      # once it crosses the 300ms slow threshold. Two of them spawn a node
+      # process and sit right on that boundary (~310ms locally), so on a slower
+      # runner they get printed and this check failed with the word appearing
+      # in a test TITLE, not in stray output.
+      #
+      # A reporter line always carries a status glyph; a test writing to a real
+      # stream emits raw text ("fezoctl 1.0.0") with no glyph and no duration.
+      # Filtering on the glyph therefore keeps exactly what this check is for
+      # while dropping the false positive -- renaming the tests would have been
+      # the wrong fix, since the names are accurate.
       - name: Test output is pristine (no stray "fezoctl" lines on the runner)
         run: |
           set -euo pipefail
-          count="$(grep -c fezoctl /tmp/vitest-output.txt || true)"
+          stray="$(grep -vE '[✓×↓❯]' /tmp/vitest-output.txt || true)"
+          count="$(printf '%s' "${stray}" | grep -c fezoctl || true)"
           echo "fezoctl mention count: ${count}"
           if [ "${count}" != "0" ]; then
             echo "vitest output is not pristine — a test is writing to a real stream instead of capturing it" >&2
-            grep -n fezoctl /tmp/vitest-output.txt >&2 || true
+            printf '%s' "${stray}" | grep -n fezoctl >&2 || true
             exit 1
           fi
 

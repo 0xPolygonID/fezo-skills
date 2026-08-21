@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import type { ToolCandidate } from '../src/engine/catalog.js';
 import { credentialDisplay, DEFAULT_GATEWAY_URL } from '../src/engine/credentials.js';
 import type { CredentialResolution, StoreCredentialsResult } from '../src/engine/credentials.js';
+import type { RoutingPlan } from '../src/engine/plan.js';
 import type { RankedCandidate, RunSelection } from '../src/engine/rank.js';
+import type { ResearchOutcome } from '../src/engine/research.js';
 import type { AttemptLog, RunReport } from '../src/engine/retry.js';
 import {
   BILLING_STATEMENT,
@@ -11,6 +13,8 @@ import {
   renderCatalog,
   renderDoctor,
   renderError,
+  renderPlan,
+  renderResearch,
   renderRun,
   renderSchema,
   renderSearch,
@@ -603,5 +607,85 @@ describe('credentialDisplay', () => {
     const resolution: CredentialResolution = { url: { value: 'https://gw.example.com', masked: 'http…', source: 'env' } };
     const display = credentialDisplay(resolution);
     expect(display.url?.value).toBe('https://gw.example.com');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// plan / research (Task 11)
+// ---------------------------------------------------------------------------
+
+const PLAN: RoutingPlan = {
+  intents: ['search'], queries: ['coffee'], targets: [], depth: 'standard',
+  fanout: 4, signals: ['question-form'], source: 'heuristic',
+};
+
+const OUTCOME: ResearchOutcome = {
+  plan: PLAN,
+  ok: true,
+  items: [{
+    url: 'https://a.example', title: 'A', snippet: 'about a',
+    providers: [{ backendId: 'you', rank: 1, resultRank: 1 }, { backendId: 'exa', rank: 2, resultRank: 3 }],
+    score: 0.03, duplicates: [],
+  }],
+  documents: [{ url: 'https://t.example', backendId: 'scrapingdog', content: '{"content":"body"}' }],
+  coverage: {
+    queries: [{ query: 'coffee', uniqueUrls: 1, agreementMedian: 2 }],
+    served: ['you', 'exa'], unreadable: [], failed: [], skipped: [], droppedQueries: [], narrowedQueries: [], unfetchedTargets: [],
+    suppressed: 0, gaps: ['"coffee" is thin (1 unique URLs)'],
+  },
+  nextActions: [{ why: '"coffee" is thin', cmd: 'fezoctl research "coffee" --depth research' }],
+  billing: { callsBilled: 2, attempts: [] },
+};
+
+describe('renderPlan', () => {
+  it('emits the plan as JSON under --json', () => {
+    expect(JSON.parse(renderPlan(PLAN, true)).depth).toBe('standard');
+  });
+
+  it('names the signals in human output', () => {
+    expect(renderPlan(PLAN, false)).toContain('question-form');
+  });
+});
+
+describe('renderResearch', () => {
+  it('emits a JSON document with every top-level section', () => {
+    const doc = JSON.parse(renderResearch(OUTCOME, undefined, true));
+    expect(Object.keys(doc).sort()).toEqual(['billing', 'coverage', 'documents', 'items', 'next_actions', 'ok', 'plan', 'session'].sort());
+  });
+
+  it('attributes every item to its providers in human output', () => {
+    const text = renderResearch(OUTCOME, undefined, false);
+    expect(text).toContain('https://a.example');
+    expect(text).toContain('you');
+    expect(text).toContain('exa');
+  });
+
+  it('always surfaces gaps in human output', () => {
+    expect(renderResearch(OUTCOME, undefined, false)).toMatch(/thin/);
+  });
+
+  it('reports what was billed', () => {
+    expect(renderResearch(OUTCOME, undefined, false)).toContain('2');
+  });
+
+  it('carries the session id into the JSON document', () => {
+    expect(JSON.parse(renderResearch(OUTCOME, 'r-1', true)).session.id).toBe('r-1');
+  });
+});
+
+describe('renderResearch caps the title', () => {
+  const longTitled: ResearchOutcome = {
+    ...OUTCOME,
+    items: [{ ...OUTCOME.items[0]!, title: 'T'.repeat(200_000) }],
+  };
+
+  it('in the JSON document', () => {
+    const doc = JSON.parse(renderResearch(longTitled, undefined, true));
+    expect(doc.items[0].title.length).toBe(300);
+  });
+
+  it('in the human render', () => {
+    const text = renderResearch(longTitled, undefined, false);
+    expect(text).not.toContain('T'.repeat(400));
   });
 });

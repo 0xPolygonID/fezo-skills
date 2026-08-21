@@ -26,6 +26,7 @@ export const repoRoot = join(here, '..');
 export const step0Path = join(here, 'step0.md');
 export const invocationPath = join(here, 'invocation.sh');
 export const oneStepDescriptionsPath = join(repoRoot, 'src', 'engine', 'one-step-descriptions.json');
+export const researchDescriptionsPath = join(repoRoot, 'src', 'engine', 'research-descriptions.json');
 export const defaultOutPath = join(repoRoot, 'skills', 'fezo', 'SKILL.md');
 
 // ONE version number, not two. `SKILL_VERSION` is *derived from*
@@ -107,6 +108,25 @@ function readOneStepDescriptions() {
   });
 }
 
+// The routing command names this generator expects to find in the shared
+// JSON, in the order the research section documents them. Same guard purpose
+// as ONE_STEP_COMMANDS above: a missing/renamed key fails the build loudly
+// rather than splicing `undefined` into the shipped skill.
+const RESEARCH_COMMANDS = ['plan', 'research'];
+
+/** Reads `src/engine/research-descriptions.json` — the same bytes
+ * `src/engine/steering.ts` imports as `RESEARCH_DESCRIPTIONS`. */
+function readResearchDescriptions() {
+  const parsed = JSON.parse(readFileSync(researchDescriptionsPath, 'utf8'));
+  return RESEARCH_COMMANDS.map((name) => {
+    const text = parsed?.[name];
+    if (typeof text !== 'string' || text.length === 0) {
+      throw new Error(`${researchDescriptionsPath} has no non-empty "${name}" description`);
+    }
+    return { name, text };
+  });
+}
+
 /** SKILL.md's hard-wrap column. The file is wrapped for a human (and an agent
  * quoting it back) to read; the shared descriptions arrive as one unwrapped
  * line each — see steering.ts's note on why the shared data carries no line
@@ -182,6 +202,60 @@ ${oneStep}
    billed.`;
 }
 
+// The `research` section. Its two command sentences are spliced in UNWRAPPED,
+// straight from `src/engine/research-descriptions.json` — the same bytes
+// `src/engine/steering.ts` exports as `RESEARCH_DESCRIPTIONS` and `src/cli.ts`
+// prints in `--help`. Unwrapped is deliberate and is what
+// `tests/skill_contract.test.ts` pins: a wrapped copy would mean the exact
+// sentence appears nowhere in the file, and the "these agree" assertion would
+// silently have nothing left to compare.
+//
+// The prose around them exists to correct the one thing an agent will
+// otherwise get wrong. The heuristic planner reads a single string: it cannot
+// split a question into sub-questions and cannot resolve a pronoun against an
+// earlier conversational turn. The agent can do both, so the section tells it
+// to — and tells it to act on the coverage gaps a round reports rather than
+// answering over them.
+function renderResearchSection() {
+  const commands = readResearchDescriptions()
+    .map(({ name, text }) => `- \`${name}\` — ${text}`)
+    .join('\n');
+  return `## Breadth: \`research\`
+
+For a question that wants several sources rather than one answer, use
+\`research\` instead of \`web-search\`. It calls several providers at once and
+returns one merged, deduplicated list where every item names the providers
+that returned it.
+
+${commands}
+
+**Decompose it yourself for real research.** The built-in planner reads one
+string: it cannot split a question into sub-questions, and it cannot resolve
+"their pricing page" against anything said earlier in this conversation. You
+can do both. For anything beyond a single lookup, rewrite the prompt so it
+stands alone and pass the sub-questions explicitly:
+
+\`\`\`bash
+"\${FEZOCTL_ARGV[@]}" research "EU AI Act enforcement" \\
+  --queries "EU AI Act enforcement actions 2026" \\
+  --queries "EU AI Act national competent authorities" \\
+  --depth research --session r-1
+\`\`\`
+
+Run \`plan\` first if you want to see what the heuristic would have done — it
+costs nothing and makes no calls.
+
+**Read the \`gaps\` before you answer.** Every round reports what it could not
+cover: thin queries, providers that failed, work dropped on the call budget.
+If \`gaps\` is non-empty and the answer matters, run the command the round
+offers in \`next_actions\` before writing your reply. Always pass the same
+\`--session\` on a follow-up round: it stops the round from returning — and
+charging for — links you already have.
+
+**Every provider in the fan-out is a billed call.** \`--depth research\` is 8
+providers per query. Use \`--depth shallow\` for a lookup.`;
+}
+
 const EXAMPLES = `## Examples
 
 Examples are illustrative only — always discover real tool names and
@@ -230,6 +304,8 @@ export function renderSkillMd() {
     renderInvocationBlock(),
     '',
     renderProcedure(),
+    '',
+    renderResearchSection(),
     '',
     EXAMPLES,
     '',

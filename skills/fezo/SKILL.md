@@ -367,6 +367,42 @@ resolve_fezoctl
 7. Report which backend(s) were attempted and which 2xx attempts were
    billed.
 
+## Breadth: `research`
+
+For a question that wants several sources rather than one answer, use
+`research` instead of `web-search`. It calls several providers at once and
+returns one merged, deduplicated list where every item names the providers
+that returned it.
+
+- `plan` — Show what routing a prompt would get — intents, queries, depth, fan-out width — without calling anything.
+- `research` — Fan one prompt out to several providers at once and return one deduplicated, source-attributed result set with a coverage report.
+
+**Decompose it yourself for real research.** The built-in planner reads one
+string: it cannot split a question into sub-questions, and it cannot resolve
+"their pricing page" against anything said earlier in this conversation. You
+can do both. For anything beyond a single lookup, rewrite the prompt so it
+stands alone and pass the sub-questions explicitly:
+
+```bash
+"${FEZOCTL_ARGV[@]}" research "EU AI Act enforcement" \
+  --queries "EU AI Act enforcement actions 2026" \
+  --queries "EU AI Act national competent authorities" \
+  --depth research --session r-1
+```
+
+Run `plan` first if you want to see what the heuristic would have done — it
+costs nothing and makes no calls.
+
+**Read the `gaps` before you answer.** Every round reports what it could not
+cover: thin queries, providers that failed, work dropped on the call budget.
+If `gaps` is non-empty and the answer matters, run the command the round
+offers in `next_actions` before writing your reply. Always pass the same
+`--session` on a follow-up round: it stops the round from returning — and
+charging for — links you already have.
+
+**Every provider in the fan-out is a billed call.** `--depth research` is 8
+providers per query. Use `--depth shallow` for a lookup.
+
 ## Examples
 
 Examples are illustrative only — always discover real tool names and
