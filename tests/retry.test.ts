@@ -343,6 +343,78 @@ describe('run — --max-attempts', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// A gateway pre-check rejection is a real round-trip that cost nothing, so it
+// must not spend the `maxAttempts` budget -- which is a SPEND cap, not a
+// request cap (see run's own doc: it "counts CALLS ... i.e. the ones that
+// could have been billed"). Regression: with every top-ranked provider
+// disabled on the account, a one-step walk spent its whole budget on free
+// 403s and gave up while the one provider the user had left enabled sat
+// unasked further down the list.
+// ---------------------------------------------------------------------------
+describe('run — a gateway pre-check rejection does not spend the attempt budget', () => {
+  it('walks past provider_disabled candidates to the enabled one, past the default budget', async () => {
+    const fetchFn = routedFetch({
+      alpha: [gatewayErrorResponse(403, 'provider_disabled', 'provider disabled for this account')],
+      beta: [gatewayErrorResponse(403, 'provider_disabled', 'provider disabled for this account')],
+      gamma: [okResponse('{"ok":true}')],
+    });
+
+    // Three candidates on the default budget of 2: without the exemption this
+    // is exactly the `--max-attempts` test above, giving up before `gamma`.
+    const report = await run({ ...baseOptions, candidates: [alpha, beta, gamma], fetchFn });
+
+    expect(report.outcome.kind).toBe('success');
+    expect(report.attempts).toHaveLength(3);
+    expect(report.unbilledRejections).toBe(2);
+    expect(report.stoppedBy).toBeUndefined();
+    // Nothing was billed for the two rejections -- the point of the exemption.
+    expect(report.attempts.filter((attempt) => attempt.billed)).toHaveLength(1);
+  });
+
+  it('still reports the count when every candidate was rejected and nothing was reached', async () => {
+    const fetchFn = routedFetch({
+      alpha: [gatewayErrorResponse(403, 'provider_disabled')],
+      beta: [gatewayErrorResponse(503, 'backend_unavailable')],
+    });
+
+    const report = await run({ ...baseOptions, candidates: [alpha, beta], fetchFn });
+
+    // The exhaustion wording is a shared contract with cli.ts's
+    // NO_MORE_CANDIDATES_REASON (see tests/cli.test.ts) -- the count rides on
+    // its own typed field rather than being appended to this sentence.
+    expect(report.outcome).toEqual({ kind: 'give_up', reason: 'no more candidates to try' });
+    expect(report.unbilledRejections).toBe(2);
+    expect(report.attempts.some((attempt) => attempt.billed)).toBe(false);
+  });
+
+  it('a post-forward failure still spends the budget: backend_error is not exempt', async () => {
+    const fetchFn = routedFetch({
+      alpha: [gatewayErrorResponse(403, 'provider_disabled')],
+      beta: [gatewayErrorResponse(502, 'backend_error')],
+      gamma: [okResponse('{"ok":true}')],
+    });
+
+    // budget 1: `alpha` is free, `beta` spends the only call, `gamma` is never
+    // reached. A blanket "don't count failures" rule would have reached it.
+    const report = await run({ ...baseOptions, candidates: [alpha, beta, gamma], maxAttempts: 1, fetchFn });
+
+    expect(report.outcome).toEqual({ kind: 'give_up', reason: 'max attempts (1) reached with candidates remaining' });
+    expect(report.stoppedBy).toBe('max-attempts');
+    expect(report.attempts.map((attempt) => attempt.backendId)).toEqual(['alpha', 'beta']);
+    expect(report.unbilledRejections).toBe(1);
+  });
+
+  it('omits the field entirely when there were none', async () => {
+    const fetchFn = routedFetch({ alpha: [okResponse('{"ok":true}')] });
+
+    const report = await run({ ...baseOptions, candidates: [alpha], fetchFn });
+
+    expect(report.outcome.kind).toBe('success');
+    expect('unbilledRejections' in report).toBe(false);
+  });
+});
+
 describe('run — exhausted candidate list', () => {
   it('ends cleanly with a complete attempt log when every candidate is tried and none succeed, independent of --max-attempts', async () => {
     const fetchFn = routedFetch({

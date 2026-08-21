@@ -459,6 +459,19 @@ explicit rather than hiding it behind automatic retries:
   attempt log, so you can see why it was skipped. A run can therefore log
   more attempts than `--max-attempts` if some of them were free pre-flight
   rejections.
+- **A gateway pre-check rejection is free too, and likewise does not spend the
+  budget**: `provider_disabled`, `backend_unavailable`,
+  `backend_not_configured`, and `backend_not_found` are all written by the
+  gateway *before* the call is forwarded to the provider, so nothing was
+  billed. This matters because `/v1/catalog` does not filter out providers you
+  have disabled on your account — the walk can only discover them by calling
+  them — so without the exemption an account with its top-ranked providers
+  switched off would spend the whole budget on free 403s and give up before
+  reaching a provider that is actually enabled. The count is reported as
+  `unbilled_rejections`, and the text output names each one so you can
+  re-enable it (or fix its required settings). Codes that can follow a
+  forwarded request — `backend_error` (which the gateway also writes on a
+  502 after forwarding), `quota_exceeded`, `rate_limited` — are *not* exempt.
 - Each attempt in the log carries a `billed` field, set from the actual
   response received — `true` for any 2xx, `false` otherwise — never inferred
   from the attempt's `status`. (A `retry`-status attempt caused by an empty
