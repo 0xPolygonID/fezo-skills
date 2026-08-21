@@ -143,6 +143,17 @@ export const METHOD_INTENTS: Record<string, Intent[]> = {
 
   // -- scraperapi (internal/scraperapibackend/routes.go:48,61-86) --
   scraperapi_scrape: ['scrape'],
+  // The async pair, read off a live `GET /v1/catalog` dump rather than the Go
+  // route table (they postdate the transcription above). Both are `scrape`,
+  // not `crawl`: `scrape_async` submits ONE job -- "a hard site or large
+  // batch" of URLs the caller already names -- and never discovers a page,
+  // which is what separates `crawl` from `scrape` (see INTENT_DESCRIPTIONS).
+  // `scrape_status` is the poll half of that pair and carries its family's
+  // intent, as firecrawl_crawl_status and geonode_crawl_status do for theirs.
+  // Neither is an entryMethod in providers.ts: ScraperAPI's declared `scrape`
+  // entry point stays the synchronous `scraperapi_scrape`.
+  scraperapi_scrape_async: ['scrape'],
+  scraperapi_scrape_status: ['scrape'],
   scraperapi_amazon_product: ['scrape'],
   scraperapi_amazon_search: ['search'],
   scraperapi_amazon_offers: ['scrape'],

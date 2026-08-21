@@ -8735,6 +8735,17 @@ var METHOD_INTENTS = {
   apify_runs_dataset: ["other"],
   // -- scraperapi (internal/scraperapibackend/routes.go:48,61-86) --
   scraperapi_scrape: ["scrape"],
+  // The async pair, read off a live `GET /v1/catalog` dump rather than the Go
+  // route table (they postdate the transcription above). Both are `scrape`,
+  // not `crawl`: `scrape_async` submits ONE job -- "a hard site or large
+  // batch" of URLs the caller already names -- and never discovers a page,
+  // which is what separates `crawl` from `scrape` (see INTENT_DESCRIPTIONS).
+  // `scrape_status` is the poll half of that pair and carries its family's
+  // intent, as firecrawl_crawl_status and geonode_crawl_status do for theirs.
+  // Neither is an entryMethod in providers.ts: ScraperAPI's declared `scrape`
+  // entry point stays the synchronous `scraperapi_scrape`.
+  scraperapi_scrape_async: ["scrape"],
+  scraperapi_scrape_status: ["scrape"],
   scraperapi_amazon_product: ["scrape"],
   scraperapi_amazon_search: ["search"],
   scraperapi_amazon_offers: ["scrape"],
@@ -9492,6 +9503,15 @@ var RETRY_CODES = /* @__PURE__ */ new Set([
   "backend_error",
   "tool_not_in_catalog"
 ]);
+var UNBILLED_GATEWAY_CODES = /* @__PURE__ */ new Set([
+  "backend_not_found",
+  "backend_unavailable",
+  "provider_disabled",
+  "backend_not_configured"
+]);
+function isUnbilledGatewayRejection(attempt) {
+  return attempt.gatewayCode !== void 0 && UNBILLED_GATEWAY_CODES.has(attempt.gatewayCode);
+}
 var RETRYABLE_CODELESS_STATUSES = /* @__PURE__ */ new Set([402, 429, 500, 502, 503]);
 function classifyFailure(failure) {
   switch (failure.kind) {
@@ -9625,6 +9645,8 @@ async function run(options) {
   let deadlineExceeded = false;
   let callsMade = 0;
   let preflightSkips = 0;
+  let unbilledRejections = 0;
+  const unbilled = () => unbilledRejections > 0 ? { unbilledRejections } : {};
   const validators = new SchemaValidatorCache();
   const clock = options.deadline?.clock ?? Date.now;
   const deadlineAt = options.deadline !== void 0 ? clock() + options.deadline.ms : void 0;
@@ -9649,6 +9671,8 @@ async function run(options) {
     attempts.push(log);
     if (preflightFailure) {
       preflightSkips += 1;
+    } else if (isUnbilledGatewayRejection(log)) {
+      unbilledRejections += 1;
     } else {
       callsMade += 1;
     }
@@ -9656,13 +9680,13 @@ async function run(options) {
       if (result === void 0) {
         throw new Error("internal error: a successful attempt has no CallToolResult");
       }
-      return { outcome: { kind: "success", candidate, result }, attempts };
+      return { outcome: { kind: "success", candidate, result }, attempts, ...unbilled() };
     }
     if (log.status === "abort") {
-      return { outcome: { kind: "aborted", reason: log.reason }, attempts };
+      return { outcome: { kind: "aborted", reason: log.reason }, attempts, ...unbilled() };
     }
     if (log.status === "give_up") {
-      return { outcome: { kind: "give_up", reason: log.reason }, attempts };
+      return { outcome: { kind: "give_up", reason: log.reason }, attempts, ...unbilled() };
     }
   }
   const everyAttemptWasAPreflightSkip = attempts.length > 0 && preflightSkips === attempts.length;
@@ -9673,7 +9697,8 @@ async function run(options) {
   return {
     outcome: { kind: "give_up", reason },
     attempts,
-    ...stoppedBy !== void 0 ? { stoppedBy } : {}
+    ...stoppedBy !== void 0 ? { stoppedBy } : {},
+    ...unbilled()
   };
 }
 
@@ -11428,6 +11453,7 @@ function renderOneStep(result, json) {
       manifest_rejected: manifestRejected,
       skipped,
       ...report.stoppedBy !== void 0 ? { stopped_by: report.stoppedBy } : {},
+      ...report.unbilledRejections !== void 0 ? { unbilled_rejections: report.unbilledRejections } : {},
       attempts: report.attempts,
       result: outcomeToJson(report.outcome),
       billed_any_attempt: billedAnyAttempt,
@@ -11454,6 +11480,13 @@ function renderOneStep(result, json) {
   if (manifestRejected.length > 0) {
     lines.push(
       `Skipped ${manifestRejected.join(", ")}: that provider's manifest requires an argument \`${spec.command}\` does not supply -- run \`fezoctl schema <tool>\` to see its bindings, then \`fezoctl call <tool>\` to supply them yourself.`
+    );
+  }
+  const unbilled = report.attempts.filter(isUnbilledGatewayRejection);
+  if (unbilled.length > 0) {
+    const named = unbilled.map((attempt) => `${attempt.backendId} (${attempt.gatewayCode ?? "rejected"})`).join(", ");
+    lines.push(
+      `Rejected by the gateway before any provider was called: ${named}. Nothing was billed for these and they did not consume the attempt budget; re-enable the provider for your account (or fix its required settings) to use it.`
     );
   }
   if (report.stoppedBy === "max-attempts") {

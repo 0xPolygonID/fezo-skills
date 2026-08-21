@@ -125,6 +125,68 @@ export const RETRY_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * The subset of `RETRY_CODES` the GATEWAY writes from a pre-check, before the
+ * call is forwarded upstream -- so the attempt cost the user nothing and must
+ * not consume `RunOptions.maxAttempts`.
+ *
+ * `maxAttempts` is a SPEND cap, not a request cap: its own doc (and `run`'s)
+ * says the budget "counts CALLS ... i.e. the ones that could have been
+ * billed", which is why a local pre-flight skip already leaves it untouched.
+ * A gateway pre-check rejection is the same thing one layer out -- the
+ * gateway answered without ever calling the provider -- and charging the
+ * budget for it produces the bug this set exists to prevent: with every
+ * top-ranked provider disabled on the account, a one-step `scrape` spent its
+ * whole 3-attempt budget on three free 403s and gave up with `max attempts
+ * reached` while the provider the user had actually left enabled sat unasked
+ * at rank 6. Nothing was billed and nothing was scraped.
+ *
+ * Membership is decided by WHERE the gateway writes the code, verified
+ * against the proxy handler's resolve -> enforce -> forward flow (zug
+ * internal/gateway/proxy.go `Handle`), not by how the failure reads:
+ *
+ * - `backend_not_found` (404), `backend_unavailable` (503),
+ *   `provider_disabled` (403), `backend_not_configured` (403): all four are
+ *   written by checks that run BEFORE the forward -- unknown/unregistered
+ *   backend, backend not marked available, the account's own per-backend
+ *   disable list, and missing required user settings.
+ *
+ * Deliberately EXCLUDED, and each for a reason -- a code belongs here only
+ * when it CANNOT follow an upstream request:
+ *
+ * - `backend_error`: the gateway writes it both before the forward (call
+ *   token, address, request build) and after one fails mid-flight (502).
+ *   The post-forward case may have reached the provider, so this code cannot
+ *   promise "nothing was billed".
+ * - `quota_exceeded`, `rate_limited`: emitted by a BACKEND, which means the
+ *   request was already forwarded and the provider's own service handled it.
+ * - `tool_not_in_catalog`: fezoctl's own client-side condition, never
+ *   reachable inside `run`'s loop (its candidates all come from the live
+ *   catalog); it is `call`'s resolution failure, which issues no request at
+ *   all and never touches this budget.
+ *
+ * Exported for the same reason `RETRY_CODES`/`ABORT_CODES` are: so
+ * tests/classify_failure.test.ts can assert exact set membership -- including
+ * that this set stays a SUBSET of `RETRY_CODES`, since a code that aborts the
+ * run has no budget left to spare.
+ */
+export const UNBILLED_GATEWAY_CODES: ReadonlySet<string> = new Set([
+  'backend_not_found',
+  'backend_unavailable',
+  'provider_disabled',
+  'backend_not_configured',
+]);
+
+/**
+ * True for an attempt the gateway rejected in a pre-check, before forwarding:
+ * a real HTTP round-trip (so NOT a `preflight` skip) that still cost nothing.
+ * Reads the typed `gatewayCode`, never the attempt's prose -- same rule as
+ * one-step.ts's `isCallerFixableArgRejection`.
+ */
+export function isUnbilledGatewayRejection(attempt: AttemptLog): boolean {
+  return attempt.gatewayCode !== undefined && UNBILLED_GATEWAY_CODES.has(attempt.gatewayCode);
+}
+
+/**
  * HTTP statuses that advance to the next candidate when the response carries
  * NO gateway code at all (a backend passthrough body -- see errors.ts's
  * `BackendErrorResponse`). This is the fallback path, used only when step 1
@@ -467,6 +529,25 @@ export interface RunReport {
    * find out" must not look identical in a document a caller scripts against.
    */
   stoppedBy?: 'max-attempts' | 'deadline';
+  /**
+   * How many attempts issued a real request but were rejected by a GATEWAY
+   * pre-check, before any provider was called -- see `UNBILLED_GATEWAY_CODES`.
+   * Absent when there were none.
+   *
+   * A typed field rather than a sentence appended to `outcome.reason`, for the
+   * same reason `AttemptLog.preflight` is one, and for one more specific to
+   * this number: cli.ts's `NO_MORE_CANDIDATES_REASON` is deliberately the
+   * SAME string the engine produces on exhaustion (a synthesized report for an
+   * unresolved tool must not read differently from a real one), so the
+   * exhaustion wording is a shared contract this field must not disturb.
+   *
+   * Worth surfacing because it is the difference between "every provider was
+   * tried and failed" and "no provider was ever reached": a run whose whole
+   * walk is unbilled rejections spent nothing, scraped nothing, and is fixed
+   * by re-enabling a provider -- not by retrying, and not by raising
+   * `--max-attempts`, which these attempts no longer consume.
+   */
+  unbilledRejections?: number;
 }
 
 /** True when `bodyText`, once trimmed, is empty -- the only "empty response" test this module makes. */
@@ -678,6 +759,13 @@ export async function run(options: RunOptions): Promise<RunReport> {
   // could have been billed. See `RunOptions.maxAttempts`.
   let callsMade = 0;
   let preflightSkips = 0;
+  // Attempts that DID issue a request but were rejected by a gateway
+  // pre-check, so they cost nothing and left `callsMade` alone. Reported on
+  // `RunReport`; it caps nothing.
+  let unbilledRejections = 0;
+  /** The optional `unbilledRejections` field, spread into every `RunReport`
+   * this function builds so no ending can forget it. */
+  const unbilled = (): Pick<RunReport, 'unbilledRejections'> => (unbilledRejections > 0 ? { unbilledRejections } : {});
   // One cache for the whole run: two candidates may share an `inputSchema`
   // object, and a retried candidate must not recompile its own.
   const validators = new SchemaValidatorCache();
@@ -720,6 +808,15 @@ export async function run(options: RunOptions): Promise<RunReport> {
     attempts.push(log);
     if (preflightFailure) {
       preflightSkips += 1;
+    } else if (isUnbilledGatewayRejection(log)) {
+      // A real round-trip, but the gateway answered from a pre-check without
+      // forwarding, so nothing was billed and the spend-shaped budget is
+      // untouched -- see `UNBILLED_GATEWAY_CODES`. Counted separately rather
+      // than not at all: the walk is still bounded (by the candidate list and
+      // by `deadline`, which is wall-clock and so DOES cover these), and the
+      // count is what lets the exhaustion summary below say that the budget
+      // was never the thing that ran out.
+      unbilledRejections += 1;
     } else {
       callsMade += 1;
     }
@@ -730,13 +827,16 @@ export async function run(options: RunOptions): Promise<RunReport> {
       if (result === undefined) {
         throw new Error('internal error: a successful attempt has no CallToolResult');
       }
-      return { outcome: { kind: 'success', candidate, result }, attempts };
+      // The count rides along on EVERY ending, not just exhaustion: a success
+      // at rank 6 that got there past five disabled providers is precisely the
+      // case a caller wants to see, and it is invisible in `outcome` alone.
+      return { outcome: { kind: 'success', candidate, result }, attempts, ...unbilled() };
     }
     if (log.status === 'abort') {
-      return { outcome: { kind: 'aborted', reason: log.reason }, attempts };
+      return { outcome: { kind: 'aborted', reason: log.reason }, attempts, ...unbilled() };
     }
     if (log.status === 'give_up') {
-      return { outcome: { kind: 'give_up', reason: log.reason }, attempts };
+      return { outcome: { kind: 'give_up', reason: log.reason }, attempts, ...unbilled() };
     }
     // status === 'retry': fall through to the next candidate.
   }
@@ -773,5 +873,6 @@ export async function run(options: RunOptions): Promise<RunReport> {
     outcome: { kind: 'give_up', reason },
     attempts,
     ...(stoppedBy !== undefined ? { stoppedBy } : {}),
+    ...unbilled(),
   };
 }
